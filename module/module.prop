@@ -1,0 +1,6 @@
+id=maa-phone-manager
+name=MAA Phone Manager Preview
+version=0.0.0-preview
+versionCode=1
+author=maa-phone-manager
+description=[preview] 本地预览模块：只安装引导与救援程序，不含 Debian rootfs、游戏资源或用户数据。未完成实机验收前不要安装。

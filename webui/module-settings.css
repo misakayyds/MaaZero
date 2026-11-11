@@ -1,0 +1,89 @@
+/* Styles for the phone-manager "关于与模块设置" section.
+ *
+ * Loaded from /static/module-settings.css next to the existing MAA WebUI
+ * stylesheet. Only the semantic theme variables already defined by the host page
+ * (--surface*, --border, --text*, --accent*, --success/--danger/--warning) are
+ * used, so dark and light themes work without a second palette.
+ * Everything is namespaced with .ms- so the existing pages cannot be affected.
+ */
+
+.ms-root{display:flex;flex-direction:column;gap:16px}
+
+.ms-card{
+  background:var(--surface,#101c2c);
+  border:1px solid var(--border,#2a3b50);
+  border-radius:var(--r,8px);
+  padding:18px;
+}
+
+.ms-card h2{
+  font-size:15px;
+  font-weight:640;
+  margin-bottom:12px;
+  padding-bottom:9px;
+  border-bottom:1px solid var(--border,#2a3b50);
+}
+
+.ms-field{margin:6px 0;font-size:13px;line-height:1.7}
+.ms-field-label{color:var(--text-muted,#a4b0c1);margin-right:8px}
+.ms-field-value{color:var(--text,#f4f7fb);font-weight:600}
+
+.ms-table{width:100%;border-collapse:collapse;font-size:13px}
+.ms-table th,.ms-table td{
+  text-align:left;
+  padding:8px 10px;
+  border-bottom:1px solid var(--border,#2a3b50);
+}
+.ms-table th{color:var(--text-muted,#a4b0c1);font-weight:520;font-size:12px}
+.ms-table td{color:var(--text,#f4f7fb)}
+
+.ms-hint{color:var(--text-muted,#a4b0c1);font-size:12px;line-height:1.7;margin:6px 0}
+.ms-pending{font-size:14px;font-weight:600;color:var(--text,#f4f7fb);margin:4px 0}
+.ms-idle{font-size:14px;color:var(--text-muted,#a4b0c1);margin:4px 0}
+
+.ms-actions{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0 6px}
+.ms-button{
+  min-height:38px;
+  padding:8px 18px;
+  border:1px solid var(--border,#2a3b50);
+  border-radius:7px;
+  background:var(--surface-raised,#142235);
+  color:var(--text,#f4f7fb);
+  font-size:13px;
+  cursor:pointer;
+}
+.ms-button:hover:not(:disabled){background:var(--surface-muted,#19283c)}
+.ms-button-primary{
+  background:var(--accent-strong,#2862df);
+  border-color:var(--accent-strong,#2862df);
+  color:#fff;
+}
+.ms-button-primary:hover:not(:disabled){background:var(--accent,#3976f6)}
+.ms-button:disabled{opacity:.45;cursor:not-allowed}
+
+.ms-message{margin-top:8px;font-size:13px;line-height:1.7;color:var(--text-muted,#a4b0c1)}
+.ms-message.ms-ok{color:var(--success,#42c477)}
+.ms-message.ms-err,
+.ms-hint.ms-err{color:var(--danger,#ef6b73)}
+.ms-hint.ms-warn{color:var(--warning,#e9b64f)}
+
+.ms-help{
+  margin:0;
+  padding:12px 14px;
+  max-height:320px;
+  overflow:auto;
+  background:var(--code-bg,#08111e);
+  border:1px solid var(--border,#2a3b50);
+  border-radius:7px;
+  color:var(--text-muted,#a4b0c1);
+  font-size:12px;
+  line-height:1.75;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+
+@media(max-width:750px){
+  .ms-card{padding:14px}
+  .ms-button{flex:1 1 auto}
+  .ms-table{font-size:12px}
+}

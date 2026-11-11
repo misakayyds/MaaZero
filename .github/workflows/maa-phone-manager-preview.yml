@@ -1,0 +1,75 @@
+name: maa-phone-manager-preview
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline rootfs recipe and WebUI overlay checks (no rootfs build)
+        run: |
+          python3 -B packaging/rootfs/test_recipe.py
+          python3 -B -m unittest discover -s packaging/tests -v
+          sh -n packaging/rootfs/customize.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: manager/go.mod
+          cache: false
+      - name: Linux filesystem and race tests
+        working-directory: manager
+        run: go test -race ./... -count=1
+  preview:
+    needs: linux-tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: manager/go.mod
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Go tests and vet
+        working-directory: manager
+        shell: pwsh
+        run: |
+          go test ./... -count=1
+          if ($LASTEXITCODE -ne 0) { throw 'Go tests failed' }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Go vet failed' }
+      - name: UI behavior and packaging tests
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s packaging/tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Overlay tests failed' }
+          node --test webui/tests/module-settings.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'UI tests failed' }
+          pwsh -File module/tests/test_module_layout.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Layout tests failed' }
+          pwsh -File packaging/test-module.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Module tests failed' }
+          pwsh -File packaging/project/tests/test_build_project.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Project tests failed' }
+          pwsh -File packaging/project/tests/test_build_project_allowlist.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Project allowlist tests failed' }
+      - name: Build ARM64 preview
+        shell: pwsh
+        run: |
+          $env:GOOS = 'linux'
+          $env:GOARCH = 'arm64'
+          $env:CGO_ENABLED = '0'
+          Push-Location manager
+          go build -trimpath -o ../manager-preview-arm64 ./cmd/maa-managerd
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          Pop-Location
+          pwsh -File packaging/build-module.ps1 -ManagerBinary manager-preview-arm64 -Version 0.1.0-preview -OutputDirectory preview-dist
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maa-phone-manager-preview-not-device-validated
+          path: preview-dist/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,29 @@
+# Go build caches and local binaries
+.cache/
+manager/maa-managerd
+manager/maa-managerd.exe
+manager-preview-arm64
+
+# Packaging and preview outputs
+dist/
+preview-dist/
+.codex_diagnostics/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local browser/fixture artifacts
+.playwright-cli/
+.superpowers/
+test/
+*.tmp.html
+
+# Local secrets / private signing material (never commit)
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+tg.txt

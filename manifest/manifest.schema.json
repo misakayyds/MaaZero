@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:maa-phone-manager:manifest:v1",
+  "title": "MAA Phone Manager Channel Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sequence",
+    "channel",
+    "generated_at",
+    "minimum_bootstrap_version",
+    "components",
+    "upstream_policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "channel": {
+      "enum": ["stable", "beta"]
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "minimum_bootstrap_version": {
+      "$ref": "#/$defs/version"
+    },
+    "notices": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/notice"
+      },
+      "default": []
+    },
+    "blocked_versions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/blockedVersion"
+      },
+      "default": []
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/component"
+      }
+    },
+    "upstream_policy": {
+      "$ref": "#/$defs/upstreamPolicy"
+    }
+  },
+  "$defs": {
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "notice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "title", "message"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$"
+        },
+        "severity": {
+          "enum": ["info", "warning", "critical"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://"
+        }
+      }
+    },
+    "blockedVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "version", "reason"],
+      "properties": {
+        "component": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,63}$"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architectures", "android_api", "root_managers"],
+      "properties": {
+        "architectures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["arm64-v8a"]
+          }
+        },
+        "android_api": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum", "maximum"],
+          "properties": {
+            "minimum": {
+              "type": "integer",
+              "minimum": 23
+            },
+            "maximum": {
+              "type": "integer",
+              "minimum": 23
+            }
+          }
+        },
+        "root_managers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["magisk", "kernelsu", "apatch"]
+          }
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "sha256",
+        "size",
+        "media_type",
+        "compression",
+        "provenance"
+      ],
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://"
+        },
+        "mirrors": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://"
+          },
+          "default": []
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "media_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "compression": {
+          "enum": ["none", "zip", "tar.gz", "tar.zst"]
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["publisher", "source_url", "license_url"],
+          "properties": {
+            "publisher": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            },
+            "source_url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "license_url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://"
+            }
+          }
+        }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "version",
+        "required",
+        "install_mode",
+        "compatibility",
+        "artifacts",
+        "health_checks"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,63}$"
+        },
+        "kind": {
+          "enum": ["manager", "project", "runtime"]
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "install_mode": {
+          "enum": ["replace-file", "extract-versioned"]
+        },
+        "compatibility": {
+          "$ref": "#/$defs/compatibility"
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "health_checks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "manager-api",
+              "webui-static",
+              "debian-exec",
+              "maa-version",
+              "config-parse"
+            ]
+          }
+        }
+      }
+    },
+    "upstreamComponentPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "channel", "automatic"],
+      "properties": {
+        "strategy": {
+          "enum": ["maa-self-update", "maa-update", "resource-sync"]
+        },
+        "channel": {
+          "enum": ["stable", "beta"]
+        },
+        "automatic": {
+          "type": "boolean"
+        },
+        "allowed_versions": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        }
+      }
+    },
+    "upstreamPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maa-cli", "maacore", "maa-resource"],
+      "properties": {
+        "maa-cli": {
+          "$ref": "#/$defs/upstreamComponentPolicy"
+        },
+        "maacore": {
+          "$ref": "#/$defs/upstreamComponentPolicy"
+        },
+        "maa-resource": {
+          "$ref": "#/$defs/upstreamComponentPolicy"
+        }
+      }
+    }
+  }
+}

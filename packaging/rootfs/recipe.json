@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "suite": "bookworm",
+  "architecture": "arm64",
+  "snapshot": "20260901T000000Z",
+  "packages": [
+    "bash", "python3", "coreutils", "util-linux", "grep", "sed", "mawk",
+    "findutils", "procps", "curl", "ca-certificates", "tar", "gzip", "git",
+    "adb", "cron", "tzdata", "locales", "debian-archive-keyring"
+  ]
+}

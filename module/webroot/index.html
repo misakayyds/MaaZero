@@ -1,0 +1,69 @@
+<!doctype html>
+<!-- preview/recovery entry served by maa-managerd on 127.0.0.1:8088; no device deployment -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MAA Phone Manager（预览）</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 20px; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.6; }
+  main { max-width: 34rem; margin: 0 auto; }
+  h1 { font-size: 1.15rem; }
+  p { opacity: .85; }
+  button { width: 100%; padding: 12px; font-size: 1rem; border-radius: 10px; border: 1px solid currentColor; background: transparent; color: inherit; }
+  a { display: inline-block; margin-top: 12px; }
+  pre { white-space: pre-wrap; font-size: .8rem; opacity: .75; }
+</style>
+</head>
+<body>
+<main>
+  <h1>MAA Phone Manager（本地预览入口）</h1>
+  <p>本页由模块里的 maa-managerd 自己提供，只做一件事：调用固定的 open-ui 命令，让它打开自己的本地管理页面；运行环境尚未安装时，那就是恢复页。</p>
+  <p>它不接受任何输入，不提供通用 root 命令入口，也不会启动、修改或连接设备上已有的任何部署。</p>
+  <button id="open" type="button">打开管理页面</button>
+  <p><a href="http://127.0.0.1:8088/">打开 maa-managerd 的本地页面 127.0.0.1:8088</a></p>
+  <pre id="status">尚未执行。</pre>
+</main>
+<script>
+(function () {
+  // 固定路径：页面不接收、也不拼接任何用户输入。
+  var MANAGER_BINARY = "/data/adb/modules/maa-phone-manager/bin/maa-managerd";
+  var DATA_ROOT = "/data/local/maa-platform";
+  var COMMAND = MANAGER_BINARY + " open-ui --data-root " + DATA_ROOT;
+
+  // KernelSU/APatch 的 WebView 桥是 exec(cmd: String, options: String?, callbackFunc: String)，
+  // 第三个参数是「回调函数名字符串」，不能传函数对象（桥会用该名字拼出调用）。
+  // 所以这里把一个具名回调挂到 window 上，再把名字交给 ksu.exec。
+  var CALLBACK_NAME = "maaPhoneManagerOpenUiResult";
+
+  function report(text) {
+    document.getElementById("status").textContent = text;
+  }
+
+  // 只使用退出码：open-ui 的输出可能带一次性会话票据，页面不回显、日志不落盘。
+  window[CALLBACK_NAME] = function (code) {
+    if (code === 0) {
+      report("已发出打开管理页面请求（exit=0）。若浏览器没有打开，请使用下方固定链接。");
+    } else {
+      report("打开管理页面失败（exit=" + code + "）。可使用下方固定链接，或查看模块救援说明。");
+    }
+  };
+
+  function openUi() {
+    if (typeof ksu === "undefined" || typeof ksu.exec !== "function") {
+      report("当前环境没有 KernelSU/APatch 执行接口。请使用下方固定链接，或在 Magisk 中点击模块操作按钮。");
+      return;
+    }
+    try {
+      ksu.exec(COMMAND, "{}", CALLBACK_NAME);
+    } catch (error) {
+      report("调用 open-ui 失败：" + error);
+    }
+  }
+
+  document.getElementById("open").addEventListener("click", openUi);
+})();
+</script>
+</body>
+</html>
