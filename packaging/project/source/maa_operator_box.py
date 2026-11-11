@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import NoReturn
 import re
@@ -22,9 +23,19 @@ WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 WEEKDAY_CRON = {day: (index + 1) % 7 for index, day in enumerate(WEEKDAYS)}
 MANAGED_BEGIN = b"# BEGIN MAA_WEBUI_OPERATOR_SCAN"
 MANAGED_END = b"# END MAA_WEBUI_OPERATOR_SCAN"
-SCAN_COMMAND = (
-    b"/usr/bin/python3 /root/maa-scripts/maa-operator-scan.py "
-    b">> /var/log/maa/operator-scan-cron.log 2>&1"
+
+
+def _get_scan_command() -> bytes:
+    py_bin = sys.executable or "/usr/bin/python3"
+    scan_script = str(Path(os.environ.get("MAA_HOME", "/root/maa-scripts")) / "maa-operator-scan.py")
+    log_path = str(Path(os.environ.get("MAA_LOG_DIR", "/var/log/maa")) / "operator-scan-cron.log")
+    return f"{py_bin} {scan_script} >> {log_path} 2>&1".encode("utf-8")
+
+
+SCAN_COMMAND = _get_scan_command()
+
+UNMANAGED_SCAN_RE = re.compile(
+    rb"(?:[^\s;]+[/\\])?(?:maa-operator-scan\.py|maa-run(?:\.sh)?[ \t]+operator-scan)(?:[ \t]|$)"
 )
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
@@ -535,9 +546,8 @@ def preview_weekly_schedule(
         _error("invalid_weekday", "$.weekday", "星期字段无效")
     hour, minute = _parse_clock_time(request["time"], "$.time")
     base, current_block = _split_managed_crontab(crontab_raw)
-    if SCAN_COMMAND in base or re.search(
-        rb"/root/maa-scripts/maa-run\.sh[ \t]+operator-scan(?:[ \t]|$)", base
-    ):
+    scan_cmd = _get_scan_command()
+    if scan_cmd in base or UNMANAGED_SCAN_RE.search(base):
         _error("unmanaged_duplicate", "$.crontab", "发现未受管的重复干员扫描定时")
     if enabled:
         status = load_scan_status(
@@ -556,7 +566,7 @@ def preview_weekly_schedule(
         managed = b"\n".join(
             (
                 MANAGED_BEGIN,
-                f"{minute} {hour} * * {cron_day} ".encode() + SCAN_COMMAND,
+                f"{minute} {hour} * * {cron_day} ".encode() + scan_cmd,
                 MANAGED_END,
             )
         )

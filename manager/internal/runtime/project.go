@@ -61,7 +61,6 @@ var deviceHelperNames = map[string]bool{
 	"wifi_watchdog.sh":                 true,
 	"wifi_watchdog_worker.sh":          true,
 	"maa-scheduled-reboot.sh":          true,
-	"arknights-apk-update.sh":          true,
 	"maa-edit.sh":                      true,
 }
 
@@ -76,6 +75,12 @@ type projectFile struct {
 	Name   string
 	SHA256 string
 	Size   int64
+}
+
+// ScanProjectDir validates the immutable project component of a bundle.
+func ScanProjectDir(dir string) error {
+	_, err := scanProjectDir(dir)
+	return err
 }
 
 // scanProjectDir validates the immutable project component of a bundle. The

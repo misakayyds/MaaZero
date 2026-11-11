@@ -838,3 +838,26 @@ func TestVersionGateAcceptsPackagedPreview(t *testing.T) {
 		}
 	}
 }
+
+func TestStartBootstrapActivatesCommittedRelease(t *testing.T) {
+	f := newReleaseFixture(t)
+	d1 := &runtimeFixture{}
+	c1, s := f.start(d1)
+	f.apply(c1)
+	c1.Close()
+
+	// Simulate fresh daemon boot on the same store without network access.
+	d2 := &runtimeFixture{}
+	c2, err := New(Config{}, s, d2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	c2.StartBootstrap()
+	f.await(c2)
+
+	if got := d2.activeVersion(); got != "0.1.0" {
+		t.Fatalf("StartBootstrap activeVersion = %q, want 0.1.0; status=%+v", got, c2.Status())
+	}
+}

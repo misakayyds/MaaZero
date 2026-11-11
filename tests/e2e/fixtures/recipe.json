@@ -1,0 +1,24 @@
+{
+  "$schema": "./recipe.schema.json",
+  "recipe_version": 1,
+  "distro": "debian",
+  "suite": "bookworm",
+  "architecture": "arm64",
+  "snapshot": "20260901T000000Z",
+  "archive_url": "https://snapshot.debian.org/archive/debian/20260901T000000Z/",
+  "security_archive_url": "https://snapshot.debian.org/archive/debian-security/20260901T000000Z/",
+  "trusted_keyring": "/usr/share/keyrings/debian-archive-keyring.gpg",
+  "components": ["main"],
+  "variant": "minbase",
+  "packages": [
+    "bash",
+    "coreutils",
+    "busybox",
+    "ca-certificates",
+    "python3",
+    "python3-minimal",
+    "curl",
+    "tar",
+    "zstd"
+  ]
+}

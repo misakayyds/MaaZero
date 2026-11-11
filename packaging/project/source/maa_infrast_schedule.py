@@ -32,21 +32,31 @@ WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 WEEKDAY_CRON = {day: (index + 1) % 7 for index, day in enumerate(WEEKDAYS)}
 MANAGED_BEGIN = b"# BEGIN MAA_WEBUI_SCHEDULE"
 MANAGED_END = b"# END MAA_WEBUI_SCHEDULE"
+def _get_daily_runner_path() -> str:
+    return os.environ.get("MAA_RUN_SCRIPT") or str(
+        Path(os.environ.get("MAA_HOME", "/root/maa-scripts")) / "maa-run.sh"
+    )
+
+def _get_cron_log_path() -> str:
+    return str(Path(os.environ.get("MAA_LOG_DIR", "/var/log/maa")) / "cron.log")
+
 _CRON_FIELD = rb"[^ \t;&|`$()<>]+"
 _DAILY_ARGUMENT = (
     rb"(?:--weekday[ \t]+(?:mon|tue|wed|thu|fri|sat|sun)"
     rb"|--scheduled-time[ \t]+\d{2}:\d{2}"
     rb"|--lock-wait-seconds[ \t]+\d{1,4})"
 )
+_RUNNER_PATTERN = rb"(?:[^\s;]+[/\\])?maa-run(?:\.sh)?"
+_LOG_PATTERN = rb"(?:[ \t]+(?:>|>>)[ \t]*[^\s;]+cron\.log(?:[ \t]+2>&1)?)?"
+
 DAILY_COMMAND_RE = re.compile(
     rb"^[ \t]*(?:" + _CRON_FIELD + rb"[ \t]+){5}"
-    rb"/root/maa-scripts/maa-run\.sh[ \t]+daily"
-    rb"(?:[ \t]+" + _DAILY_ARGUMENT + rb")*"
-    rb"(?:[ \t]+(?:>|>>)[ \t]*/var/log/maa/cron\.log(?:[ \t]+2>&1)?)?"
-    rb"[ \t]*$"
+    + _RUNNER_PATTERN + rb"[ \t]+daily"
+    + rb"(?:[ \t]+" + _DAILY_ARGUMENT + rb")*"
+    + _LOG_PATTERN + rb"[ \t]*$"
 )
 ANY_DAILY_COMMAND_RE = re.compile(
-    rb"/root/maa-scripts/maa-run\.sh[ \t]+daily(?=$|[^A-Za-z0-9_]|[0-9]+[<>])"
+    _RUNNER_PATTERN + rb"[ \t]+daily(?=$|[^A-Za-z0-9_]|[0-9]+[<>])"
 )
 DEFAULT_INFRAST_PARAMS = {
     "mode": 0,
@@ -676,10 +686,12 @@ def _canonical_cron_line(entry: dict[str, object]) -> bytes:
     if not isinstance(lock_wait, int) or isinstance(lock_wait, bool) or not 0 <= lock_wait <= 1800:
         _schedule_error("invalid_lock_wait", "$.entries.lock_wait_seconds", "锁等待时间必须在 0 到 1800 秒")
     hour, minute = divmod(minute_of_day, 60)
+    runner = _get_daily_runner_path()
+    log_file = _get_cron_log_path()
     return (
-        f"{minute} {hour} * * {WEEKDAY_CRON[weekday]} /root/maa-scripts/maa-run.sh daily "
+        f"{minute} {hour} * * {WEEKDAY_CRON[weekday]} {runner} daily "
         f"--weekday {weekday} --scheduled-time {time} --lock-wait-seconds {lock_wait} "
-        ">> /var/log/maa/cron.log 2>&1"
+        f">> {log_file} 2>&1"
     ).encode("ascii")
 
 

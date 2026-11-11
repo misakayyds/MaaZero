@@ -5,20 +5,27 @@
 # ============================================
 set -uo pipefail
 
-export PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export LANG=en_US.UTF-8
+MAA_HOME="${MAA_HOME:-/root/maa-scripts}"
+MAA_CONFIG_DIR="${MAA_CONFIG_DIR:-/root/.config/maa}"
+MAA_DATA_DIR="${MAA_DATA_DIR:-/root/.local/share/maa}"
+MAA_STATE_DIR="${MAA_STATE_DIR:-/root/.local/state/maa}"
+MAA_CACHE_DIR="${MAA_CACHE_DIR:-/root/.cache/maa}"
+MAA_LOG_DIR="${MAA_LOG_DIR:-/var/log/maa}"
+export PATH="${HOME}/.local/bin:${MAA_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LANG="${LANG:-en_US.UTF-8}"
+export PYTHONDONTWRITEBYTECODE=1
 
-LOG_DIR="/var/log/maa"
+LOG_DIR="$MAA_LOG_DIR"
 LOG_FILE="$LOG_DIR/update-$(date +%Y%m%d-%H%M%S).log"
 LOCK_FILE="/tmp/maa-task.lock"
 UPDATE_TIMEOUT="15m"
 UPDATE_MARKER="$LOG_DIR/last-update-ok"
 UPDATE_RETRIES=2
 UPDATE_RETRY_DELAY=20
-RESOURCE_TARBALL_URL="https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main"
-RESOURCE_DIR="/root/.local/share/maa/resource"
-RESOURCE_CLONE_DIR="/root/.local/share/maa/MaaResource/resource"
-RESOURCE_OVERLAY_SCRIPT="/root/maa-scripts/maa-resource-overlay.sh"
+RESOURCE_TARBALL_URL="${MAA_RESOURCE_TARBALL_URL:-https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main}"
+RESOURCE_DIR="${MAA_RESOURCE_DIR:-$MAA_DATA_DIR/resource}"
+RESOURCE_CLONE_DIR="${MAA_RESOURCE_CLONE_DIR:-$MAA_DATA_DIR/MaaResource/resource}"
+RESOURCE_OVERLAY_SCRIPT="${MAA_RESOURCE_OVERLAY_SCRIPT:-$MAA_HOME/maa-resource-overlay.sh}"
 MAA_CORE_CHANNEL="${MAA_CORE_CHANNEL:-beta}"
 MAA_UPDATE_TEST_TIME="${MAA_UPDATE_TEST_TIME:-0}"
 
@@ -173,7 +180,6 @@ for attempt in $(seq 1 "$UPDATE_RETRIES"); do
         break
     fi
 
-    pkill -9 -f "git.*MaaResource" || true
     if [[ "$attempt" -lt "$UPDATE_RETRIES" ]]; then
         log "等待 ${UPDATE_RETRY_DELAY}s 后重试资源更新..."
         sleep "$UPDATE_RETRY_DELAY"
@@ -184,14 +190,15 @@ if [[ "$resource_updated" -eq 1 ]]; then
     log "✅ MaaCore 与资源 检查/更新成功"
     log_resource_versions
     date '+%Y-%m-%d %H:%M:%S' > "$UPDATE_MARKER"
-    if python3 /root/maa-scripts/patch_config.py >> "$LOG_FILE" 2>&1; then
+    if python3 "$MAA_HOME/patch_config.py" >> "$LOG_FILE" 2>&1; then
         log "✅ 稳定截图配置补丁已应用"
     else
         log "⚠️ 稳定截图配置补丁应用失败"
     fi
-    if python3 /root/maa-scripts/maa_infrast_requirements.py \
+    mkdir -p "$MAA_STATE_DIR"
+    if python3 "$MAA_HOME/maa_infrast_requirements.py" \
         --update \
-        --output /root/maa-scripts/infrast-operator-requirements.json \
+        --output "$MAA_STATE_DIR/infrast-operator-requirements.json" \
         >> "$LOG_FILE" 2>&1; then
         log "✅ 基建技能建议门槛索引已更新"
     else

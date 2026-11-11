@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -47,15 +48,41 @@ def safe_api_url(url: str) -> str:
 
 def fetch(url: str) -> tuple[bytes, str]:
     request = urllib.request.Request(url, headers={'User-Agent': 'maa-run-session/1'})
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(request, timeout=8) as response:
         data = response.read(MAX_BYTES + 1)
         if response.status != 200 or len(data) > MAX_BYTES:
             raise SessionError('invalid status or oversized response')
         return data, response.headers.get('ETag', '')
 
 
-def download_one(url: str, target: Path, *, sleep=time.sleep) -> None:
-    for attempt in range(1, 4):
+def _local_fallback_bytes(local: str) -> tuple[bytes, str] | None:
+    cache_root = Path(os.environ.get('MAA_CACHE_DIR') or
+                      str(Path(os.environ.get('XDG_CACHE_HOME') or Path.home()/'.cache')/'maa'))
+    data_root = Path(os.environ.get('MAA_DATA_DIR') or
+                     str(Path(os.environ.get('XDG_DATA_HOME') or Path.home()/'.local/share')/'maa'))
+    candidates = [cache_root / local, data_root / local]
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            raw = candidate.read_bytes()
+            if len(raw) <= MAX_BYTES and isinstance(json.loads(raw), dict):
+                etag_path = Path(str(candidate) + '.etag')
+                etag = etag_path.read_text(encoding='utf-8').strip() if etag_path.is_file() else ''
+                return raw, etag
+        except Exception:
+            continue
+    base_tasks = data_root / 'resource/tasks/tasks.json'
+    if base_tasks.is_file() and local in (
+        'StageActivityV2.json',
+        'resource/platform_diff/iOS/resource/tasks/tasks.json',
+    ):
+        return b'{}', ''
+    return None
+
+
+def download_one(url: str, local: str, target: Path, *, sleep=time.sleep) -> None:
+    for attempt in range(1, 3):
         try:
             data, etag = fetch(url)
             if not isinstance(json.loads(data), dict):
@@ -68,11 +95,19 @@ def download_one(url: str, target: Path, *, sleep=time.sleep) -> None:
             return
         except Exception as error:
             # Do not print arbitrary exception text: it can contain proxy credentials.
-            print(f'[RUN_SESSION] update attempt={attempt}/3 url={url} error={type(error).__name__}',
+            print(f'[RUN_SESSION] update attempt={attempt}/2 url={url} error={type(error).__name__}',
                   file=sys.stderr, flush=True)
-            if attempt == 3:
-                raise SessionError(f'hot update failed: {url}') from None
-            sleep(attempt * 2)
+            if attempt < 2:
+                sleep(2)
+    fallback = _local_fallback_bytes(local)
+    if fallback is not None:
+        data, etag = fallback
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        Path(str(target) + '.etag').write_text(etag, encoding='utf-8')
+        print(f'[RUN_SESSION] offline/CDN fallback used for {local}', flush=True)
+        return
+    raise SessionError(f'hot update failed: {url}')
 
 
 def with_mooncake_announcement(tasks: dict, base_tasks: dict | None = None) -> dict:
@@ -104,6 +139,59 @@ def with_mooncake_announcement(tasks: dict, base_tasks: dict | None = None) -> d
     return result
 
 
+def with_stop_at_login(tasks: dict) -> dict:
+    """Stop StartUp cleanly once the Arknights login screen is reached without logging in."""
+    result = copy.deepcopy(tasks)
+    result['StartToWakeUp'] = {
+        'action': 'Stop',
+        'roi': [520, 460, 240, 100],
+        'postDelay': 1000,
+        'next': [],
+    }
+    result['StartToWakeUpOCR'] = {
+        'algorithm': 'OcrDetect',
+        'text': [
+            '开始唤醒', '账号管理', '账号登录', '手机号登录',
+            '密码登录', '验证码登录', '输入手机号', '获取验证码', '登录',
+        ],
+        'fullMatch': False,
+        'roi': [250, 100, 780, 600],
+        'action': 'Stop',
+        'postDelay': 1000,
+        'next': [],
+    }
+    result['StartLoginBServer'] = {
+        'action': 'Stop',
+        'roi': [400, 350, 500, 150],
+        'postDelay': 1000,
+        'next': [],
+    }
+    result['AccountManager'] = {
+        'action': 'Stop',
+        'roi': [697, 663, 144, 39],
+        'postDelay': 1000,
+        'next': [],
+    }
+    result['AccountManagerLoginButton'] = {
+        'algorithm': 'OcrDetect',
+        'text': ['登录'],
+        'fullMatch': True,
+        'roi': [423, 329, 448, 147],
+        'action': 'Stop',
+        'postDelay': 1000,
+        'next': [],
+    }
+    for stale in (
+        'StartUp@StartToWakeUp',
+        'StartUp@StartToWakeUpOCR',
+        'StartUp@StartLoginBServer',
+        'StartUp@AccountManager',
+        'StartUp@AccountManagerLoginButton',
+    ):
+        result.pop(stale, None)
+    return result
+
+
 def prepare(config_dir: Path, dest: Path) -> None:
     dest.mkdir(mode=0o700, parents=True, exist_ok=False)
     api = DEFAULT_API
@@ -112,16 +200,22 @@ def prepare(config_dir: Path, dest: Path) -> None:
         api = tomllib.loads(cli_path.read_text(encoding='utf-8')).get('hot_update', {}).get('api_url', api)
     api = safe_api_url(api)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(download_one, f'{api}/{url}', dest/'cache'/local) for url, local in TARGETS]
+        futures = [pool.submit(download_one, f'{api}/{url}', local, dest/'cache'/local) for url, local in TARGETS]
         for future in futures:
             future.result()
-    data_dir = Path(os.environ.get('MAA_DATA_DIR') or
-                    str(Path(os.environ.get('XDG_DATA_HOME') or Path.home()/'.local/share')/'maa'))
-    base_path = data_dir/'resource/tasks/tasks.json'
+    res_dir = Path(os.environ.get('MAA_RESOURCE_DIR') or (
+        Path(os.environ.get('MAA_DATA_DIR') or
+             str(Path(os.environ.get('XDG_DATA_HOME') or Path.home()/'.local/share')/'maa')) / 'resource'
+    ))
+    base_path = res_dir/'tasks/tasks.json'
     base = json.loads(base_path.read_text(encoding='utf-8')) if base_path.is_file() else {}
     cn_tasks = dest/'cache/resource/tasks/tasks.json'
-    cn_tasks.write_text(json.dumps(with_mooncake_announcement(
-        json.loads(cn_tasks.read_text(encoding='utf-8')), base), ensure_ascii=False), encoding='utf-8')
+    patched_tasks = with_mooncake_announcement(
+        json.loads(cn_tasks.read_text(encoding='utf-8')), base)
+    if os.environ.get('MAA_STARTUP_STOP_AT_LOGIN') == '1':
+        patched_tasks = with_stop_at_login(patched_tasks)
+        print('[RUN_SESSION] stop-at-login guard enabled for this snapshot', flush=True)
+    cn_tasks.write_text(json.dumps(patched_tasks, ensure_ascii=False), encoding='utf-8')
     print('[RUN_SESSION] CN mooncake tutorial close rule added to this snapshot', flush=True)
     hashes = {}
     for _, relative in TARGETS:
@@ -164,6 +258,16 @@ def without_duplicate_start(document: dict) -> dict:
     return result
 
 
+def _safe_symlink_or_copy(source: Path, target: Path) -> None:
+    try:
+        target.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+    except OSError:
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
+
+
 def build_command(root: Path, original: Path, args: list[str], maa: str,
                   prewarm_token: str = '') -> tuple[list[str], dict[str, str]]:
     manifest = validate_session(root)
@@ -190,7 +294,7 @@ def build_command(root: Path, original: Path, args: list[str], maa: str,
     for name in ('profiles', 'resource', 'asst.toml', 'asst.json', 'asst.yaml', 'asst.yml'):
         source = original/name
         if source.exists():
-            (phase/name).symlink_to(source.resolve(), target_is_directory=source.is_dir())
+            _safe_symlink_or_copy(source, phase/name)
     (phase/'cli.toml').write_text(
         '[resource]\nauto_update = false\n[hot_update]\n'
         f'api_url = {json.dumps(manifest["api"])}\ncheck_interval = {CACHE_INTERVAL}\n', encoding='utf-8')

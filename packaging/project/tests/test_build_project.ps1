@@ -87,13 +87,13 @@ function New-FixtureSource {
     Write-LfFile (Join-Path $src "maa-crlf-helper.sh") "#!/bin/bash`necho helper`n"
     Write-LfFile (Join-Path $src "start_webui.sh") ((@('#!/bin/bash', 'pkill -f maa-webui.py') -join "`n") + "`n")
     Write-LfFile (Join-Path $src "maa-scheduled-reboot.sh") ((@('#!/bin/bash', 'echo reboot') -join "`n") + "`n")
-    Write-LfFile (Join-Path $src "arknights-apk-update.sh") ((@('#!/bin/bash', 'echo pm install') -join "`n") + "`n")
+    Write-LfFile (Join-Path $src "arknights-apk-update.sh") ((@('#!/bin/bash', 'LOCK_FILE="/tmp/maa-task.lock"') -join "`n") + "`n")
     Write-LfFile (Join-Path $src "maa-edit.sh") ((@('#!/bin/bash', 'echo edit') -join "`n") + "`n")
     Write-LfFile (Join-Path $src "README.md") "notes`n"
     Write-LfFile (Join-Path $src "maa-run.sh.bak-20260101") "#!/bin/bash`n"
     Write-LfFile (Join-Path $src "__pycache__\maa-webui.cpython-312.pyc") "bytecode"
     Write-LfFile (Join-Path $src "_legacy_flat\maa-run.sh") "#!/bin/bash`nLOCK_FILE=`"/tmp/old.lock`"`n"
-    Write-LfFile (Join-Path $Root "project-files.json") (([ordered]@{ schema = 1; files = @('infrast-operator-requirements.json', 'maa-auto-update.sh', 'maa-crlf-helper.sh', 'maa-run.sh', 'maa-webui.py', 'maa-weekly-editor.js') } | ConvertTo-Json -Depth 4) + "`n")
+    Write-LfFile (Join-Path $Root "project-files.json") (([ordered]@{ schema = 1; files = @('arknights-apk-update.sh', 'infrast-operator-requirements.json', 'maa-auto-update.sh', 'maa-crlf-helper.sh', 'maa-run.sh', 'maa-webui.py', 'maa-weekly-editor.js') } | ConvertTo-Json -Depth 4) + "`n")
     return $src
 }
 
@@ -105,12 +105,12 @@ $webuiSourceBefore = Get-Sha256Hex (Join-Path $src1 "maa-webui.py")
 $r = Invoke-Build -Arguments @("-Source", $src1, "-Out", $out1, "-Version", "1.2.3")
 Assert-That ($r.ExitCode -eq 0) "正常构建应成功，实际退出码 $($r.ExitCode)：$($r.Output)"
 Assert-That (Test-Path -LiteralPath (Join-Path $out1 "project\maa-run.sh")) "构建产物缺少 maa-run.sh"
+Assert-That (Test-Path -LiteralPath (Join-Path $out1 "project\arknights-apk-update.sh")) "构建产物缺少 arknights-apk-update.sh"
 Assert-That (Test-Path -LiteralPath (Join-Path $out1 "VERSION")) "构建产物缺少 VERSION"
 Assert-That (Test-Path -LiteralPath (Join-Path $out1 "inventory.json")) "构建产物缺少 inventory.json"
 Assert-That (Test-Path -LiteralPath (Join-Path $out1 "project.sha256")) "构建产物缺少 project.sha256"
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $out1 "project\start_webui.sh"))) "start_webui.sh 不得被打包"
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $out1 "project\maa-scheduled-reboot.sh"))) "设备改动的 maa-scheduled-reboot.sh 不得被打包"
-Assert-That (-not (Test-Path -LiteralPath (Join-Path $out1 "project\arknights-apk-update.sh"))) "设备改动的 arknights-apk-update.sh 不得被打包"
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $out1 "project\maa-edit.sh"))) "设备改动的 maa-edit.sh 不得被打包"
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $out1 "project\README.md"))) "非白名单扩展名不得被打包"
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $out1 "project\maa-run.sh.bak-20260101"))) "备份文件不得被打包"
@@ -132,7 +132,7 @@ Assert-That ($inventory.Contains('"sourceSha256"')) "inventory 必须记录改�
 Assert-That ($inventory.Contains('"name": "maa-webui.py"')) "inventory 应列出 maa-webui.py"
 Assert-That ($inventory.Contains('"reason": "device-helper"')) "inventory 应记录被排除的设备脚本"
 Assert-That ($inventory.Contains('"reason": "device-mutation"')) "inventory 应记录被排除的设备改动脚本"
-foreach ($mutation in @("maa-scheduled-reboot.sh", "arknights-apk-update.sh", "maa-edit.sh")) {
+foreach ($mutation in @("maa-scheduled-reboot.sh", "maa-edit.sh")) {
     Assert-That ($inventory.Contains('"name": "' + $mutation + '", "reason": "device-mutation"')) "inventory 应以 device-mutation 记录 $mutation"
 }
 Assert-That ($inventory.Contains('"name": "_legacy_flat", "reason": "directory"') -or $inventory.Contains('"name": "_legacy_flat"')) "inventory 应记录被排除的 _legacy_flat 目录"
@@ -240,13 +240,13 @@ $realWebuiBefore = Get-Sha256Hex $webuiSource
 $r = Invoke-Build -Arguments @("-Source", $realSource, "-Out", $out9, "-Version", "0.0.0-dev")
 Assert-That ($r.ExitCode -eq 0) "内置脚本源应能构建：$($r.Output)"
 if ($r.ExitCode -eq 0) {
-    foreach ($required in @("maa-run.sh", "maa-auto-update.sh", "maa-webui.py", "maa-task-guard.py", "maa_weekly_plan.py", "infrast-operator-requirements.json")) {
+    foreach ($required in @("arknights-apk-update.sh", "maa-run.sh", "maa-auto-update.sh", "maa-webui.py", "maa-task-guard.py", "maa_weekly_plan.py", "infrast-operator-requirements.json")) {
         Assert-That (Test-Path -LiteralPath (Join-Path $out9 "project\$required")) "内置源构建缺少 $required"
     }
     foreach ($forbidden in @("start_webui.sh", "ssh_watchdog.sh", "ssh_watchdog_worker.sh", "tg.txt", "maa-run.sh.bak-20260101", "README.md")) {
         Assert-That (-not (Test-Path -LiteralPath (Join-Path $out9 "project\$forbidden"))) "内置源构建不应包含 $forbidden"
     }
-    foreach ($mutation in @("maa-scheduled-reboot.sh", "arknights-apk-update.sh", "maa-edit.sh")) {
+    foreach ($mutation in @("maa-scheduled-reboot.sh", "maa-edit.sh")) {
         Assert-That (-not (Test-Path -LiteralPath (Join-Path $out9 "project\$mutation"))) "内置源构建不应包含设备改动脚本 $mutation"
     }
     $realInventoryText = Read-Text (Join-Path $out9 "inventory.json")

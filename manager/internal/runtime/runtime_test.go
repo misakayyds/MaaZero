@@ -415,7 +415,7 @@ func TestCheckRejectsBrokenRootfsLayout(t *testing.T) {
 	})
 	t.Run("device mutation present", func(t *testing.T) {
 		f := newFixture(t)
-		writeTestFile(t, filepath.Join(f.rootfs, projectRelDir, "arknights-apk-update.sh"), "#!/bin/bash\n", 0o644)
+		writeTestFile(t, filepath.Join(f.rootfs, projectRelDir, "maa-scheduled-reboot.sh"), "#!/bin/bash\n", 0o644)
 		a := f.adapter(t, "linux")
 		if err := a.Check(context.Background(), f.bundle); !errors.Is(err, ErrUnsafeProject) {
 			t.Fatalf("Check = %v, want ErrUnsafeProject", err)

@@ -3,7 +3,7 @@
 # 只停止后台程序：先调用二进制 stop，再保留 /data/local/maa-platform 下的全部用户数据。
 # 不使用按进程名匹配的强杀命令，也不删除任何文件。
 
-DATA_ROOT=/data/local/maa-platform
+DATA_ROOT="${DATA_ROOT:-/data/local/maa-platform}"
 MODDIR="${MODDIR:-${0%/*}}"
 case "$MODDIR" in
   */*) ;;

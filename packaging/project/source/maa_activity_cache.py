@@ -8,7 +8,11 @@ import urllib.request
 from maa_weekly_plan import atomic_write_text
 
 ACTIVITY_API='https://api.maa.plus/MaaAssistantArknights/api/gui/StageActivityV2.json'
-DEFAULT_CACHE=Path(os.environ.get('XDG_CACHE_HOME') or Path.home()/'.cache')/'maa/StageActivityV2.json'
+_CACHE_ROOT = Path(
+    os.environ.get('MAA_CACHE_DIR')
+    or (Path(os.environ.get('XDG_CACHE_HOME') or Path.home()/'.cache') / 'maa')
+)
+DEFAULT_CACHE = _CACHE_ROOT / 'StageActivityV2.json'
 MAX_AGE=3600
 MAX_BYTES=2*1024*1024
 

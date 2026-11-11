@@ -2,6 +2,7 @@
 import argparse
 import copy
 import json
+import os
 import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -262,9 +263,14 @@ def effective_stage(data, activity_data, now):
 
 
 def main():
+    default_cache_dir = os.environ.get("MAA_CACHE_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "maa"
+    )
+    default_activity_file = os.path.join(default_cache_dir, "StageActivityV2.json")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-file", required=True)
-    parser.add_argument("--activity-file", default="/root/.cache/maa/StageActivityV2.json")
+    parser.add_argument("--activity-file", default=default_activity_file)
     parser.add_argument("--output")
     parser.add_argument("--now")
     parser.add_argument("--dry-run-stage", action="store_true")

@@ -93,7 +93,7 @@ running_pid() {
 
 # 就绪证据必须是「本进程自己持有的、监听 127.0.0.1:8088 的 socket inode」。
 # 只看全局端口被占用不算数：设备上可能已有别的服务（例如既有生产 WebUI）
-# 占着 8088，那与本次启动无关。/proc/net/tcp 中 127.0.0.1:8088 = 0100007F:1F90，
+# 占着 8088，那与本次启动无关。/proc/net/tcp 中 127.0.0.1:8088 = 0100007F:1F98，
 # 状态 0A 为 LISTEN，行尾字段是该 socket 的 inode。
 listening_socket_owned_by() {
   target_pid="$1"
@@ -107,7 +107,7 @@ listening_socket_owned_by() {
     inode="${inode%]}"
     [ -n "$inode" ] || continue
     # 固定字段匹配：$2=本地地址、$4=状态、$10=inode。这样 inode 123 不会匹配 1234。
-    if awk -v want="$inode" '$2 == "0100007F:1F90" && $4 == "0A" && $10 "" == want { found = 1 } END { exit(found ? 0 : 1) }' /proc/net/tcp 2>/dev/null; then
+    if awk -v want="$inode" '$2 == "0100007F:1F98" && $4 == "0A" && $10 "" == want { found = 1 } END { exit(found ? 0 : 1) }' /proc/net/tcp 2>/dev/null; then
       return 0
     fi
   done
@@ -115,15 +115,30 @@ listening_socket_owned_by() {
 }
 
 # 有上限的等待（最多约 4 秒），不会长时间阻塞开机。
+# 开机高负载下 nohup 刚 fork 尚未 execve 到 $BIN 时允许极短过渡窗口，
+# 但最终必须同时满足 daemon_alive 与 socket inode 归属校验才算启动成功。
+nohup_exec_pending() {
+  target_pid="$1"
+  [ -r "/proc/$target_pid/cmdline" ] || return 1
+  argv="$(tr "\0" "\n" < "/proc/$target_pid/cmdline" 2>/dev/null)"
+  argv0="$(printf "%s\n" "$argv" | head -n 1)"
+  argv1="$(printf "%s\n" "$argv" | head -n 2 | tail -n 1)"
+  case "$argv0" in
+    nohup|*/nohup) [ "$argv1" = "$BIN" ] && return 0 ;;
+  esac
+  return 1
+}
+
 wait_ready() {
   target_pid="$1"
   ticks=0
   while [ "$ticks" -lt 16 ]; do
-    if ! daemon_alive "$target_pid"; then
+    if daemon_alive "$target_pid"; then
+      if listening_socket_owned_by "$target_pid"; then
+        return 0
+      fi
+    elif ! nohup_exec_pending "$target_pid"; then
       return 1
-    fi
-    if listening_socket_owned_by "$target_pid"; then
-      return 0
     fi
     sleep 0.25 2>/dev/null || sleep 1
     ticks=$((ticks + 1))

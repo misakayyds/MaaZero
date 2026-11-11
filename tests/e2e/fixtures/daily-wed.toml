@@ -1,0 +1,11 @@
+[[tasks]]
+type = "StartUp"
+client_type = "Official"
+start_game_enabled = true
+
+[[tasks]]
+type = "Fight"
+stage = "AP-5"
+medicine = 0
+expiring_medicine = 0
+times = 10

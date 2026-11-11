@@ -192,7 +192,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Resolve MAA weekly task configuration")
     subparsers = parser.add_subparsers(dest="command", required=True)
     resolve_parser = subparsers.add_parser("resolve")
-    resolve_parser.add_argument("--config-dir", required=True, type=Path)
+    default_config = os.environ.get("MAA_CONFIG_DIR")
+    resolve_parser.add_argument(
+        "--config-dir",
+        default=Path(default_config) if default_config else None,
+        required=default_config is None,
+        type=Path,
+    )
     resolve_parser.add_argument("--weekday", choices=WEEKDAYS)
     resolve_parser.add_argument("--format", choices=("json", "shell"), default="json")
     args = parser.parse_args()

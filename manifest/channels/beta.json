@@ -1,0 +1,148 @@
+{
+  "schema_version": 1,
+  "sequence": 1,
+  "channel": "beta",
+  "generated_at": "2026-11-11T23:28:27Z",
+  "minimum_bootstrap_version": "0.1.0",
+  "notices": [],
+  "blocked_versions": [],
+  "components": [
+    {
+      "id": "maa-managerd",
+      "kind": "manager",
+      "version": "0.1.0-preview",
+      "required": true,
+      "install_mode": "replace-file",
+      "compatibility": {
+        "architectures": [
+          "arm64-v8a"
+        ],
+        "android_api": {
+          "minimum": 30,
+          "maximum": 40
+        },
+        "root_managers": [
+          "magisk",
+          "kernelsu",
+          "apatch"
+        ]
+      },
+      "artifacts": [
+        {
+          "url": "https://github.com/MaaXYZ/maa-phone-manager/releases/download/v0.1.0-preview/maa-managerd",
+          "mirrors": [],
+          "sha256": "95568189a5c8756b2036528f9973f97b5ee5c8f753376838c4c1eb2ab66fb45f",
+          "size": 7078050,
+          "media_type": "application/octet-stream",
+          "compression": "none",
+          "provenance": {
+            "publisher": "MAA Phone Manager",
+            "source_url": "https://github.com/MaaXYZ/maa-phone-manager/tree/v0.1.0-preview",
+            "license_url": "https://github.com/MaaXYZ/maa-phone-manager/blob/v0.1.0-preview/LICENSE"
+          }
+        }
+      ],
+      "health_checks": [
+        "manager-api"
+      ]
+    },
+    {
+      "id": "maa-phone-project",
+      "kind": "project",
+      "version": "0.1.0-preview",
+      "required": true,
+      "install_mode": "extract-versioned",
+      "compatibility": {
+        "architectures": [
+          "arm64-v8a"
+        ],
+        "android_api": {
+          "minimum": 30,
+          "maximum": 40
+        },
+        "root_managers": [
+          "magisk",
+          "kernelsu",
+          "apatch"
+        ]
+      },
+      "artifacts": [
+        {
+          "url": "https://github.com/MaaXYZ/maa-phone-manager/releases/download/v0.1.0-preview/maa-phone-project-0.1.0-preview.tar.gz",
+          "mirrors": [],
+          "sha256": "927e89acf9e210e77143b252e93c5728c7d7be35f9135d31167c443eb144dcd4",
+          "size": 327760,
+          "media_type": "application/gzip",
+          "compression": "tar.gz",
+          "provenance": {
+            "publisher": "MAA Phone Manager",
+            "source_url": "https://github.com/MaaXYZ/maa-phone-manager/tree/v0.1.0-preview",
+            "license_url": "https://github.com/MaaXYZ/maa-phone-manager/blob/v0.1.0-preview/LICENSE"
+          }
+        }
+      ],
+      "health_checks": [
+        "webui-static",
+        "config-parse"
+      ]
+    },
+    {
+      "id": "debian-rootfs",
+      "kind": "runtime",
+      "version": "12.11.0",
+      "required": true,
+      "install_mode": "extract-versioned",
+      "compatibility": {
+        "architectures": [
+          "arm64-v8a"
+        ],
+        "android_api": {
+          "minimum": 30,
+          "maximum": 40
+        },
+        "root_managers": [
+          "magisk",
+          "kernelsu",
+          "apatch"
+        ]
+      },
+      "artifacts": [
+        {
+          "url": "https://github.com/MaaXYZ/maa-phone-manager/releases/download/rootfs-12.11.0/debian-rootfs-12.11.0-arm64.tar.gz",
+          "mirrors": [],
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "size": 536870912,
+          "media_type": "application/gzip",
+          "compression": "tar.gz",
+          "provenance": {
+            "publisher": "MAA Phone Manager CI from Debian packages",
+            "source_url": "https://snapshot.debian.org/archive/debian/20260901T000000Z/",
+            "license_url": "https://www.debian.org/legal/licenses/"
+          }
+        }
+      ],
+      "health_checks": [
+        "debian-exec",
+        "maa-version"
+      ]
+    }
+  ],
+  "upstream_policy": {
+    "maa-cli": {
+      "strategy": "maa-self-update",
+      "channel": "beta",
+      "automatic": false,
+      "allowed_versions": ">=0.5.0 <1.0.0"
+    },
+    "maacore": {
+      "strategy": "maa-update",
+      "channel": "beta",
+      "automatic": true
+    },
+    "maa-resource": {
+      "strategy": "resource-sync",
+      "channel": "beta",
+      "automatic": true
+    }
+  }
+}

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -19,10 +20,24 @@ from maa_operator_box import (
 )
 
 
-SCRIPT_DIR = Path("/root/maa-scripts")
-CONFIG_DIR = Path("/root/.config/maa")
-RESOURCE_DIR = Path("/root/.local/share/maa/resource")
-ASST_LOG_PATH = Path("/root/.local/state/maa/debug/asst.log")
+SCRIPT_DIR = Path(os.environ.get("MAA_HOME", Path(__file__).resolve().parent))
+CONFIG_DIR = Path(
+    os.environ.get("MAA_CONFIG_DIR")
+    or (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "maa")
+)
+RESOURCE_DIR = Path(
+    os.environ.get("MAA_RESOURCE_DIR")
+    or (Path(os.environ.get("MAA_DATA_DIR") or (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "maa")) / "resource")
+)
+ASST_LOG_PATH = Path(
+    os.environ.get("MAA_ASST_LOG")
+    or (Path(os.environ.get("MAA_STATE_DIR") or (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "maa")) / "debug" / "asst.log")
+)
+MAA_BIN = (
+    os.environ.get("MAA_BIN")
+    or shutil.which("maa")
+    or "/root/.local/bin/maa"
+)
 TASK_TEXT = """[[tasks]]
 name = "开始唤醒"
 type = "StartUp"
@@ -47,7 +62,7 @@ def atomic_task_file() -> None:
 def maa_version() -> str:
     try:
         result = subprocess.run(
-            ["/root/.local/bin/maa", "version"],
+            [MAA_BIN, "version"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -69,10 +84,11 @@ def resource_version() -> str:
 def main() -> int:
     atomic_task_file()
     scan_started_ns = time.time_ns()
+    runner_cmd = os.environ.get("MAA_RUN_SCRIPT") or str(SCRIPT_DIR / "maa-run.sh")
     process = subprocess.Popen(
         [
             "/bin/bash",
-            str(SCRIPT_DIR / "maa-run.sh"),
+            runner_cmd,
             "operator-scan",
             "--debug",
         ],

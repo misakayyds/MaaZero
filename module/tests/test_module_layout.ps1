@@ -140,7 +140,7 @@ if (Test-Path -LiteralPath $servicePath -PathType Leaf) {
     Assert-That (($service.IndexOf("require_root_700") -ge 0) -and ($service.IndexOf("require_root_700") -lt $service.IndexOf("nohup"))) "the root:700 check must run before launching the daemon"
     Assert-That (($service.IndexOf("require_root_700") -ge 0) -and ($service.IndexOf("require_root_700") -lt $service.IndexOf('> "$PIDFILE"'))) "the root:700 check must run before writing the pid file"
     Assert-That ($service -match "wait_ready") "service.sh must verify readiness before reporting success"
-    Assert-That ($service -match "0100007F:1F90") "readiness must check the fixed loopback port (127.0.0.1:8088)"
+    Assert-That ($service -match "0100007F:1F98") "readiness must check the fixed loopback port (127.0.0.1:8088)"
     Assert-That ($service.IndexOf('/proc/$target_pid/fd') -ge 0) "readiness must inspect the daemon's own file descriptors"
     Assert-That ($service.IndexOf("socket:") -ge 0) "readiness must resolve the daemon's listening socket inode"
     Assert-That ($service.IndexOf('$inode') -ge 0) "readiness must match the socket inode, not just the global port"

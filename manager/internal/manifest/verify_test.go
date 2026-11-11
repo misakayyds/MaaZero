@@ -46,6 +46,40 @@ func TestExampleManifestMatchesVerifier(t *testing.T) {
 	}
 }
 
+func TestGeneratedChannelManifestsMatchVerifier(t *testing.T) {
+	paths := []string{
+		filepath.Join("..", "..", "..", "manifest", "channels", "stable.json"),
+		filepath.Join("..", "..", "..", "manifest", "channels", "beta.json"),
+		filepath.Join("..", "..", "..", "dist", "channels", "stable.json"),
+		filepath.Join("..", "..", "..", "dist", "channels", "beta.json"),
+	}
+	for _, manifestPath := range paths {
+		payload, err := os.ReadFile(manifestPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", manifestPath, err)
+		}
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey() error = %v", err)
+		}
+
+		manifest, err := LoadAndVerify(payload, ed25519.Sign(privateKey, payload), publicKey)
+		if err != nil {
+			t.Fatalf("manifest at %s rejected: %v", manifestPath, err)
+		}
+		expectedChannel := "stable"
+		if strings.HasSuffix(manifestPath, "beta.json") {
+			expectedChannel = "beta"
+		}
+		if manifest.Sequence != 1 || manifest.Channel != expectedChannel {
+			t.Fatalf("manifest at %s identity mismatch: sequence %d channel %q", manifestPath, manifest.Sequence, manifest.Channel)
+		}
+		if len(manifest.Components) != 3 {
+			t.Fatalf("manifest at %s component count = %d, want 3", manifestPath, len(manifest.Components))
+		}
+	}
+}
+
 func TestLoadAndVerifyRejectsInvalidSignature(t *testing.T) {
 	valid := validManifestMap(t)
 	signed := signedPayload(t, valid, nil)

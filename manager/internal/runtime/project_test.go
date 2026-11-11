@@ -60,7 +60,6 @@ func TestScanProjectDirRejectsUnsafeLayouts(t *testing.T) {
 		{"screen helper", "screen_backlight_off.sh", "#!/bin/sh\n", ErrUnsafeProject},
 		{"launcher", "start_webui.sh", "#!/bin/sh\n", ErrUnsafeProject},
 		{"reboot automation", "maa-scheduled-reboot.sh", "#!/bin/bash\n", ErrUnsafeProject},
-		{"apk installer", "arknights-apk-update.sh", "#!/bin/bash\n", ErrUnsafeProject},
 		{"shell editor entry", "maa-edit.sh", "#!/bin/bash\n", ErrUnsafeProject},
 		{"backup", "maa-webui.py.bak-20260912", "x\n", ErrUnsafeProject},
 		{"backup dir marker", "backups", "x\n", ErrUnsafeProject},

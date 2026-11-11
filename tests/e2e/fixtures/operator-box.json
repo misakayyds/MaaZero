@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-11-11T12:00:00+08:00",
+  "operators": {
+    "char_002_amiya": {
+      "id": "char_002_amiya",
+      "name": "阿米娅",
+      "level": 80,
+      "elite": 2,
+      "potential": 6,
+      "skills": [{"id": "skchr_amiya_1", "level": 7, "specialize": 3}]
+    }
+  }
+}

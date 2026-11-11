@@ -3,17 +3,21 @@
 # has new map data but lacks tasks/Stages navigation support.
 set -uo pipefail
 
-export PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+MAA_HOME="${MAA_HOME:-/root/maa-scripts}"
+MAA_DATA_DIR="${MAA_DATA_DIR:-/root/.local/share/maa}"
+export PATH="${HOME}/.local/bin:${MAA_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export LANG="${LANG:-en_US.UTF-8}"
 
 LOG_FILE="${LOG_FILE:-/dev/stdout}"
-RESOURCE_DIR="${RESOURCE_DIR:-/root/.local/share/maa/resource}"
+RESOURCE_DIR="${RESOURCE_DIR:-$MAA_DATA_DIR/resource}"
 RESOURCE_SOURCE_DIR="${RESOURCE_SOURCE_DIR:-}"
 CORE_RESOURCE_GIT_URL="${MAA_NAV_OVERLAY_GIT_URL:-https://github.com/MaaAssistantArknights/MaaAssistantArknights.git}"
 CORE_RESOURCE_REF="${MAA_NAV_OVERLAY_REF:-dev-v2}"
-CORE_RESOURCE_CLONE_DIR="${MAA_NAV_OVERLAY_CLONE_DIR:-/root/.local/share/maa/MaaAssistantArknights-dev-v2}"
+CORE_RESOURCE_CLONE_DIR="${MAA_NAV_OVERLAY_CLONE_DIR:-$MAA_DATA_DIR/MaaAssistantArknights-dev-v2}"
 RECENT_GROUP_LIMIT="${MAA_NAV_OVERLAY_GROUP_LIMIT:-4}"
 STATE_FILE="${MAA_NAV_OVERLAY_STATE_FILE:-$RESOURCE_DIR/.maa-nav-overlay-state.json}"
+MAA_NAV_OVERLAY="${MAA_NAV_OVERLAY:-0}"
+MAA_NAV_OVERLAY_ALLOW_GIT="${MAA_NAV_OVERLAY_ALLOW_GIT:-0}"
 
 log() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] [nav-overlay] $*"
@@ -148,6 +152,15 @@ PY
 }
 
 prepare_core_resource_checkout() {
+    if [[ -n "$RESOURCE_SOURCE_DIR" && -d "$RESOURCE_SOURCE_DIR" ]]; then
+        log "使用本地已就绪资源源目录，跳过 Git 克隆: $RESOURCE_SOURCE_DIR"
+        return 0
+    fi
+    if [[ "$MAA_NAV_OVERLAY_ALLOW_GIT" != "1" ]]; then
+        log "未配置本地资源源且已禁用运行时 Git 克隆 (MAA_NAV_OVERLAY_ALLOW_GIT != 1)"
+        return 1
+    fi
+
     mkdir -p "$(dirname "$CORE_RESOURCE_CLONE_DIR")"
     if [[ -d "$CORE_RESOURCE_CLONE_DIR/.git" ]]; then
         log "更新官方主仓资源索引: ref=$CORE_RESOURCE_REF"
@@ -168,9 +181,15 @@ prepare_core_resource_checkout() {
 }
 
 apply_overlay() {
+    local source_dir
+    if [[ -n "$RESOURCE_SOURCE_DIR" && -d "$RESOURCE_SOURCE_DIR" ]]; then
+        source_dir="$RESOURCE_SOURCE_DIR"
+    else
+        source_dir="$CORE_RESOURCE_CLONE_DIR/resource"
+    fi
     local core_commit
-    core_commit="$(git -C "$CORE_RESOURCE_CLONE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    python3 - "$RESOURCE_DIR" "$CORE_RESOURCE_CLONE_DIR/resource" "$STATE_FILE" "$CORE_RESOURCE_REF" "$core_commit" "$@" <<'PY'
+    core_commit="$(git -C "$CORE_RESOURCE_CLONE_DIR" rev-parse --short HEAD 2>/dev/null || echo local)"
+    python3 - "$RESOURCE_DIR" "$source_dir" "$STATE_FILE" "$CORE_RESOURCE_REF" "$core_commit" "$@" <<'PY'
 import json
 import hashlib
 import shutil
@@ -260,7 +279,7 @@ PY
 }
 
 main() {
-    if [[ "${MAA_NAV_OVERLAY:-1}" != "1" ]]; then
+    if [[ "${MAA_NAV_OVERLAY:-0}" != "1" ]]; then
         log "导航覆盖层已关闭: MAA_NAV_OVERLAY=${MAA_NAV_OVERLAY:-}"
         return 0
     fi

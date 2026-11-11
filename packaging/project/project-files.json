@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "files": [
+    "arknights-apk-update.sh",
     "infrast-operator-requirements.json",
     "maa_cultivation_runtime.py",
     "maa_cultivation_service.py",

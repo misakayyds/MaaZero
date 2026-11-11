@@ -16,12 +16,13 @@ import uuid
 SKIP_FILENAME = "skip-next-daily.json"
 DAILY_CRON_RE = re.compile(
     rb"^[ \t]*(\d{1,2})[ \t]+(\d{1,2})[ \t]+\*[ \t]+\*[ \t]+([^ \t]+)"
-    rb"[ \t]+/root/maa-scripts/maa-run\.sh[ \t]+daily(?:[ \t]|$)"
+    rb"[ \t]+(?:\S*/)?maa-run(?:\.sh)?[ \t]+daily(?:[ \t]|$)"
 )
 
 
-def skip_file(config_dir: str | Path) -> Path:
-    return Path(config_dir) / SKIP_FILENAME
+def skip_file(config_dir: str | Path | None = None) -> Path:
+    target_dir = config_dir or os.environ.get("MAA_CONFIG_DIR", "/root/.config/maa")
+    return Path(target_dir) / SKIP_FILENAME
 
 
 def _cron_weekdays(value: str) -> set[int]:

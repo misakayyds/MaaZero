@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,6 +25,10 @@ import (
 	"maa-phone-manager/manager/internal/api"
 	"maa-phone-manager/manager/internal/control"
 	"maa-phone-manager/manager/internal/device"
+	"maa-phone-manager/manager/internal/driver"
+	"maa-phone-manager/manager/internal/install"
+	"maa-phone-manager/manager/internal/manifest"
+	maaruntime "maa-phone-manager/manager/internal/runtime"
 	"maa-phone-manager/manager/internal/store"
 )
 
@@ -49,6 +55,9 @@ func run(args []string, out io.Writer) error {
 		}
 		_, err := fmt.Fprintln(out, daemonVersion())
 		return err
+	}
+	if args[0] == "seed-release" {
+		return runSeedRelease(args[1:], out)
 	}
 	if args[0] != "serve" && args[0] != "open-ui" && args[0] != "stop" {
 		return errors.New("unsupported command")
@@ -110,9 +119,27 @@ func run(args []string, out io.Writer) error {
 		cfg.Device = facts.ManifestDeviceFacts()
 	}
 	cfg.Version = daemonVersion()
-	// Full unattended-runtime activation is not yet verified. Do not enable
-	// installation merely because Probe or a chroot version command succeeded.
-	backend, err := control.New(cfg, s, nil)
+	rootfsPath := filepath.Join(*dataRoot, "runtime", "rootfs")
+	upstreamURL := *upstream
+	if upstreamURL == "" {
+		upstreamURL = "http://127.0.0.1:8089"
+	}
+	drv, err := driver.New(driver.Config{
+		DataRoot:    *dataRoot,
+		RootfsPath:  rootfsPath,
+		BusyboxPath: driver.ResolveBusybox(),
+		UpstreamURL: upstreamURL,
+	})
+	if err != nil {
+		return fmt.Errorf("init driver: %w", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		_ = drv.Stop(stopCtx)
+	}()
+
+	backend, err := control.New(cfg, s, drv)
 	if err != nil {
 		return err
 	}
@@ -122,7 +149,7 @@ func run(args []string, out io.Writer) error {
 		return err
 	}
 	defer l.Close()
-	apiCfg := api.Config{Host: l.Addr().String(), Backend: backend, Upstream: *upstream}
+	apiCfg := api.Config{Host: l.Addr().String(), Backend: backend, Upstream: upstreamURL}
 	if *assets != "" {
 		apiCfg.Assets = os.DirFS(*assets)
 	}
@@ -140,6 +167,7 @@ func run(args []string, out io.Writer) error {
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(l) }()
+	backend.StartBootstrap()
 	_, _ = fmt.Fprintln(out, "MAA manager preview started; authenticated local control only")
 	select {
 	case <-ctx.Done():
@@ -262,4 +290,172 @@ func command(root, action string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return exec.CommandContext(ctx, "/system/bin/am", "start", "-a", "android.intent.action.VIEW", "-d", line).Run()
+}
+
+func runSeedRelease(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("seed-release", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	dataRoot := flags.String("data-root", "/data/local/maa-platform", "private data root")
+	projectArchive := flags.String("project-archive", "", "local tar.gz project archive")
+	projectVersion := flags.String("project-version", daemonVersion(), "project release version")
+	rootfsArchive := flags.String("rootfs-archive", "", "optional local tar.gz rootfs archive")
+	rootfsVersion := flags.String("rootfs-version", "12.11.0", "rootfs release version")
+	replace := flags.Bool("replace", false, "replace existing project release directory")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("unexpected arguments")
+	}
+	if *projectArchive == "" && *rootfsArchive == "" {
+		return errors.New("at least one of --project-archive or --rootfs-archive is required")
+	}
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return errors.New("runtime requires rooted Android; use Go tests on the development host")
+	}
+	if !filepath.IsAbs(*dataRoot) {
+		return errors.New("data root must be absolute")
+	}
+	if err := prepareDataRoot(*dataRoot); err != nil {
+		return err
+	}
+	s, err := store.Open(*dataRoot)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	if *rootfsArchive != "" {
+		art, err := localTarGzArtifact(*rootfsArchive, "debian-rootfs", *rootfsVersion)
+		if err != nil {
+			return err
+		}
+		runtimeDir := filepath.Join(*dataRoot, "runtime")
+		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+			return fmt.Errorf("create runtime dir: %w", err)
+		}
+		rootfsDest := filepath.Join(runtimeDir, "rootfs")
+		if _, err := os.Stat(rootfsDest); errors.Is(err, os.ErrNotExist) {
+			if _, err := install.StageRootfs(ctx, art, *rootfsArchive, rootfsDest); err != nil {
+				return fmt.Errorf("stage rootfs: %w", err)
+			}
+		} else if err != nil {
+			return err
+		}
+		rootfsRelDir, err := s.ReleasePath("debian-rootfs", *rootfsVersion)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(rootfsRelDir, 0700); err != nil {
+			return err
+		}
+		if rawDesc, err := json.Marshal(art); err == nil {
+			_ = os.WriteFile(filepath.Join(rootfsRelDir, ".maa-artifact.json"), append(rawDesc, '\n'), 0600)
+		}
+		if err := commitLocalSeed(s, "debian-rootfs", *rootfsVersion, art.SHA256); err != nil {
+			return err
+		}
+	}
+
+	if *projectArchive != "" {
+		art, err := localTarGzArtifact(*projectArchive, "maa-phone-project", *projectVersion)
+		if err != nil {
+			return err
+		}
+		dest, err := s.ReleasePath("maa-phone-project", *projectVersion)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
+			return err
+		}
+		if *replace {
+			_ = os.RemoveAll(dest)
+		}
+		if _, err := os.Stat(dest); errors.Is(err, os.ErrNotExist) {
+			rawDesc, err := json.Marshal(art)
+			if err != nil {
+				return err
+			}
+			seal := map[string][]byte{".maa-artifact.json": append(rawDesc, '\n')}
+			if err := install.StageSealed(ctx, art, *projectArchive, dest, seal); err != nil {
+				return fmt.Errorf("stage project: %w", err)
+			}
+		} else if err != nil {
+			return err
+		}
+		if err := maaruntime.ScanProjectDir(dest); err != nil {
+			return fmt.Errorf("validate project: %w", err)
+		}
+		if err := commitLocalSeed(s, "maa-phone-project", *projectVersion, art.SHA256); err != nil {
+			return err
+		}
+	}
+
+	_, err = fmt.Fprintln(out, "SEED_OK")
+	return err
+}
+
+func localTarGzArtifact(archivePath, component, ver string) (manifest.Artifact, error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return manifest.Artifact{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return manifest.Artifact{}, err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return manifest.Artifact{}, err
+	}
+	return manifest.Artifact{
+		URL:         fmt.Sprintf("https://local.invalid/%s/%s/%s-%s.tar.gz", component, ver, component, ver),
+		SHA256:      hex.EncodeToString(h.Sum(nil)),
+		Size:        info.Size(),
+		MediaType:   "application/gzip",
+		Compression: "tar.gz",
+	}, nil
+}
+
+func commitLocalSeed(s *store.Store, component, ver, digest string) error {
+	if s.Pending() != nil {
+		tx, err := s.Resume()
+		if err != nil {
+			return err
+		}
+		if err := tx.Rollback("seed_reset"); err != nil {
+			return err
+		}
+	}
+	before := s.Versions()[component]
+	if before.Current == ver {
+		return nil
+	}
+	tx, err := s.BeginUpdate(component, before.Current, ver, digest)
+	if err != nil {
+		return err
+	}
+	for _, st := range []store.Stage{
+		store.Downloading,
+		store.Verifying,
+		store.Staging,
+		store.WaitingIdle,
+		store.Switching,
+		store.HealthCheck,
+	} {
+		if err := tx.Advance(st); err != nil {
+			_ = tx.Rollback("seed_failed")
+			return err
+		}
+	}
+	if err := tx.Commit(func() error { return nil }); err != nil {
+		_ = tx.Rollback("seed_failed")
+		return err
+	}
+	return nil
 }

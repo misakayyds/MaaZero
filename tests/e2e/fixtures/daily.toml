@@ -1,0 +1,16 @@
+[[tasks]]
+type = "StartUp"
+client_type = "Official"
+start_game_enabled = true
+
+[[tasks]]
+type = "Fight"
+stage = "1-7"
+medicine = 0
+expiring_medicine = 0
+times = 5
+
+[[tasks]]
+type = "Infrast"
+facility = ["Trade", "Manufacture", "Control", "Dormitory"]
+mode = 0

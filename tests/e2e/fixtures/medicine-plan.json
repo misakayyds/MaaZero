@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "item_id": "30012",
+  "threshold": 80,
+  "stage": "SN-10",
+  "batch_size": 9999
+}

@@ -1,0 +1,5 @@
+{
+  "manifest_url": "https://release.example.invalid/manifest.json",
+  "public_key": "MC4CAQAwBQYDK2VwBCIEINT3v+9n5Qc6p1X5f9/kL2qZ9xY8u7y6z5w4v3u2t1s0",
+  "channel": "stable"
+}

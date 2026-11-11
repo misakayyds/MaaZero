@@ -1,5 +1,6 @@
 # Go build caches and local binaries
 .cache/
+bin/
 manager/maa-managerd
 manager/maa-managerd.exe
 manager-preview-arm64
@@ -8,6 +9,8 @@ manager-preview-arm64
 dist/
 preview-dist/
 .codex_diagnostics/
+.agents/teamwork/
+test-report-audit.json
 
 # Python caches
 __pycache__/

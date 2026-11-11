@@ -11,8 +11,11 @@ import http.server
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import threading
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -68,25 +71,31 @@ from maa_schedule_control import (
 )
 
 PORT = 8088
-MAA_BIN = "/root/.local/bin/maa"
-SCRIPT_DIR = "/root/maa-scripts"
-LOG_DIR = "/var/log/maa"
+SCRIPT_DIR = os.environ.get("MAA_HOME", str(Path(__file__).resolve().parent))
+MAA_BIN = os.environ.get("MAA_BIN", shutil.which("maa") or os.path.expanduser("~/.local/bin/maa"))
+LOG_DIR = os.environ.get("MAA_LOG_DIR", "/var/log/maa")
+DATA_DIR = os.environ.get("MAA_DATA_DIR", os.path.expanduser("~/.local/share/maa"))
+STATE_DIR = os.environ.get("MAA_STATE_DIR", os.path.expanduser("~/.local/state/maa"))
+CACHE_DIR = os.environ.get("MAA_CACHE_DIR", os.environ.get("XDG_CACHE_HOME") or "/var/cache/maa")
+ADB_ADDR = os.environ.get("MAA_ADB_ADDR", "127.0.0.1:5555")
 STARTUP_HEALTH_STATE_FILE = os.path.join(LOG_DIR, "startup-health.env")
-ENV_PATH = "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-CONFIG_DIR = ""
-try:
-    r = subprocess.run([MAA_BIN, "dir", "config"], capture_output=True, text=True, timeout=5,
-                       env={**os.environ, "PATH": ENV_PATH})
-    CONFIG_DIR = r.stdout.strip()
-except Exception:
-    CONFIG_DIR = os.path.expanduser("~/.config/maa")
+ENV_PATH = f"{os.path.dirname(MAA_BIN)}:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+CONFIG_DIR = os.environ.get("MAA_CONFIG_DIR", "")
+if not CONFIG_DIR:
+    try:
+        r = subprocess.run([MAA_BIN, "dir", "config"], capture_output=True, text=True, timeout=5,
+                           env={**os.environ, "PATH": ENV_PATH})
+        CONFIG_DIR = r.stdout.strip()
+    except Exception:
+        CONFIG_DIR = os.path.expanduser("~/.config/maa")
 
 TASK_FILE = os.path.join(CONFIG_DIR, "tasks", "daily.toml")
 PROFILE_FILE = os.path.join(CONFIG_DIR, "profiles", "default.toml")
 CLI_FILE = os.path.join(CONFIG_DIR, "cli.toml")
-RESOURCE_DIR = "/root/.local/share/maa/resource"
-RESOURCE_CLONE_DIR = "/root/.local/share/maa/MaaResource/resource"
+RESOURCE_DIR = os.environ.get("MAA_RESOURCE_DIR", os.path.join(DATA_DIR, "resource"))
+RESOURCE_CLONE_DIR = os.path.join(DATA_DIR, "MaaResource", "resource")
 WEB_SERVER_CLASS = http.server.ThreadingHTTPServer
 
 FALLBACK_SUPPLY_STAGE_CODES = (
@@ -116,7 +125,7 @@ MAX_SCHEDULE_BODY_BYTES = 1_048_576
 MAX_CULTIVATION_BODY_BYTES = 262_144
 CULTIVATION_CATALOG_FILE = os.path.join(SCRIPT_DIR, "maa-cultivation-data.json")
 CULTIVATION_RUNNER = os.path.join(SCRIPT_DIR, "maa-cultivation-run.py")
-CULTIVATION_AVATAR_DIR = "/var/cache/maa/avatars"
+CULTIVATION_AVATAR_DIR = os.environ.get("MAA_AVATAR_DIR", os.path.join(CACHE_DIR, "avatars"))
 CULTIVATION_AVATAR_ID_RE = re.compile(r"^char_[0-9a-zA-Z_]{1,48}$")
 OPERATOR_SCAN_TASK = "operator-scan"
 OPERATOR_SCAN_TASK_TEXT = """[[tasks]]
@@ -143,7 +152,26 @@ def get_env():
     env = os.environ.copy()
     env["PATH"] = ENV_PATH
     env["LANG"] = "en_US.UTF-8"
+    env["MAA_HOME"] = SCRIPT_DIR
+    env["MAA_CONFIG_DIR"] = CONFIG_DIR
+    env["MAA_DATA_DIR"] = DATA_DIR
+    env["MAA_STATE_DIR"] = STATE_DIR
+    env["MAA_LOG_DIR"] = LOG_DIR
+    env["MAA_CACHE_DIR"] = CACHE_DIR
+    env["MAA_ADB_ADDR"] = ADB_ADDR
     return env
+
+
+def popen_bg(cmd, env=None):
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "env": env if env is not None else get_env(),
+    }
+    if hasattr(os, "setsid"):
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(cmd, **kwargs)
 
 
 def read_crontab_bytes():
@@ -230,6 +258,13 @@ INFRAST_REQUIREMENTS_PATH = (
 )
 
 
+def resolve_infrast_requirements_path():
+    state_override = Path(STATE_DIR) / "infrast-operator-requirements.json"
+    if state_override.is_file():
+        return state_override
+    return INFRAST_REQUIREMENTS_PATH
+
+
 def get_infrast_plan_list_payload(config_dir=CONFIG_DIR):
     try:
         manifest = _read_schedule_manifest(config_dir)
@@ -270,7 +305,7 @@ def get_operator_box_payload(config_dir=CONFIG_DIR, filename=None, crontab_raw=b
                 "filename": filename,
                 **compare_plan(details, snapshot),
             }
-            requirement_status = load_requirement_index(INFRAST_REQUIREMENTS_PATH)
+            requirement_status = load_requirement_index(resolve_infrast_requirements_path())
             payload["training"] = {
                 **compare_training(
                     details,
@@ -839,8 +874,11 @@ def get_maa_version():
 
 def get_adb_status():
     try:
-        r = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10, env=get_env())
-        return "device" in r.stdout
+        r = subprocess.run(["adb", "-s", ADB_ADDR, "get-state"], capture_output=True, text=True, timeout=5, env=get_env())
+        if r.returncode == 0 and "device" in r.stdout:
+            return True
+        r2 = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10, env=get_env())
+        return "device" in r2.stdout
     except: return False
 
 def get_logs(n=50):
@@ -854,7 +892,7 @@ def get_logs(n=50):
 
 def get_maacore_log(n=40):
     try:
-        f = os.path.expanduser("~/.local/state/maa/debug/asst.log")
+        f = os.environ.get("MAA_ASST_LOG") or os.path.join(STATE_DIR, "debug", "asst.log")
         if os.path.exists(f):
             lines = Path(f).read_text("utf-8", errors="replace").splitlines()
             return "\n".join(lines[-n:])
@@ -919,9 +957,7 @@ def run_task_bg(task_name, weekday=None, infrast_now=False):
                 cmd.extend(["--weekday", weekday])
             if infrast_now:
                 cmd.append("--infrast-now")
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=get_env())
+            proc = popen_bg(cmd)
             with run_lock: running_task["pid"] = proc.pid
             buf = []
             for line in proc.stdout:
@@ -960,16 +996,7 @@ def run_operator_scan_bg(config_dir=CONFIG_DIR):
             }
         return_code = None
         try:
-            proc = subprocess.Popen(
-                [
-                    "python3",
-                    f"{SCRIPT_DIR}/maa-operator-scan.py",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=get_env(),
-            )
+            proc = popen_bg(["python3", f"{SCRIPT_DIR}/maa-operator-scan.py"])
             with run_lock:
                 running_task["pid"] = proc.pid
             recent = []
@@ -1346,13 +1373,7 @@ def run_cultivation_bg(mode):
     def worker():
         global running_task
         try:
-            proc = subprocess.Popen(
-                ["python3", CULTIVATION_RUNNER, "--mode", mode],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=get_env(),
-            )
+            proc = popen_bg(["python3", CULTIVATION_RUNNER, "--mode", mode])
             with run_lock:
                 running_task["pid"] = proc.pid
             recent = []
@@ -1391,9 +1412,7 @@ def startup_health_bg():
                             "start_time": datetime.now().strftime("%H:%M:%S"),
                             "pid": None, "output": "开始启动健康检查...\n"}
         try:
-            proc = subprocess.Popen(
-                ["/bin/bash", f"{SCRIPT_DIR}/maa-run.sh", "--startup-health-check", "--debug"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=get_env())
+            proc = popen_bg(["/bin/bash", f"{SCRIPT_DIR}/maa-run.sh", "--startup-health-check", "--debug"])
             with run_lock: running_task["pid"] = proc.pid
             buf = []
             for line in proc.stdout:
@@ -1424,9 +1443,41 @@ def update_maa_bg():
         try:
             env = get_env()
             env["MAA_SELF_UPDATE"] = "1"
-            proc = subprocess.Popen(
-                ["/bin/bash", f"{SCRIPT_DIR}/maa-auto-update.sh"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+            proc = popen_bg(["/bin/bash", f"{SCRIPT_DIR}/maa-auto-update.sh"], env=env)
+            with run_lock: running_task["pid"] = proc.pid
+            buf = []
+            for line in proc.stdout:
+                buf.append(line.rstrip())
+                if len(buf) > 300: buf = buf[-300:]
+                with run_lock: running_task["output"] = "\n".join(buf)
+            proc.wait()
+            with run_lock:
+                running_task["output"] += f"\n\n--- 结束 (exit={proc.returncode}) ---"
+                running_task["active"] = False
+        except Exception as e:
+            with run_lock:
+                running_task["output"] += f"\n异常: {e}"
+                running_task["active"] = False
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
+def update_apk_bg(force=False):
+    global running_task
+    with run_lock:
+        if running_task["active"]: return False
+    def worker():
+        global running_task
+        with run_lock:
+            running_task = {"active": True, "task": "更新明日方舟客户端",
+                            "start_time": datetime.now().strftime("%H:%M:%S"),
+                            "pid": None, "output": "开始检查并更新明日方舟官服客户端 APK...\n"}
+        try:
+            env = get_env()
+            cmd = ["/bin/bash", f"{SCRIPT_DIR}/arknights-apk-update.sh", "--check"]
+            if force:
+                cmd.append("--force")
+            proc = popen_bg(cmd, env=env)
             with run_lock: running_task["pid"] = proc.pid
             buf = []
             for line in proc.stdout:
@@ -2140,6 +2191,7 @@ function renderHome() {
   h += `<details class="advanced-panel"><summary>维护操作</summary><div class="advanced-body card"><div class="btn-row">
     <button class="btn btn-s" onclick="doStartupHealth()" ${st.active?'disabled':''}>启动健康检查</button>
     <button class="btn btn-s" onclick="doUpdate()" ${st.active?'disabled':''}>更新 MAA</button>
+    <button class="btn btn-s" onclick="doApkUpdate()" ${st.active?'disabled':''}>更新明日方舟</button>
     <button class="btn btn-s" onclick="doGame('start')" ${st.active?'disabled':''}>启动游戏</button>
     <button class="btn btn-s" onclick="doGame('stop')" ${st.active?'disabled':''}>关闭游戏</button>
     <button class="btn btn-s" onclick="doKill()" ${!st.active?'disabled':''} style="color:var(--rd);border-color:var(--rd)">停止任务</button>
@@ -2180,6 +2232,10 @@ async function doRun(weekday='current') {
 }
 async function doUpdate() {
   await api('update', {method:'POST'});
+  await loadAll(); go('home');
+}
+async function doApkUpdate() {
+  await api('apk-update', {method:'POST'});
   await loadAll(); go('home');
 }
 async function doStartupHealth() {
@@ -5369,6 +5425,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok = update_maa_bg()
             self._json(200, {"ok": ok})
 
+        elif p == "/api/apk-update":
+            ok = update_apk_bg()
+            self._json(200, {"ok": ok})
+
         elif p == "/api/startup-health":
             ok = startup_health_bg()
             self._json(200, {"ok": ok})
@@ -5376,20 +5436,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p == "/api/kill":
             global running_task
             with run_lock:
-                pid = running_task["pid"]
+                pid = running_task.get("pid")
                 if pid:
                     try:
-                        subprocess.run(["pkill", "-P", str(pid)], env=get_env())
-                        os.kill(pid, 9)
-                    except Exception:
+                        if hasattr(os, "killpg"):
+                            os.killpg(pid, signal.SIGTERM)
+                            for _ in range(20):
+                                time.sleep(0.1)
+                                try:
+                                    os.killpg(pid, 0)
+                                except OSError:
+                                    break
+                            else:
+                                os.killpg(pid, signal.SIGKILL)
+                        else:
+                            os.kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, OSError):
                         pass
-                subprocess.run(["pkill", "-f", "maa run"], env=get_env())
-                subprocess.run(["pkill", "-f", "maa-run.sh"], env=get_env())
-                
-                # 显式恢复分辨率并强退游戏，防止 SIGKILL 导致 bash trap 无法触发而遗留横屏/游戏
+
+                # 通过 ADB 兜底强退明日方舟（使用标准 ADB_ADDR）
                 try:
-                    subprocess.run(["nsenter", "-t", "1", "-m", "--", "/system/bin/sh", "-c", "wm size reset"], env=get_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.run(["adb", "-s", "127.0.0.1:5555", "shell", "am", "force-stop", "com.hypergryph.arknights"], env=get_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(
+                        ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", "com.hypergryph.arknights"],
+                        env=get_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+                    )
                 except Exception:
                     pass
 
@@ -5401,9 +5471,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             action = body.get("action", "")
             cmd = []
             if action == "start":
-                cmd = ["adb", "-s", "127.0.0.1:5555", "shell", "monkey", "-p", "com.hypergryph.arknights", "-c", "android.intent.category.LAUNCHER", "1"]
+                cmd = ["adb", "-s", ADB_ADDR, "shell", "monkey", "-p", "com.hypergryph.arknights", "-c", "android.intent.category.LAUNCHER", "1"]
             elif action == "stop":
-                cmd = ["adb", "-s", "127.0.0.1:5555", "shell", "am", "force-stop", "com.hypergryph.arknights"]
+                cmd = ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", "com.hypergryph.arknights"]
             
             if cmd:
                 try:
@@ -5447,6 +5517,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    global PORT
+    if "MAA_WEBUI_PORT" in os.environ:
+        try:
+            PORT = int(os.environ["MAA_WEBUI_PORT"])
+        except ValueError:
+            pass
     os.makedirs(LOG_DIR, exist_ok=True)
     server = WEB_SERVER_CLASS(("0.0.0.0", PORT), Handler)
     print(f"MAA WebUI v2 启动: http://0.0.0.0:{PORT}")

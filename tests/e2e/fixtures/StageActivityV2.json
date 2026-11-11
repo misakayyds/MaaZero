@@ -1,0 +1,12 @@
+{
+  "activities": [
+    {
+      "activityId": "act45d0",
+      "activityName": "Stultifera Navis",
+      "startTime": 1700000000,
+      "endTime": 2000000000,
+      "rewardEndTime": 2000000000,
+      "stageList": ["SN-1", "SN-2", "SN-3", "SN-7", "SN-8", "SN-9", "SN-10"]
+    }
+  ]
+}

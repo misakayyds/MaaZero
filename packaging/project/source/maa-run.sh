@@ -11,8 +11,9 @@ set -uo pipefail
 # 提升文件描述符上限以防 C++ Core fd 泄漏导致崩溃
 ulimit -n 65536 2>/dev/null || true
 
-export PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export LANG=en_US.UTF-8
+export PATH="${HOME}/.local/bin:${MAA_HOME:-/root/maa-scripts}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LANG="${LANG:-en_US.UTF-8}"
+export PYTHONDONTWRITEBYTECODE=1
 export MAA_LOG=warn
 export MAA_LOG_PREFIX=Auto
 
@@ -35,6 +36,8 @@ elif [[ -n "${1:-}" && "${1:-}" != --* ]]; then
 fi
 REQUESTED_TASK="$TASK"
 DEBUG=""
+STOP_AT_LOGIN="${MAA_STARTUP_STOP_AT_LOGIN:-0}"
+KEEP_GAME_ON_EXIT="${MAA_KEEP_GAME_ON_EXIT:-0}"
 WEEKDAY_OVERRIDE=""
 SCHEDULED_TIME=""
 SCHEDULED_DATE=""
@@ -55,6 +58,12 @@ for ((i=0; i<${#args[@]}; i++)); do
     arg="${args[$i]}"
     case "$arg" in
         --startup-health-check|--bench-screencap)
+            ;;
+        --stop-at-login)
+            STOP_AT_LOGIN=1
+            ;;
+        --keep-game-foreground)
+            KEEP_GAME_ON_EXIT=1
             ;;
         --debug)
             DEBUG="1"
@@ -183,18 +192,28 @@ elif (( retry_attempt_count > 0 )); then
     echo "--retry-attempt requires scheduled mode" >&2
     exit 2
 fi
-ADB_ADDR="127.0.0.1:5555"
+MAA_HOME="${MAA_HOME:-/root/maa-scripts}"
+MAA_CONFIG_DIR="${MAA_CONFIG_DIR:-/root/.config/maa}"
+MAA_DATA_DIR="${MAA_DATA_DIR:-/root/.local/share/maa}"
+MAA_STATE_DIR="${MAA_STATE_DIR:-/root/.local/state/maa}"
+MAA_CACHE_DIR="${MAA_CACHE_DIR:-/root/.cache/maa}"
+MAA_LOG_DIR="${MAA_LOG_DIR:-/var/log/maa}"
+MAA_ADB_ADDR="${MAA_ADB_ADDR:-127.0.0.1:5555}"
+export MAA_HOME MAA_CONFIG_DIR MAA_DATA_DIR MAA_STATE_DIR MAA_CACHE_DIR MAA_LOG_DIR MAA_ADB_ADDR
+
+ADB_ADDR="$MAA_ADB_ADDR"
 ADB_DEVICE="-s $ADB_ADDR"
 AK_PACKAGE="com.hypergryph.arknights"
-LOG_DIR="/var/log/maa"
+LOG_DIR="$MAA_LOG_DIR"
 LOG_FILE="$LOG_DIR/maa-$(date +%Y%m%d-%H%M%S).log"
 FAILURE_SNAPSHOT_DIR="$LOG_DIR/failure-snapshots"
 FAILURE_SNAPSHOT_KEEP_DAYS=14
 STARTUP_HEALTH_STATE_FILE="$LOG_DIR/startup-health.env"
-STARTUP_HEALTH_TIMEOUT="7m"
+STARTUP_HEALTH_TIMEOUT="${MAA_STARTUP_HEALTH_TIMEOUT:-15m}"
 LOCK_FILE="/tmp/maa-task.lock"
-SCHEDULE_CONTROL_SCRIPT="${MAA_SCHEDULE_CONTROL_SCRIPT:-/root/maa-scripts/maa_schedule_control.py}"
-SCHEDULE_CONTROL_CONFIG_DIR="${MAA_SCHEDULE_CONTROL_CONFIG_DIR:-/root/.config/maa}"
+RUNNER_PID_FILE="${MAA_RUNNER_PID_FILE:-$MAA_STATE_DIR/maa-runner.pid}"
+SCHEDULE_CONTROL_SCRIPT="${MAA_SCHEDULE_CONTROL_SCRIPT:-$MAA_HOME/maa_schedule_control.py}"
+SCHEDULE_CONTROL_CONFIG_DIR="${MAA_SCHEDULE_CONTROL_CONFIG_DIR:-$MAA_CONFIG_DIR}"
 UPDATE_MARKER="$LOG_DIR/last-update-ok"
 MAX_RETRIES=3
 RETRY_DELAY=30
@@ -210,30 +229,28 @@ SCREENCAP_GEOMETRY_CHECK_AFTER=3
 SCREENCAP_BENCH_SAMPLES=10
 SCREENCAP_WARN_AVG_MS=800
 SCREENCAP_WARN_MAX_MS=2000
-MIN_MEM_AVAILABLE_KB=2200000
-MAX_SWAP_USED_KB=3145728
-RUNTIME_MIN_MEM_AVAILABLE_KB=524288
-RESOURCE_TARBALL_URL="https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main"
-RESOURCE_DIR="/root/.local/share/maa/resource"
-RESOURCE_CLONE_DIR="/root/.local/share/maa/MaaResource/resource"
-RESOURCE_OVERLAY_SCRIPT="/root/maa-scripts/maa-resource-overlay.sh"
-TASK_GUARD_SCRIPT="/root/maa-scripts/maa-task-guard.py"
-WEEKLY_PLAN_SCRIPT="/root/maa-scripts/maa_weekly_plan.py"
-INFRAST_RUNTIME_SCRIPT="/root/maa-scripts/maa_infrast_runtime.py"
-CULTIVATION_RUN_SCRIPT="/root/maa-scripts/maa-cultivation-run.py"
-RUN_SESSION_SCRIPT="/root/maa-scripts/maa_run_session.py"
+MIN_MEM_AVAILABLE_KB="${MAA_MIN_MEM_AVAILABLE_KB:-1572864}"
+MAX_SWAP_USED_KB="${MAA_MAX_SWAP_USED_KB:-3145728}"
+RUNTIME_MIN_MEM_AVAILABLE_KB="${MAA_RUNTIME_MIN_MEM_AVAILABLE_KB:-524288}"
+RESOURCE_TARBALL_URL="${MAA_RESOURCE_TARBALL_URL:-https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main}"
+RESOURCE_DIR="${MAA_RESOURCE_DIR:-$MAA_DATA_DIR/resource}"
+RESOURCE_CLONE_DIR="${MAA_RESOURCE_CLONE_DIR:-$MAA_DATA_DIR/MaaResource/resource}"
+RESOURCE_OVERLAY_SCRIPT="${MAA_RESOURCE_OVERLAY_SCRIPT:-$MAA_HOME/maa-resource-overlay.sh}"
+TASK_GUARD_SCRIPT="${MAA_TASK_GUARD_SCRIPT:-$MAA_HOME/maa-task-guard.py}"
+WEEKLY_PLAN_SCRIPT="${MAA_WEEKLY_PLAN_SCRIPT:-$MAA_HOME/maa_weekly_plan.py}"
+INFRAST_RUNTIME_SCRIPT="${MAA_INFRAST_RUNTIME_SCRIPT:-$MAA_HOME/maa_infrast_runtime.py}"
+CULTIVATION_RUN_SCRIPT="${MAA_CULTIVATION_RUN_SCRIPT:-$MAA_HOME/maa-cultivation-run.py}"
+RUN_SESSION_SCRIPT="${MAA_RUN_SESSION_SCRIPT:-$MAA_HOME/maa_run_session.py}"
 export MAA_RUN_SESSION=""
 export MAA_PREWARM_TOKEN=""
-INFRAST_LEDGER_FILE="/root/.local/state/maa/infrast-schedule-ledger.json"
-ACTIVITY_STAGE_FILE="/root/.cache/maa/StageActivityV2.json"
-MEDICINE_PLAN_SCRIPT="/root/maa-scripts/maa_medicine_service.py"
+export MAA_STARTUP_STOP_AT_LOGIN="$STOP_AT_LOGIN"
+export MAA_KEEP_GAME_ON_EXIT="$KEEP_GAME_ON_EXIT"
+INFRAST_LEDGER_FILE="${MAA_INFRAST_LEDGER_FILE:-$MAA_STATE_DIR/infrast-schedule-ledger.json}"
+ACTIVITY_STAGE_FILE="${MAA_ACTIVITY_STAGE_FILE:-$MAA_CACHE_DIR/StageActivityV2.json}"
+MEDICINE_PLAN_SCRIPT="${MAA_MEDICINE_PLAN_SCRIPT:-$MAA_HOME/maa_medicine_service.py}"
 MAA_CORE_CHANNEL="${MAA_CORE_CHANNEL:-beta}"
 MAA_UPDATE_TEST_TIME="${MAA_UPDATE_TEST_TIME:-0}"
-ASST_LOG_DIR="/root/.local/state/maa/debug"
-
-# 分辨率控制: chroot 中 adb shell wm size 没有权限
-# 需要通过 chroot 外的 Android shell 来执行
-CHROOT_PATH="/data/local/debian"
+ASST_LOG_DIR="${MAA_ASST_LOG_DIR:-$MAA_STATE_DIR/debug}"
 MAA_RESOLUTION="1080x1920"
 MAA_RESOLUTION_WIDTH="${MAA_RESOLUTION%x*}"
 MAA_RESOLUTION_HEIGHT="${MAA_RESOLUTION#*x}"
@@ -305,7 +322,7 @@ resolve_weekly_task() {
         return 0
     fi
 
-    config_dir=$(maa dir config 2>/dev/null || printf '%s' "/root/.config/maa")
+    config_dir=$(maa dir config 2>/dev/null || printf '%s' "$MAA_CONFIG_DIR")
     if [[ ! -f "$WEEKLY_PLAN_SCRIPT" ]]; then
         TASK="daily"
         WEEKLY_FALLBACK_REASON="resolver_missing"
@@ -551,7 +568,7 @@ initialize_scheduled_execution() {
         error "基建运行时守门脚本不存在: $INFRAST_RUNTIME_SCRIPT"
         return 21
     fi
-    config_dir=$(maa dir config 2>/dev/null || printf '%s' "/root/.config/maa")
+    config_dir=$(maa dir config 2>/dev/null || printf '%s' "$MAA_CONFIG_DIR")
     if ! prepare_activity_config_for_schedule "$TASK" "$config_dir"; then
         return 21
     fi
@@ -693,57 +710,77 @@ cleanup() {
     rm -f "$SCREENCAP_METHOD_STATE"
     restore_resolution
     restore_rotation
-    kill_arknights
+    if [[ "${KEEP_GAME_ON_EXIT:-0}" -ne 1 ]]; then
+        kill_arknights
+    else
+        info "已启用保留游戏前台 (--keep-game-foreground)，跳过关闭明日方舟"
+    fi
+    rm -f "$RUNNER_PID_FILE" 2>/dev/null || true
     info "清理完成"
 }
 
-kill_stale_processes() {
-    pkill -9 -f "maa run" || true
-    pkill -9 -x "screencap" || true
-    pkill -9 -f "gzip -1" || true
-    pkill -9 -f "nc -w 3" || true
-    pkill -9 -f "adb.*exec-out.*screencap" || true
-    pkill -9 -f "/system/bin/sh -c screencap" || true
+terminate_runner_pid() {
+    local target_pid="$1"
+    if [[ -n "$target_pid" && "$target_pid" =~ ^[0-9]+$ ]] && kill -0 "$target_pid" 2>/dev/null; then
+        kill -TERM -- -"$target_pid" 2>/dev/null || kill -TERM "$target_pid" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$target_pid" 2>/dev/null && (( waited < 3 )); do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if kill -0 "$target_pid" 2>/dev/null; then
+            kill -KILL -- -"$target_pid" 2>/dev/null || kill -KILL "$target_pid" 2>/dev/null || true
+        fi
+    fi
 }
 
-# === 分辨率控制 (通过 nsenter 逃逸 chroot 执行 wm 命令) ===
-run_on_android() {
-    # 从 chroot 中执行 Android 命令: 通过 /proc/1 的 namespace 执行
-    nsenter -t 1 -m -- /system/bin/sh -c "$*" 2>/dev/null
+kill_stale_processes() {
+    if [[ -f "$RUNNER_PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$RUNNER_PID_FILE" 2>/dev/null || true)
+        if [[ "$old_pid" == "$$" ]]; then
+            return 0
+        fi
+        if [[ -n "$old_pid" && "$old_pid" =~ ^[0-9]+$ && "$old_pid" != "${PPID:-}" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            local cmdline
+            cmdline=$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)
+            if [[ "$cmdline" == *"maa"* || "$cmdline" == *"python"* ]]; then
+                info "清理上一次残留的 runner 进程 (PID: $old_pid)..."
+                terminate_runner_pid "$old_pid"
+            fi
+        fi
+        rm -f "$RUNNER_PID_FILE"
+    fi
 }
+
+# === 宿主设备与分辨率控制 (通过 ADB 执行) ===
 
 restart_android_adbd_tcp() {
-    warn "ADB TCP 未就绪，尝试从 Android 侧恢复 adbd..."
-    local before after
-    before=$(run_on_android "getprop service.adb.tcp.port; getprop init.svc.adbd" | tr '\n' ' ' || true)
-    debug "adbd 恢复前: $before"
-    run_on_android "setprop service.adb.tcp.port 5555; stop adbd; sleep 1; start adbd" || true
-    sleep 3
-    after=$(run_on_android "getprop service.adb.tcp.port; getprop init.svc.adbd; ss -ltn 2>/dev/null | grep ':5555' | head -1" | tr '\n' ' ' || true)
-    debug "adbd 恢复后: $after"
+    warn "ADB TCP 未就绪 ($ADB_ADDR)。请确保 Android 宿主 ADB 调试已开启或由控制面 daemon 托管。"
+    return 0
 }
 
 restore_android_setting() {
     local key="$1"
     local value="$2"
     if [[ -n "$value" && "$value" != "null" ]]; then
-        run_on_android "settings put system $key $value" || true
+        adb $ADB_DEVICE shell settings put system "$key" "$value" 2>/dev/null || true
     else
-        run_on_android "settings delete system $key" || true
+        adb $ADB_DEVICE shell settings delete system "$key" 2>/dev/null || true
     fi
 }
 
 lock_rotation() {
     if [[ "$ROTATION_LOCKED" -eq 0 ]]; then
-        ORIG_ACCELEROMETER_ROTATION=$(run_on_android "settings get system accelerometer_rotation" | tr -d '\r' || true)
-        ORIG_USER_ROTATION=$(run_on_android "settings get system user_rotation" | tr -d '\r' || true)
+        ORIG_ACCELEROMETER_ROTATION=$(adb $ADB_DEVICE shell settings get system accelerometer_rotation 2>/dev/null | tr -d '\r\n' || true)
+        ORIG_USER_ROTATION=$(adb $ADB_DEVICE shell settings get system user_rotation 2>/dev/null | tr -d '\r\n' || true)
         info "锁定系统旋转: accelerometer=${ORIG_ACCELEROMETER_ROTATION:-unknown} user_rotation=${ORIG_USER_ROTATION:-unknown} -> landscape"
     else
         info "系统旋转已锁定，重新应用横屏"
     fi
 
-    run_on_android "settings put system accelerometer_rotation 0" || true
-    run_on_android "settings put system user_rotation 1" || true
+    adb $ADB_DEVICE shell settings put system accelerometer_rotation 0 2>/dev/null || true
+    adb $ADB_DEVICE shell settings put system user_rotation 1 2>/dev/null || true
     ROTATION_LOCKED=1
     sleep 1
 }
@@ -768,24 +805,24 @@ set_maa_resolution() {
         return 0
     fi
 
-    info "设置 MAA 分辨率: $MAA_RESOLUTION (原始: $current)"
-    run_on_android "wm size $MAA_RESOLUTION"
-    sleep 3
-    RESOLUTION_CHANGED=1
+    info "尝试设置 MAA 分辨率: $MAA_RESOLUTION (原始: $current)"
+    adb $ADB_DEVICE shell wm size "$MAA_RESOLUTION" 2>/dev/null || true
+    sleep 2
 
     local verify
     verify=$(adb $ADB_DEVICE shell wm size 2>/dev/null | grep "Override" | awk '{print $3}')
     if [[ "$verify" == "$MAA_RESOLUTION" ]]; then
+        RESOLUTION_CHANGED=1
         info "分辨率设置成功: $verify"
     else
-        warn "分辨率设置可能失败，当前: $(adb $ADB_DEVICE shell wm size 2>/dev/null)"
+        warn "分辨率修改未生效或受宿主安全策略限制 (当前: $(adb $ADB_DEVICE shell wm size 2>/dev/null || echo unknown))"
     fi
 }
 
 restore_resolution() {
     if [[ "$RESOLUTION_CHANGED" -eq 1 ]]; then
         info "恢复原始分辨率..."
-        run_on_android "wm size reset"
+        adb $ADB_DEVICE shell wm size reset 2>/dev/null || true
         sleep 1
         RESOLUTION_CHANGED=0
         info "分辨率已恢复"
@@ -894,8 +931,8 @@ stop_startup_overlay_watchdog() {
 }
 
 backlight_off_keep_awake() {
-    info "保持设备唤醒并关闭屏幕背光..."
-    run_on_android "/system/bin/sh /data/adb/maa/screen_backlight_off.sh" || true
+    # 物理单机背光脚本已剔除，宿主屏幕策略由控制面或 Android 系统托管
+    debug "背光控制已跳过 (非单机专用环境)"
 }
 
 kill_arknights() {
@@ -1030,6 +1067,10 @@ swap_used_kb() {
     awk '/SwapTotal:/{total=$2} /SwapFree:/{free=$2} END{if (total=="") total=0; if (free=="") free=0; print total-free}' /proc/meminfo 2>/dev/null || echo 0
 }
 
+swap_total_kb() {
+    awk '/SwapTotal:/{total=$2} END{if (total=="") total=0; print total}' /proc/meminfo 2>/dev/null || echo 0
+}
+
 memory_status_line() {
     local avail swap_used load
     avail=$(mem_available_kb)
@@ -1039,12 +1080,20 @@ memory_status_line() {
 }
 
 memory_pressure_is_high() {
-    local avail swap_used
+    local avail swap_used swap_total
     avail=$(mem_available_kb)
     swap_used=$(swap_used_kb)
+    swap_total=$(swap_total_kb)
     [[ "$avail" =~ ^[0-9]+$ ]] || avail=0
     [[ "$swap_used" =~ ^[0-9]+$ ]] || swap_used=0
-    (( avail < MIN_MEM_AVAILABLE_KB || swap_used > MAX_SWAP_USED_KB ))
+    [[ "$swap_total" =~ ^[0-9]+$ ]] || swap_total=0
+    if (( avail < MIN_MEM_AVAILABLE_KB )); then
+        return 0
+    fi
+    if (( avail < 3145728 && swap_used > MAX_SWAP_USED_KB && swap_total > 0 && swap_used * 100 >= swap_total * 85 )); then
+        return 0
+    fi
+    return 1
 }
 
 runtime_memory_pressure_is_high() {
@@ -1454,9 +1503,8 @@ request_reboot_after_startup_render_stall() {
         return 0
     fi
 
-    warn "已保存失败现场并发送通知；因 STARTUP_RENDER_STALL 请求 Android reboot 清理 Unity/渲染运行态"
+    warn "已保存失败现场并记录状态；STARTUP_RENDER_STALL 异常（严禁整机重启，交由控制面或人工介入）"
     cleanup
-    run_on_android "sync; sleep 2; reboot" || warn "Android reboot 请求未确认成功"
 }
 
 prepare_run_session() {
@@ -1522,8 +1570,8 @@ run_startup_health_check() {
     fi
 
     mkdir -p "$test_dir/tasks" "$test_dir/profiles" "$LOG_DIR" 2>/dev/null || true
-    cp -a /root/.config/maa/cli.toml "$test_dir/" 2>/dev/null || true
-    cp -a /root/.config/maa/profiles/default.toml "$test_dir/profiles/default.toml" 2>/dev/null || true
+    cp -a "$MAA_CONFIG_DIR/cli.toml" "$test_dir/" 2>/dev/null || true
+    cp -a "$MAA_CONFIG_DIR/profiles/default.toml" "$test_dir/profiles/default.toml" 2>/dev/null || true
     printf "%s\n" \
         "[[tasks]]" \
         "name = \"开始唤醒\"" \
@@ -1581,7 +1629,7 @@ prepare_effective_task_config() {
     cleanup_effective_task_config
     EFFECTIVE_TASK_NAME="$task"
 
-    config_dir=$(maa dir config 2>/dev/null || printf '%s' "/root/.config/maa")
+    config_dir=$(maa dir config 2>/dev/null || printf '%s' "$MAA_CONFIG_DIR")
     task_dir="$config_dir/tasks"
     source="$task_dir/${task}.toml"
 
@@ -1766,7 +1814,7 @@ run_closing_scan() {
             ;;
     esac
     local config_dir task_file
-    config_dir=$(maa dir config 2>/dev/null || printf '%s' "/root/.config/maa")
+    config_dir=$(maa dir config 2>/dev/null || printf '%s' "$MAA_CONFIG_DIR")
     task_file="${EFFECTIVE_TASK_FILE:-}"
     if [[ -z "$task_file" || ! -f "$task_file" ]]; then
         task_file="$config_dir/tasks/${task}.toml"
@@ -1887,7 +1935,7 @@ run_maa_task() {
         if [[ "$REQUESTED_TASK" == "daily" ]] && (( SCHEDULED_MODE == 0 )) &&
            [[ -f "$CULTIVATION_RUN_SCRIPT" ]]; then
             # 显式传配置目录：与 runner 使用同一份配置，不依赖子进程里的 maa dir config。
-            cultivation_config_dir="$(maa dir config 2>/dev/null || printf '%s' "/root/.config/maa")"
+            cultivation_config_dir="$(maa dir config 2>/dev/null || printf '%s' "$MAA_CONFIG_DIR")"
             if python3 "$CULTIVATION_RUN_SCRIPT" --mode check \
                 --config-dir "$cultivation_config_dir" >/dev/null 2>>"$LOG_FILE"; then
                 cultivation_active=1
@@ -1899,7 +1947,7 @@ run_maa_task() {
             # （Recruit/Infrast/Custom/未知）视为可能扣款。接管路径由 runtime 按 phase 处理，
             # 避免一上来全失效导致龙门币本永远跳过。state 不存在时该调用零成本直接返回。
             if [[ -z "$cultivation_config_dir" ]]; then
-                cultivation_config_dir="$(maa dir config 2>/dev/null || printf '%s' "/root/.config/maa")"
+                cultivation_config_dir="$(maa dir config 2>/dev/null || printf '%s' "$MAA_CONFIG_DIR")"
             fi
             local cultivation_precheck_file="${EFFECTIVE_TASK_FILE:-}"
             if [[ -z "$cultivation_precheck_file" || ! -f "$cultivation_precheck_file" ]]; then
@@ -2267,7 +2315,7 @@ run_maa_task() {
 # === 更新 ===
 apply_resource_patch() {
     local mode="${1:-raw_with_gzip}"
-    if MAA_SCREENCAP_MODE="$mode" python3 /root/maa-scripts/patch_config.py >> "$LOG_FILE" 2>&1; then
+    if MAA_SCREENCAP_MODE="$mode" python3 "$MAA_HOME/patch_config.py" >> "$LOG_FILE" 2>&1; then
         info "截图配置补丁已应用: mode=${mode}"
     else
         warn "截图配置补丁应用失败: mode=${mode}"
@@ -2397,7 +2445,6 @@ update_resources_before_run() {
             return 0
         fi
 
-        pkill -9 -f "git.*MaaResource" || true
         if (( attempt < UPDATE_RETRIES )); then
             warn "等待 ${UPDATE_RETRY_DELAY}s 后重试更新..."
             sleep "$UPDATE_RETRY_DELAY"
@@ -2498,7 +2545,7 @@ collect_failure_snapshot() {
         free -h 2>/dev/null || true
         cat /proc/meminfo 2>/dev/null | head -n 30 || true
         echo "=== disk ==="
-        df -h / /var/log/maa /tmp 2>/dev/null || true
+        df -h / "$LOG_DIR" /tmp 2>/dev/null || true
         echo "=== debian top cpu ==="
         ps -eo pid,ppid,stat,pcpu,pmem,comm,args --sort=-pcpu 2>/dev/null | head -n 30 || true
     } > "$dir/debian-system.txt" 2>&1 || true
@@ -2551,8 +2598,8 @@ collect_failure_snapshot() {
             | tail -n 2000 > "$dir/logcat-filtered.log" 2>/dev/null || true
     fi
 
-    run_on_android "ls -lt /data/tombstones 2>/dev/null | head -n 30" > "$dir/tombstones-list.txt" 2>&1 || true
-    run_on_android "for f in \$(ls -t /data/tombstones/tombstone_* 2>/dev/null | head -n 6); do echo ===\$f===; grep -E 'Cmdline|pid:|signal|Abort message|backtrace|#00|#01|#02|#03|#04|/odm|/vendor' \$f 2>/dev/null | head -n 120; done" > "$dir/tombstones-summary.txt" 2>&1 || true
+    adb $ADB_DEVICE shell "ls -lt /data/tombstones 2>/dev/null | head -n 30" > "$dir/tombstones-list.txt" 2>&1 || true
+    adb $ADB_DEVICE shell "for f in \$(ls -t /data/tombstones/tombstone_* 2>/dev/null | head -n 6); do echo ===\$f===; grep -E 'Cmdline|pid:|signal|Abort message|backtrace|#00|#01|#02|#03|#04|/odm|/vendor' \$f 2>/dev/null | head -n 120; done" > "$dir/tombstones-summary.txt" 2>&1 || true
 
     tar -czf "$archive" -C "$FAILURE_SNAPSHOT_DIR" "$(basename "$dir")" 2>/dev/null || true
     if [[ -s "$archive" ]]; then
@@ -2580,9 +2627,9 @@ print_status() {
 send_tg_message() {
     local message="$1"
 
-    local tg_file="/root/maa-scripts/tg.txt"
+    local tg_file="${MAA_TG_FILE:-$MAA_HOME/tg.txt}"
     if [[ ! -f "$tg_file" ]]; then
-        tg_file="/root/.config/maa/tg.txt"
+        tg_file="$MAA_CONFIG_DIR/tg.txt"
     fi
     
     if [[ ! -f "$tg_file" ]]; then
@@ -2665,7 +2712,7 @@ startup_status = sys.argv[6] if len(sys.argv) > 6 else "not_run"
 startup_reason = sys.argv[7] if len(sys.argv) > 7 else ""
 startup_screen = sys.argv[8] if len(sys.argv) > 8 else "unknown"
 task_config_path = sys.argv[9] if len(sys.argv) > 9 else os.environ.get("MAA_TG_TASK_FILE", "")
-activity_path = sys.argv[10] if len(sys.argv) > 10 else os.environ.get("MAA_TG_ACTIVITY_FILE", "/root/.cache/maa/StageActivityV2.json")
+activity_path = sys.argv[10] if len(sys.argv) > 10 else os.environ.get("MAA_TG_ACTIVITY_FILE", os.path.join(os.environ.get("MAA_CACHE_DIR", "/root/.cache/maa"), "StageActivityV2.json"))
 weekly_weekday = sys.argv[11] if len(sys.argv) > 11 else ""
 weekly_source_path = sys.argv[12] if len(sys.argv) > 12 else ""
 weekly_fallback_reason = sys.argv[13] if len(sys.argv) > 13 else ""
@@ -2954,7 +3001,7 @@ if startup_status and startup_status != "not_run":
         startup_line += f" / {startup_screen}"
     out.append(startup_line)
 
-asst_path = os.environ.get("MAA_TG_ASST_LOG", "/root/.local/state/maa/debug/asst.log")
+asst_path = os.environ.get("MAA_TG_ASST_LOG", os.path.join(os.environ.get("MAA_STATE_DIR", "/root/.local/state/maa"), "debug", "asst.log"))
 asst_lines = []
 try:
     with open(asst_path, "r", encoding="utf-8", errors="replace") as f:
@@ -3261,7 +3308,7 @@ main() {
             exit 22
         fi
     fi
-    trap cleanup EXIT
+    trap cleanup EXIT INT TERM
 
     info "======================================="
     info "  MAA 自动任务 $(date '+%Y-%m-%d %H:%M')"
@@ -3271,6 +3318,7 @@ main() {
 
     info "清理历史残留进程..."
     kill_stale_processes
+    echo $$ > "$RUNNER_PID_FILE" 2>/dev/null || true
 
     cleanup_logs
     rotate_asst_logs

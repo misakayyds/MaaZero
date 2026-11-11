@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "days": {
+    "mon": {"task": "daily-mon", "enabled": true},
+    "tue": {"task": "daily-tue", "enabled": true},
+    "wed": {"task": "daily-wed", "enabled": true},
+    "thu": {"task": "daily-thu", "enabled": true},
+    "fri": {"task": "daily-fri", "enabled": true},
+    "sat": {"task": "daily-sat", "enabled": true},
+    "sun": {"task": "daily-sun", "enabled": true}
+  }
+}

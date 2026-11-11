@@ -67,14 +67,23 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_DIR = Path("/root/.config/maa")
+SCRIPT_DIR = Path(os.environ.get("MAA_HOME", Path(__file__).resolve().parent))
+DEFAULT_CONFIG_DIR = Path(
+    os.environ.get("MAA_CONFIG_DIR")
+    or (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "maa")
+)
 CATALOG_FILENAME = "maa-cultivation-data.json"
-RUNNER_SCRIPT = SCRIPT_DIR / "maa-run.sh"
+RUNNER_SCRIPT = Path(
+    os.environ.get("MAA_RUN_SCRIPT")
+    or (SCRIPT_DIR / "maa-run.sh")
+)
 SCAN_TASK_NAME = "cultivation-scan"
 MASTERY_TASK_NAME = "cultivation-mastery"
 # MaaCore debug 日志：maa-cli 回调不全时从这里补取本轮最终 OperBox（与 maa-operator-scan.py 同源）。
-DEFAULT_ASST_LOG = Path("/root/.local/state/maa/debug/asst.log")
+DEFAULT_ASST_LOG = Path(
+    os.environ.get("MAA_ASST_LOG")
+    or (Path(os.environ.get("MAA_STATE_DIR") or (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "maa")) / "debug" / "asst.log")
+)
 OPERATOR_SNAPSHOT_NAME = "operator-box.json"
 OPERATOR_STATE_NAME = "operator-box-state.json"
 

@@ -14,9 +14,17 @@ from maa_task_config import load_tasks_strict, render_tasks, _toml_val
 from maa_weekly_plan import atomic_write_text, load_settings as weekly_settings
 from maa_activity_cache import get_activity
 
-ACTIVITY_FILE=Path('/root/.cache/maa/StageActivityV2.json')
-ITEM_FILE=Path('/root/.local/share/maa/resource/item_index.json')
-CORE_LOG=Path('/root/.local/state/maa/debug/asst.log')
+def _resolve_medicine_paths():
+    cache_dir = Path(os.environ.get("MAA_CACHE_DIR") or (Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "maa"))
+    data_dir = Path(os.environ.get("MAA_DATA_DIR") or (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "maa"))
+    state_dir = Path(os.environ.get("MAA_STATE_DIR") or (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "maa"))
+    
+    act_file = Path(os.environ.get("MAA_ACTIVITY_FILE") or (cache_dir / "StageActivityV2.json"))
+    item_file = Path(os.environ.get("MAA_ITEM_FILE") or (data_dir / "resource" / "item_index.json"))
+    core_log = Path(os.environ.get("MAA_ASST_LOG") or (state_dir / "debug" / "asst.log"))
+    return act_file, item_file, core_log
+
+ACTIVITY_FILE, ITEM_FILE, CORE_LOG = _resolve_medicine_paths()
 
 
 def read_json(path, default=None):

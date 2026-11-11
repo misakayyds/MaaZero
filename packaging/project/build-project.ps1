@@ -87,7 +87,6 @@ $script:ArtifactPatterns = @(
 # 设备改动入口：不是新手默认能力，只排除不发布（Check 侧同样拒绝）。
 $script:DeviceMutations = @(
     'maa-scheduled-reboot.sh',
-    'arknights-apk-update.sh',
     'maa-edit.sh'
 )
 $script:CredentialPatterns = @(
@@ -99,7 +98,6 @@ $script:CredentialPatterns = @(
     '(?i)secret'
 )
 $script:ExcludedSourceFiles = @(
-    'arknights-apk-update.sh',
     'maa-edit.sh',
     'maa-scheduled-reboot.sh',
     'ssh_watchdog_worker.sh',

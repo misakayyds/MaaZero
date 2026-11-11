@@ -131,9 +131,81 @@ func New(cfg Config, s *store.Store, driver Driver) (*Controller, error) {
 			return nil, errors.New("invalid public signing key")
 		}
 		c.publicKey = key
-		c.reason = "请检查发布版本；完整运行适配器尚未接入"
+		if driver == nil {
+			c.reason = "请检查发布版本；完整运行适配器尚未接入"
+		} else {
+			c.reason = "发布源已配置，可检查或安装更新"
+		}
 	}
 	return c, nil
+}
+
+// StartBootstrap asynchronously activates the currently committed project release
+// on daemon startup so the HTTP listener on 127.0.0.1:8088 comes up immediately
+// while the chroot runtime and WebUI start in the background.
+func (c *Controller) StartBootstrap() {
+	c.mu.Lock()
+	if c.closed || c.busy || c.driver == nil {
+		c.mu.Unlock()
+		return
+	}
+	component, version := c.bootstrapTargetLocked()
+	if component == "" || version == "" {
+		c.mu.Unlock()
+		return
+	}
+	c.busy = true
+	c.reason = "正在启动已安装的运行环境…"
+	c.wg.Add(1)
+	c.mu.Unlock()
+
+	go func() {
+		defer c.wg.Done()
+		ctx, cancel := context.WithTimeout(c.ctx, recoverTimeout)
+		defer cancel()
+		if err := c.bootstrapRelease(ctx, component, version); err != nil {
+			c.finish("运行环境启动失败：" + err.Error())
+		} else {
+			c.finish("运行环境已启动并就绪")
+		}
+	}()
+}
+
+func (c *Controller) bootstrapTargetLocked() (string, string) {
+	versions := c.store.Versions()
+	if v, ok := versions["maa-phone-project"]; ok && v.Current != "" {
+		return "maa-phone-project", v.Current
+	}
+	component, current := "", ""
+	for id, v := range versions {
+		if id == "debian-rootfs" || id == "maa-managerd" || v.Current == "" {
+			continue
+		}
+		if component != "" {
+			return "", ""
+		}
+		component, current = id, v.Current
+	}
+	return component, current
+}
+
+func (c *Controller) bootstrapRelease(ctx context.Context, component, version string) error {
+	dest, err := c.store.ReleasePath(component, version)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dest); err != nil {
+		return err
+	}
+	release, err := c.driver.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := c.driver.Validate(ctx, nil, dest); err != nil {
+		return err
+	}
+	return c.driver.Activate(ctx, dest)
 }
 
 func validURL(raw string) error {
