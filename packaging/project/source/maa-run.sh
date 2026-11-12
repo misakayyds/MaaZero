@@ -203,7 +203,6 @@ export MAA_HOME MAA_CONFIG_DIR MAA_DATA_DIR MAA_STATE_DIR MAA_CACHE_DIR MAA_LOG_
 
 ADB_ADDR="$MAA_ADB_ADDR"
 ADB_DEVICE="-s $ADB_ADDR"
-AK_PACKAGE="com.hypergryph.arknights"
 LOG_DIR="$MAA_LOG_DIR"
 LOG_FILE="$LOG_DIR/maa-$(date +%Y%m%d-%H%M%S).log"
 FAILURE_SNAPSHOT_DIR="$LOG_DIR/failure-snapshots"
@@ -214,6 +213,36 @@ LOCK_FILE="/tmp/maa-task.lock"
 RUNNER_PID_FILE="${MAA_RUNNER_PID_FILE:-$MAA_STATE_DIR/maa-runner.pid}"
 SCHEDULE_CONTROL_SCRIPT="${MAA_SCHEDULE_CONTROL_SCRIPT:-$MAA_HOME/maa_schedule_control.py}"
 SCHEDULE_CONTROL_CONFIG_DIR="${MAA_SCHEDULE_CONTROL_CONFIG_DIR:-$MAA_CONFIG_DIR}"
+MAA_RT_CLIENT_TYPE="Official"
+MAA_RT_AK_PACKAGE="com.hypergryph.arknights"
+MAA_RT_MUTE_DURING_RUN="0"
+MAA_RT_SLEEP_AFTER_RUN="scheduled"
+MAA_RT_HTTP_PROXY=""
+MAA_RT_GITHUB_MIRROR=""
+IS_CRON_RUN="${MAA_IS_CRON_RUN:-0}"
+if [[ -f "$SCHEDULE_CONTROL_SCRIPT" ]]; then
+    if _rt_env=$(python3 "$SCHEDULE_CONTROL_SCRIPT" env --config-dir "$MAA_CONFIG_DIR" 2>/dev/null); then
+        eval "$_rt_env"
+    fi
+    if [[ "$IS_CRON_RUN" -ne 1 ]] && python3 "$SCHEDULE_CONTROL_SCRIPT" is-cron \
+        --parent-pid "${MAA_INVOCATION_PARENT_PID:-$PPID}" \
+        --proc-root "${MAA_PROC_ROOT:-/proc}" >/dev/null 2>&1; then
+        IS_CRON_RUN=1
+    fi
+fi
+CLIENT_TYPE="${MAA_CLIENT_TYPE:-${MAA_RT_CLIENT_TYPE:-Official}}"
+case "$CLIENT_TYPE" in
+    Official|Bilibili|YoStarEN|YoStarJP|YoStarKR) ;;
+    *) CLIENT_TYPE="Official" ;;
+esac
+AK_PACKAGE="${MAA_AK_PACKAGE:-${MAA_RT_AK_PACKAGE:-com.hypergryph.arknights}}"
+MUTE_DURING_RUN="${MAA_MUTE_DURING_RUN:-${MAA_RT_MUTE_DURING_RUN:-0}}"
+SLEEP_AFTER_RUN="${MAA_SLEEP_AFTER_RUN:-${MAA_RT_SLEEP_AFTER_RUN:-scheduled}}"
+if [[ -n "${MAA_RT_HTTP_PROXY:-}" ]]; then
+    export HTTP_PROXY="$MAA_RT_HTTP_PROXY" HTTPS_PROXY="$MAA_RT_HTTP_PROXY"
+    export http_proxy="$MAA_RT_HTTP_PROXY" https_proxy="$MAA_RT_HTTP_PROXY"
+    export NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1"
+fi
 UPDATE_MARKER="$LOG_DIR/last-update-ok"
 MAX_RETRIES=3
 RETRY_DELAY=30
@@ -232,7 +261,12 @@ SCREENCAP_WARN_MAX_MS=2000
 MIN_MEM_AVAILABLE_KB="${MAA_MIN_MEM_AVAILABLE_KB:-1572864}"
 MAX_SWAP_USED_KB="${MAA_MAX_SWAP_USED_KB:-3145728}"
 RUNTIME_MIN_MEM_AVAILABLE_KB="${MAA_RUNTIME_MIN_MEM_AVAILABLE_KB:-524288}"
-RESOURCE_TARBALL_URL="${MAA_RESOURCE_TARBALL_URL:-https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main}"
+DEFAULT_RESOURCE_TARBALL_URL="https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main"
+if [[ -z "${MAA_RESOURCE_TARBALL_URL:-}" && -n "${MAA_RT_GITHUB_MIRROR:-}" ]]; then
+    RESOURCE_TARBALL_URL="${MAA_RT_GITHUB_MIRROR%/}/$DEFAULT_RESOURCE_TARBALL_URL"
+else
+    RESOURCE_TARBALL_URL="${MAA_RESOURCE_TARBALL_URL:-$DEFAULT_RESOURCE_TARBALL_URL}"
+fi
 RESOURCE_DIR="${MAA_RESOURCE_DIR:-$MAA_DATA_DIR/resource}"
 RESOURCE_CLONE_DIR="${MAA_RESOURCE_CLONE_DIR:-$MAA_DATA_DIR/MaaResource/resource}"
 RESOURCE_OVERLAY_SCRIPT="${MAA_RESOURCE_OVERLAY_SCRIPT:-$MAA_HOME/maa-resource-overlay.sh}"
@@ -288,6 +322,11 @@ RESOLUTION_CHANGED=0
 ORIG_ACCELEROMETER_ROTATION=""
 ORIG_USER_ROTATION=""
 ROTATION_LOCKED=0
+ORIG_MUSIC_VOLUME=""
+ORIG_MUSIC_VOLUME_FILE="$MAA_STATE_DIR/orig-music-volume"
+MUSIC_MUTED=0
+DEVICE_SESSION_ACTIVE=0
+KEYGUARD_STILL_LOCKED=0
 TASK_STARTED_AT=0
 WATCHDOG_PID=""
 STARTUP_OVERLAY_WATCHDOG_PID=""
@@ -736,10 +775,14 @@ cleanup() {
     rm -f "$SCREENCAP_METHOD_STATE"
     restore_resolution
     restore_rotation
-    if [[ "${KEEP_GAME_ON_EXIT:-0}" -ne 1 ]]; then
+    restore_media_volume
+    if [[ "${DEVICE_SESSION_ACTIVE:-0}" -ne 1 ]]; then
+        debug "本轮未唤醒或触碰手机前台会话，跳过关闭游戏与自动息屏"
+    elif [[ "${KEEP_GAME_ON_EXIT:-0}" -ne 1 ]]; then
         kill_arknights
+        sleep_screen_if_configured
     else
-        info "已启用保留游戏前台 (--keep-game-foreground)，跳过关闭明日方舟"
+        info "已启用保留游戏前台 (--keep-game-foreground)，跳过关闭明日方舟与自动息屏"
     fi
     rm -f "$RUNNER_PID_FILE" 2>/dev/null || true
     info "清理完成"
@@ -790,9 +833,9 @@ restore_android_setting() {
     local key="$1"
     local value="$2"
     if [[ -n "$value" && "$value" != "null" ]]; then
-        adb $ADB_DEVICE shell settings put system "$key" "$value" 2>/dev/null || true
+        timeout --foreground 8s adb $ADB_DEVICE shell settings put system "$key" "$value" 2>/dev/null || true
     else
-        adb $ADB_DEVICE shell settings delete system "$key" 2>/dev/null || true
+        timeout --foreground 8s adb $ADB_DEVICE shell settings delete system "$key" 2>/dev/null || true
     fi
 }
 
@@ -848,7 +891,7 @@ set_maa_resolution() {
 restore_resolution() {
     if [[ "$RESOLUTION_CHANGED" -eq 1 ]]; then
         info "恢复原始分辨率..."
-        adb $ADB_DEVICE shell wm size reset 2>/dev/null || true
+        timeout --foreground 8s adb $ADB_DEVICE shell wm size reset 2>/dev/null || true
         sleep 1
         RESOLUTION_CHANGED=0
         info "分辨率已恢复"
@@ -890,8 +933,21 @@ ensure_adb() {
 }
 
 # === 游戏控制 ===
+keyguard_is_showing() {
+    local win_state
+    win_state=$(adb $ADB_DEVICE shell dumpsys window 2>/dev/null | tr -d '\r' || true)
+    if printf '%s\n' "$win_state" | grep -qE 'mShowingLockscreen=true|isStatusBarKeyguard=true'; then
+        if ! printf '%s\n' "$win_state" | grep -q 'mDreamingLockscreen=true'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 wake_screen() {
+    DEVICE_SESSION_ACTIVE=1
     info "唤醒屏幕..."
+    KEYGUARD_STILL_LOCKED=0
     local wakefulness
     wakefulness=$(adb $ADB_DEVICE shell dumpsys power 2>/dev/null | grep "mWakefulness=" | head -1 || echo "")
     debug "Screen: $wakefulness"
@@ -904,6 +960,97 @@ wake_screen() {
     else
         info "屏幕已亮"
         adb $ADB_DEVICE shell wm dismiss-keyguard >/dev/null 2>&1 || true
+    fi
+
+    if keyguard_is_showing; then
+        info "检测到锁屏遮罩，尝试上滑解除滑动锁屏..."
+        adb $ADB_DEVICE shell input swipe 540 1800 540 600 200 >/dev/null 2>&1 || true
+        sleep 1
+        adb $ADB_DEVICE shell wm dismiss-keyguard >/dev/null 2>&1 || true
+    fi
+
+    if keyguard_is_showing; then
+        KEYGUARD_STILL_LOCKED=1
+        warn "KEYGUARD_LOCKED: 检测到手机仍处于锁屏界面（可能启用了密码/图案/生物识别锁屏），自动唤醒无法越过安全锁屏；若后续黑屏或启动失败，请将系统锁屏设为“无”或“滑动”。"
+    fi
+}
+
+mute_media_if_configured() {
+    if [[ "${MUTE_DURING_RUN:-0}" != "1" || "$MUSIC_MUTED" -eq 1 ]]; then
+        return 0
+    fi
+    local vol_out cur_vol="" saved_vol=""
+    vol_out=$(timeout --foreground 8s adb $ADB_DEVICE shell cmd media_session volume --stream 3 --get 2>/dev/null | tr -d '\r' || true)
+    cur_vol=$(printf '%s\n' "$vol_out" | sed -n 's/.*volume is \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    if [[ -z "$cur_vol" ]]; then
+        cur_vol=$(timeout --foreground 8s adb $ADB_DEVICE shell settings get system volume_music_speaker 2>/dev/null | tr -d '\r\n' || true)
+    fi
+    if [[ "$cur_vol" =~ ^[0-9]+$ ]] && (( cur_vol > 0 )); then
+        ORIG_MUSIC_VOLUME="$cur_vol"
+        mkdir -p "$(dirname "$ORIG_MUSIC_VOLUME_FILE")" 2>/dev/null || true
+        printf '%s\n' "$ORIG_MUSIC_VOLUME" > "$ORIG_MUSIC_VOLUME_FILE" 2>/dev/null || true
+        if timeout --foreground 8s adb $ADB_DEVICE shell cmd media_session volume --stream 3 --set 0 >/dev/null 2>&1 || \
+           timeout --foreground 8s adb $ADB_DEVICE shell media volume --stream 3 --set 0 >/dev/null 2>&1; then
+            MUSIC_MUTED=1
+            info "已按策略静音媒体音量 (原音量=$ORIG_MUSIC_VOLUME -> 0)"
+        else
+            rm -f "$ORIG_MUSIC_VOLUME_FILE" 2>/dev/null || true
+            ORIG_MUSIC_VOLUME=""
+        fi
+    elif [[ "$cur_vol" == "0" && -f "$ORIG_MUSIC_VOLUME_FILE" ]]; then
+        saved_vol=$(tr -d '\r\n ' < "$ORIG_MUSIC_VOLUME_FILE" 2>/dev/null || true)
+        if [[ "$saved_vol" =~ ^[0-9]+$ ]] && (( saved_vol > 0 )); then
+            ORIG_MUSIC_VOLUME="$saved_vol"
+            MUSIC_MUTED=1
+            info "检测到上次异常中断遗留的静音状态，将在本轮结束后恢复媒体音量: $ORIG_MUSIC_VOLUME"
+        fi
+    else
+        debug "当前媒体音量已为 0 或不可读，无需静音"
+    fi
+}
+
+restore_media_volume() {
+    if [[ "$MUSIC_MUTED" -eq 0 && -z "$ORIG_MUSIC_VOLUME" && "${DEVICE_SESSION_ACTIVE:-0}" -eq 1 && "${MUTE_DURING_RUN:-0}" == "1" && -f "$ORIG_MUSIC_VOLUME_FILE" ]]; then
+        local saved_vol
+        saved_vol=$(tr -d '\r\n ' < "$ORIG_MUSIC_VOLUME_FILE" 2>/dev/null || true)
+        if [[ "$saved_vol" =~ ^[0-9]+$ ]] && (( saved_vol > 0 )); then
+            ORIG_MUSIC_VOLUME="$saved_vol"
+            MUSIC_MUTED=1
+        fi
+    fi
+    if [[ "$MUSIC_MUTED" -eq 1 && -n "$ORIG_MUSIC_VOLUME" ]]; then
+        info "恢复运行前媒体音量: $ORIG_MUSIC_VOLUME"
+        if timeout --foreground 8s adb $ADB_DEVICE shell cmd media_session volume --stream 3 --set "$ORIG_MUSIC_VOLUME" >/dev/null 2>&1 || \
+           timeout --foreground 8s adb $ADB_DEVICE shell media volume --stream 3 --set "$ORIG_MUSIC_VOLUME" >/dev/null 2>&1; then
+            rm -f "$ORIG_MUSIC_VOLUME_FILE" 2>/dev/null || true
+        fi
+        MUSIC_MUTED=0
+        ORIG_MUSIC_VOLUME=""
+    fi
+}
+
+sleep_screen_if_configured() {
+    if [[ "${BENCH_ONLY:-0}" -eq 1 || "${STARTUP_HEALTH_ONLY:-0}" -eq 1 || "${KEEP_GAME_ON_EXIT:-0}" -eq 1 ]]; then
+        return 0
+    fi
+    local mode="${SLEEP_AFTER_RUN:-scheduled}"
+    local should_sleep=0
+    case "$mode" in
+        always)
+            should_sleep=1
+            ;;
+        scheduled)
+            if (( SCHEDULED_MODE == 1 || IS_CRON_RUN == 1 )); then
+                should_sleep=1
+            fi
+            ;;
+        off|*)
+            should_sleep=0
+            ;;
+    esac
+    if (( should_sleep == 1 )); then
+        info "按运行后息屏策略 ($mode) 发送自动息屏指令 (KEYCODE_SLEEP)..."
+        timeout --foreground 8s adb $ADB_DEVICE shell input keyevent 223 >/dev/null 2>&1 || true
     fi
 }
 
@@ -963,17 +1110,17 @@ backlight_off_keep_awake() {
 
 kill_arknights() {
     info "关闭明日方舟进程..."
-    adb $ADB_DEVICE shell am force-stop "$AK_PACKAGE" 2>/dev/null || true
+    timeout --foreground 8s adb $ADB_DEVICE shell am force-stop "$AK_PACKAGE" 2>/dev/null || true
     sleep 2
     info "明日方舟已关闭"
 }
 
 check_arknights_installed() {
-    if adb $ADB_DEVICE shell pm list packages 2>/dev/null | grep -q "$AK_PACKAGE"; then
-        info "明日方舟已安装"
+    if adb $ADB_DEVICE shell pm list packages 2>/dev/null | tr -d '\r' | grep -Fxq "package:$AK_PACKAGE"; then
+        info "明日方舟已安装 (${CLIENT_TYPE}: ${AK_PACKAGE})"
         return 0
     else
-        error "明日方舟未安装!"
+        error "明日方舟未安装 (${CLIENT_TYPE}: ${AK_PACKAGE})! 请确认设置页客户端版本与设备实际安装的渠道一致。"
         return 1
     fi
 }
@@ -1053,7 +1200,8 @@ prewarm_landscape_surface() {
 
     warn "LANDSCAPE_PREWARM: raw header 未对齐 MAA 横屏尺寸，先受控拉起游戏以等待 Surface 横屏"
     adb $ADB_DEVICE shell am start -n "$AK_PACKAGE"/com.u8.sdk.U8UnityContext >/dev/null 2>&1 || \
-        warn "LANDSCAPE_PREWARM: am start 明日方舟未确认成功，继续等待 header 观测"
+        adb $ADB_DEVICE shell monkey -p "$AK_PACKAGE" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || \
+        warn "LANDSCAPE_PREWARM: 启动明日方舟 ($AK_PACKAGE) 未确认成功，继续等待 header 观测"
 
     for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         sleep 2
@@ -1478,6 +1626,9 @@ record_startup_failure_state() {
     if [[ "$reason" == *SERVER_MAINTENANCE* ]]; then
         set_failure_reason "SERVER_MAINTENANCE"
         warn "启动失败分型命中服务器停机维护公告: reason=$reason screen=$screen"
+    elif [[ "${KEYGUARD_STILL_LOCKED:-0}" -eq 1 ]]; then
+        set_failure_reason "KEYGUARD_LOCKED"
+        warn "启动失败分型命中安全锁屏遮挡: reason=$reason screen=$screen"
     elif is_startup_render_stall_failure "$reason" "$screen"; then
         set_failure_reason "STARTUP_RENDER_STALL"
         warn "启动失败分型命中纯 Logo/Unity 渲染停滞: reason=$reason screen=$screen"
@@ -1574,6 +1725,7 @@ run_startup_health_check() {
         return 1
     fi
 
+    DEVICE_SESSION_ACTIVE=1
     kill_arknights
     wake_screen
     backlight_off_keep_awake
@@ -1602,7 +1754,7 @@ run_startup_health_check() {
         "[[tasks]]" \
         "name = \"开始唤醒\"" \
         "type = \"StartUp\"" \
-        "params = { client_type = \"Official\", start_game_enabled = true }" > "$task_file"
+        "params = { client_type = \"${CLIENT_TYPE:-Official}\", start_game_enabled = true }" > "$task_file"
 
     logcat_since=$(date "+%m-%d %H:%M:%S.000")
     info "启动健康检查 logcat 起点: $logcat_since"
@@ -1904,6 +2056,7 @@ run_maa_task() {
         # 唤醒屏幕并设置 16:9 物理分辨率
         wake_screen
         backlight_off_keep_awake
+        mute_media_if_configured
         lock_rotation
         set_maa_resolution
 
@@ -2407,12 +2560,18 @@ update_resource_from_tarball() {
     rm -rf "$work_dir" "$tarball"
     mkdir -p "$work_dir"
 
-    if ! timeout --foreground -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" "$RESOURCE_TARBALL_URL" 2>&1 | tee -a "$LOG_FILE"; then
+    if ! timeout --foreground -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" -- "$RESOURCE_TARBALL_URL" 2>&1 | tee -a "$LOG_FILE"; then
         rm -rf "$work_dir" "$tarball"
         return 1
     fi
 
     if ! tar -xzf "$tarball" -C "$work_dir" >> "$LOG_FILE" 2>&1; then
+        rm -rf "$work_dir" "$tarball"
+        return 1
+    fi
+
+    if [[ -n "$(find "$work_dir" -type l -print -quit 2>/dev/null)" ]]; then
+        warn "tarball 中包含符号链接，拒绝覆盖资源目录"
         rm -rf "$work_dir" "$tarball"
         return 1
     fi
@@ -2681,9 +2840,21 @@ print_status() {
     info "================"
 }
 
-# === Telegram 通知 ===
+# === 多渠道 / Telegram 通知 ===
 send_tg_message() {
     local message="$1"
+
+    if [[ -f "$SCHEDULE_CONTROL_SCRIPT" ]]; then
+        if python3 "$SCHEDULE_CONTROL_SCRIPT" notify \
+            --config-dir "$MAA_CONFIG_DIR" \
+            --script-dir "$MAA_HOME" \
+            --title "[MaaZero] 运行通知" \
+            --message "$message" 2>>"$LOG_FILE"; then
+            return 0
+        fi
+        warn "通知分发脚本返回失败，请检查设置页通知渠道或网络代理配置"
+        return 0
+    fi
 
     local tg_file="${MAA_TG_FILE:-$MAA_HOME/tg.txt}"
     if [[ ! -f "$tg_file" ]]; then
@@ -2875,6 +3046,8 @@ def explain_failure_line(line):
         return "ADB 连接失败：控制链路没有连上 Android ADB，任务可能尚未稳定进入 MAA。"
     if "服务器停机维护公告" in text or "开启服务器停机维护" in text:
         return "服务器停机维护：检测到官方停机维护公告，维护期间无法登录游戏，本轮已安全停止。"
+    if "KEYGUARD_LOCKED" in text or "仍处于锁屏界面" in text:
+        return "锁屏未解锁：检测到密码/图案/生物识别锁屏遮挡，自动唤醒无法解锁，请将系统锁屏设为“无”或“滑动”。"
     if "StartUp Error" in text or "启动健康门失败" in text:
         return "StartUp 失败：游戏启动阶段没有进入可作业画面，本轮已停止盲跑。"
     if "ScreencapFailed" in text or "连续" in text and "截图失败" in text:
@@ -3525,10 +3698,11 @@ run_with_outer_lock() {
     # inherit the descriptor and keep the task lock forever.
     if [[ "${FLOCKER:-}" != "$LOCK_FILE" ]]; then
         if (( SCHEDULED_MODE == 1 )); then
-            env FLOCKER="$LOCK_FILE" MAA_SCHEDULED_LOGICAL_DATE="$SCHEDULED_DATE" \
+            env FLOCKER="$LOCK_FILE" MAA_IS_CRON_RUN="$IS_CRON_RUN" MAA_SCHEDULED_LOGICAL_DATE="$SCHEDULED_DATE" \
                 flock -w "$LOCK_WAIT_SECONDS" -E 75 -o "$LOCK_FILE" "$0" "$@"
         else
-            env FLOCKER="$LOCK_FILE" flock -n -E 75 -o "$LOCK_FILE" "$0" "$@"
+            env FLOCKER="$LOCK_FILE" MAA_IS_CRON_RUN="$IS_CRON_RUN" \
+                flock -n -E 75 -o "$LOCK_FILE" "$0" "$@"
         fi
         ec=$?
         if [[ "$ec" -eq 75 ]]; then

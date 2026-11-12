@@ -48,7 +48,25 @@ UPDATE_TIMEOUT="${MAA_UPDATE_TIMEOUT:-30m}"
 UPDATE_MARKER="$LOG_DIR/last-update-ok"
 UPDATE_RETRIES=2
 UPDATE_RETRY_DELAY=20
-RESOURCE_TARBALL_URL="${MAA_RESOURCE_TARBALL_URL:-https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main}"
+SCHEDULE_CONTROL_SCRIPT="${MAA_SCHEDULE_CONTROL_SCRIPT:-$MAA_HOME/maa_schedule_control.py}"
+MAA_RT_HTTP_PROXY=""
+MAA_RT_GITHUB_MIRROR=""
+if [[ -f "$SCHEDULE_CONTROL_SCRIPT" ]]; then
+    if _rt_env=$(python3 "$SCHEDULE_CONTROL_SCRIPT" env --config-dir "$MAA_CONFIG_DIR" 2>/dev/null); then
+        eval "$_rt_env"
+    fi
+fi
+if [[ -n "${MAA_RT_HTTP_PROXY:-}" ]]; then
+    export HTTP_PROXY="$MAA_RT_HTTP_PROXY" HTTPS_PROXY="$MAA_RT_HTTP_PROXY"
+    export http_proxy="$MAA_RT_HTTP_PROXY" https_proxy="$MAA_RT_HTTP_PROXY"
+    export NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1"
+fi
+DEFAULT_RESOURCE_TARBALL_URL="https://codeload.github.com/MaaAssistantArknights/MaaResource/tar.gz/refs/heads/main"
+if [[ -z "${MAA_RESOURCE_TARBALL_URL:-}" && -n "${MAA_RT_GITHUB_MIRROR:-}" ]]; then
+    RESOURCE_TARBALL_URL="${MAA_RT_GITHUB_MIRROR%/}/$DEFAULT_RESOURCE_TARBALL_URL"
+else
+    RESOURCE_TARBALL_URL="${MAA_RESOURCE_TARBALL_URL:-$DEFAULT_RESOURCE_TARBALL_URL}"
+fi
 RESOURCE_DIR="${MAA_RESOURCE_DIR:-$MAA_DATA_DIR/resource}"
 RESOURCE_CLONE_DIR="${MAA_RESOURCE_CLONE_DIR:-$MAA_DATA_DIR/MaaResource/resource}"
 RESOURCE_OVERLAY_SCRIPT="${MAA_RESOURCE_OVERLAY_SCRIPT:-$MAA_HOME/maa-resource-overlay.sh}"
@@ -185,12 +203,18 @@ update_resource_from_tarball() {
     rm -rf "$work_dir" "$tarball"
     mkdir -p "$work_dir"
 
-    if ! timeout --foreground -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" "$RESOURCE_TARBALL_URL" >> "$LOG_FILE" 2>&1; then
+    if ! timeout --foreground -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" -- "$RESOURCE_TARBALL_URL" >> "$LOG_FILE" 2>&1; then
         rm -rf "$work_dir" "$tarball"
         return 1
     fi
 
     if ! tar -xzf "$tarball" -C "$work_dir" >> "$LOG_FILE" 2>&1; then
+        rm -rf "$work_dir" "$tarball"
+        return 1
+    fi
+
+    if [[ -n "$(find "$work_dir" -type l -print -quit 2>/dev/null)" ]]; then
+        log "tarball 包含不受信任的符号链接，拒绝覆盖运行资源"
         rm -rf "$work_dir" "$tarball"
         return 1
     fi
@@ -217,6 +241,12 @@ update_resource_from_tarball() {
 }
 
 log "=== 开始 MAA 检查更新流程 ==="
+if [[ -n "${MAA_RT_HTTP_PROXY:-}" ]]; then
+    log "🌐 已加载全局网络代理设置 (HTTP_PROXY/HTTPS_PROXY)"
+fi
+if [[ -n "${MAA_RT_GITHUB_MIRROR:-}" ]]; then
+    log "🪞 已加载 GitHub 镜像加速前缀"
+fi
 exit_code=0
 
 # 1. maa-cli 自更新不放在高频路径，避免网络抖动拖住资源更新。

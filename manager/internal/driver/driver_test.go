@@ -422,6 +422,25 @@ func TestSeedDefaultConfigsPreservesExistingUserFiles(t *testing.T) {
 			t.Fatalf("missing seeded file %s: %v", rel, err)
 		}
 	}
+
+	dailyRaw, err := os.ReadFile(filepath.Join(dataRoot, "data", "config", "tasks", "daily.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dailyStr := string(dailyRaw)
+	for _, wantType := range []string{
+		`type = "StartUp"`,
+		`type = "Infrast"`,
+		`type = "Fight"`,
+		`type = "Recruit"`,
+		`type = "Mall"`,
+		`type = "Award"`,
+		`type = "CloseDown"`,
+	} {
+		if !strings.Contains(dailyStr, wantType) {
+			t.Fatalf("seeded daily.toml missing %s:\n%s", wantType, dailyStr)
+		}
+	}
 }
 
 func TestSupervisorReadinessProbe(t *testing.T) {

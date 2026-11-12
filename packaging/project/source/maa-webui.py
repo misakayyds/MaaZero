@@ -65,9 +65,21 @@ from maa_weekly_plan import (
 from maa_task_config import load_tasks, save_tasks
 from maa_activity_cache import get_activity
 from maa_schedule_control import (
+    CLIENT_PACKAGE_MAP,
+    SECRET_UNCHANGED,
+    apply_visual_crontab,
     arm_skip_next_daily,
     cancel_skip_next_daily,
+    export_config_backup,
+    import_config_backup,
+    load_runtime_settings,
     load_skip_next_daily,
+    next_daily_run,
+    parse_visual_crontab,
+    public_runtime_settings,
+    resolve_active_client,
+    save_runtime_settings,
+    send_notifications,
 )
 
 PORT = 8088
@@ -159,6 +171,18 @@ def get_env():
     env["MAA_LOG_DIR"] = LOG_DIR
     env["MAA_CACHE_DIR"] = CACHE_DIR
     env["MAA_ADB_ADDR"] = ADB_ADDR
+    try:
+        rt = load_runtime_settings(CONFIG_DIR)
+        proxy_url = (rt.get("network") or {}).get("http_proxy", "").strip()
+        if proxy_url:
+            env["HTTP_PROXY"] = proxy_url
+            env["HTTPS_PROXY"] = proxy_url
+            env["http_proxy"] = proxy_url
+            env["https_proxy"] = proxy_url
+            env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+            env["no_proxy"] = "127.0.0.1,localhost,::1"
+    except Exception:
+        pass
     return env
 
 
@@ -411,11 +435,20 @@ def get_operator_box_payload(config_dir=CONFIG_DIR, filename=None, crontab_raw=b
     return payload
 
 
+def _operator_scan_task_text(config_dir=CONFIG_DIR):
+    try:
+        client_type, _, _ = resolve_active_client(config_dir)
+    except Exception:
+        client_type = "Official"
+    return OPERATOR_SCAN_TASK_TEXT.replace('"Official"', json.dumps(client_type))
+
+
 def _ensure_operator_scan_task(config_dir=CONFIG_DIR):
     task_path = Path(config_dir) / "tasks" / f"{OPERATOR_SCAN_TASK}.toml"
-    if task_path.exists() and task_path.read_text("utf-8") == OPERATOR_SCAN_TASK_TEXT:
+    expected_text = _operator_scan_task_text(config_dir)
+    if task_path.exists() and task_path.read_text("utf-8") == expected_text:
         return task_path
-    atomic_write_text(task_path, OPERATOR_SCAN_TASK_TEXT)
+    atomic_write_text(task_path, expected_text)
     return task_path
 
 
@@ -617,7 +650,7 @@ def copy_weekday_tasks(config_dir, source, targets):
 
 # ─── stage API ───
 def fetch_stages():
-    data, warning = get_activity()
+    data, warning = get_activity(config_dir=CONFIG_DIR)
     _stage_cache.update(data=data, ts=datetime.now().timestamp(), error=warning)
     return data
 
@@ -859,7 +892,12 @@ def get_stage_catalog():
     """Get active stages plus diagnostics and local resource-index candidates."""
     data = fetch_stages()
     item_names = _load_item_names(RESOURCE_DIR)
-    official = data.get("Official", {})
+    try:
+        active_client, _, _ = resolve_active_client(CONFIG_DIR)
+    except Exception:
+        active_client = "Official"
+    stage_region = active_client if isinstance(data, dict) and active_client in data else "Official"
+    official = data.get(stage_region, {}) if isinstance(data, dict) else {}
     ss = official.get("sideStoryStage", {})
     now = datetime.now(timezone(timedelta(hours=8)))
     active = []
@@ -1013,6 +1051,210 @@ def get_crontab():
         r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5, env=get_env())
         return r.stdout.strip() if r.returncode == 0 else ""
     except: return ""
+
+
+_host_diag_lock = threading.Lock()
+_host_diag_cache = {"ts": 0.0, "data": None}
+SNAPSHOT_ID_RE = re.compile(r"^(log|snap|iface):([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){0,2}\.png)$")
+LOG_SNAPSHOT_REL_RE = re.compile(r"^startup-(?:health|failure)-[A-Za-z0-9_.-]+\.png$")
+
+
+def _invalidate_host_diag_cache():
+    with _host_diag_lock:
+        _host_diag_cache["ts"] = 0.0
+
+
+def get_host_device_diag(force=False):
+    now_ts = time.time()
+    with _host_diag_lock:
+        if not force and _host_diag_cache["data"] is not None and (now_ts - _host_diag_cache["ts"] < 15.0):
+            return dict(_host_diag_cache["data"])
+    client_type, pkg_name, _ = resolve_active_client(CONFIG_DIR)
+    diag = {
+        "adb_online": False,
+        "client_type": client_type,
+        "active_package": pkg_name,
+        "package_installed": None,
+        "lockscreen_secure": False,
+        "lockscreen_showing": False,
+        "lockscreen_hint": "",
+        "doze_whitelisted": None,
+        "doze_hint": "建议在 Android 系统「设置 -> 电池 -> 应用耗电管理」中将明日方舟设为“允许后台活动 / 无限制”，防止夜间息屏触发深度省电断连。",
+    }
+    if not get_adb_status():
+        diag["lockscreen_hint"] = "ADB 当前离线，暂无法检测锁屏与安装包状态"
+        with _host_diag_lock:
+            _host_diag_cache.update(ts=now_ts, data=dict(diag))
+        return diag
+
+    diag["adb_online"] = True
+    env = get_env()
+    try:
+        pm_res = subprocess.run(
+            ["adb", "-s", ADB_ADDR, "shell", "pm", "list", "packages"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+        pkgs = {line.strip() for line in (pm_res.stdout or "").replace("\r", "").splitlines()}
+        diag["package_installed"] = f"package:{pkg_name}" in pkgs
+    except Exception:
+        pass
+
+    try:
+        ls_res = subprocess.run(
+            ["adb", "-s", ADB_ADDR, "shell", "locksettings", "get-disabled"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+        ls_out = (ls_res.stdout or "").strip().lower()
+        if ls_out == "false":
+            diag["lockscreen_secure"] = True
+    except Exception:
+        pass
+
+    try:
+        win_res = subprocess.run(
+            ["adb", "-s", ADB_ADDR, "shell", "dumpsys", "window"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+        win_out = (win_res.stdout or "").replace("\r", "")
+        if ("mShowingLockscreen=true" in win_out or "isStatusBarKeyguard=true" in win_out) and "mDreamingLockscreen=true" not in win_out:
+            diag["lockscreen_showing"] = True
+    except Exception:
+        pass
+
+    try:
+        idle_res = subprocess.run(
+            ["adb", "-s", ADB_ADDR, "shell", "dumpsys", "deviceidle", "whitelist"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+        if idle_res.returncode == 0 and idle_res.stdout:
+            diag["doze_whitelisted"] = f",{pkg_name}," in idle_res.stdout
+    except Exception:
+        pass
+
+    if diag["lockscreen_secure"]:
+        diag["lockscreen_hint"] = "检测到手机设置了密码/图案/生物识别锁屏：息屏后定时唤醒无法自动越过安全锁屏，挂机期间建议将系统锁屏改为“无”或“滑动”。"
+    elif diag["lockscreen_showing"]:
+        diag["lockscreen_hint"] = "当前处于滑动锁屏界面，任务运行时将自动上滑解锁。"
+    else:
+        diag["lockscreen_hint"] = "未检测到密码锁屏阻挡（无锁屏或已解锁），支持息屏定时自动唤醒。"
+
+    with _host_diag_lock:
+        _host_diag_cache.update(ts=now_ts, data=dict(diag))
+    return diag
+
+
+def _snapshot_roots():
+    return {
+        "log": Path(LOG_DIR),
+        "snap": Path(LOG_DIR) / "failure-snapshots",
+        "iface": Path(STATE_DIR) / "debug" / "interface",
+    }
+
+
+def _path_has_symlink(base: Path, rel: str = "") -> bool:
+    if base.is_symlink():
+        return True
+    cur = base
+    for part in Path(rel).parts:
+        if part in ("", "."):
+            continue
+        cur = cur / part
+        if cur.is_symlink():
+            return True
+    return False
+
+
+def list_failure_screenshots(limit=24):
+    roots = _snapshot_roots()
+    candidates = []
+
+    log_root = roots["log"]
+    if log_root.is_dir() and not log_root.is_symlink():
+        for pat in ("startup-health-*.png", "startup-failure-*.png"):
+            for p in log_root.glob(pat):
+                if p.is_file() and not _path_has_symlink(log_root, p.name):
+                    candidates.append(("log", p.name, "启动健康诊断", p))
+
+    snap_root = roots["snap"]
+    if snap_root.is_dir() and not _path_has_symlink(roots["log"], "failure-snapshots"):
+        for p in snap_root.glob("*/*.png"):
+            rel = f"{p.parent.name}/{p.name}"
+            if p.is_file() and not _path_has_symlink(snap_root, rel):
+                candidates.append(("snap", rel, f"失败快照 ({p.parent.name})", p))
+        for p in snap_root.glob("*/interface/*.png"):
+            rel = f"{p.parent.parent.name}/interface/{p.name}"
+            if p.is_file() and not _path_has_symlink(snap_root, rel):
+                candidates.append(("snap", rel, f"界面抓拍 ({p.parent.parent.name})", p))
+
+    iface_root = roots["iface"]
+    if iface_root.is_dir() and not _path_has_symlink(Path(STATE_DIR), "debug/interface"):
+        for p in iface_root.glob("*.png"):
+            if p.is_file() and not _path_has_symlink(iface_root, p.name):
+                candidates.append(("iface", p.name, "MaaCore 界面截图", p))
+
+    enriched = []
+    for bucket, rel, category, path in candidates:
+        token = f"{bucket}:{rel}"
+        if not SNAPSHOT_ID_RE.fullmatch(token):
+            continue
+        if bucket == "log" and not LOG_SNAPSHOT_REL_RE.fullmatch(rel):
+            continue
+        try:
+            st = path.stat()
+            if st.st_size < 64:
+                continue
+            enriched.append({
+                "id": token,
+                "name": path.name,
+                "category": category,
+                "mtime": st.st_mtime,
+                "time": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "size_kb": round(st.st_size / 1024.0, 1),
+            })
+        except OSError:
+            continue
+
+    enriched.sort(key=lambda item: item["mtime"], reverse=True)
+    for item in enriched:
+        item.pop("mtime", None)
+    return enriched[:limit]
+
+
+def read_failure_screenshot_bytes(token):
+    if not isinstance(token, str):
+        raise ValueError("invalid snapshot id")
+    match = SNAPSHOT_ID_RE.fullmatch(token.strip())
+    if not match:
+        raise ValueError("invalid snapshot id")
+    bucket, rel = match.group(1), match.group(2)
+    if ".." in rel:
+        raise ValueError("invalid snapshot id")
+    if bucket == "log" and not LOG_SNAPSHOT_REL_RE.fullmatch(rel):
+        raise ValueError("invalid snapshot id")
+    base = _snapshot_roots()[bucket]
+    if bucket == "snap" and _path_has_symlink(Path(LOG_DIR), "failure-snapshots"):
+        raise ValueError("invalid snapshot id")
+    if bucket == "iface" and _path_has_symlink(Path(STATE_DIR), "debug/interface"):
+        raise ValueError("invalid snapshot id")
+    if _path_has_symlink(base, rel):
+        raise ValueError("invalid snapshot id")
+    if not base.is_dir():
+        raise FileNotFoundError(token)
+    base_resolved = base.resolve()
+    target = (base_resolved / rel).resolve()
+    try:
+        target.relative_to(base_resolved)
+    except ValueError as exc:
+        raise ValueError("invalid snapshot id") from exc
+    if target.is_symlink() or not target.is_file():
+        raise FileNotFoundError(token)
+    size = target.stat().st_size
+    if size < 64 or size > 15 * 1024 * 1024:
+        raise ValueError("invalid screenshot size")
+    raw = target.read_bytes()
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("not a PNG image")
+    return raw
 
 def run_task_bg(task_name, weekday=None, infrast_now=False):
     global running_task
@@ -1549,7 +1791,7 @@ def update_maa_bg():
     return True
 
 
-def update_apk_bg(force=False):
+def update_apk_bg(force=False, force_official=False):
     global running_task
     with run_lock:
         if running_task["active"]: return False
@@ -1564,6 +1806,8 @@ def update_apk_bg(force=False):
             cmd = ["/bin/bash", f"{SCRIPT_DIR}/arknights-apk-update.sh", "--check"]
             if force:
                 cmd.append("--force")
+            if force_official:
+                cmd.append("--force-official")
             proc = popen_bg(cmd, env=env)
             with run_lock: running_task["pid"] = proc.pid
             buf = []
@@ -1854,6 +2098,30 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 @media(max-width:1100px){.week-strip{grid-template-columns:repeat(4,1fr)}.week-day:nth-child(4){border-right:0}.week-day:nth-child(-n+4){border-bottom:1px solid var(--border)}.isched-overview,.dashboard-grid{grid-template-columns:1fr}}
 @media(max-width:900px){.app-shell{display:block}.sidebar{position:sticky;height:auto}.brand{height:60px;padding:0 20px}.nav{flex-direction:row;padding:8px 12px;overflow-x:auto;border-top:1px solid var(--border)}.nav a{padding:9px 13px}.sidebar-foot{display:none}.topbar{min-height:72px;padding:14px 20px}.wrap{padding:22px 20px 40px}}
 @media(max-width:640px){.topbar{align-items:flex-start}.topbar-meta{align-items:flex-end;flex-direction:column;gap:7px}.page-kicker{display:none}.topbar h1{font-size:20px}.wrap{padding:18px 14px 36px}.page-head{display:block}.page-head h2{font-size:24px}.hero-stage{font-size:38px}.week-strip{grid-template-columns:repeat(2,1fr)}.week-day{border-bottom:1px solid var(--border)}.week-day:nth-child(even){border-right:0}.week-day:nth-child(7){grid-column:1/-1}.dashboard-grid,.weekly-editor,.info-grid{grid-template-columns:1fr}.weekly-editor>section+section{border-left:0;border-top:1px solid var(--border)}.shift-summary,.status-row{grid-template-columns:1fr}.shift-block+.shift-block{padding:16px 0 0;border-left:0;border-top:1px solid var(--border)}.status-item{text-align:left}.isched-days{grid-template-columns:repeat(4,1fr)}.isched-day{border-bottom:1px solid var(--border)}.isched-day:nth-child(4){border-right:0}.isched-day:nth-child(7){grid-column:3/5}.hero-actions,.weekly-actions{align-items:stretch;flex-direction:column}.hero-actions .btn,.weekly-actions .btn,.hero-actions select{width:100%;justify-content:center}}
+.pill-group{display:flex;flex-wrap:wrap;gap:6px;flex:1;min-width:210px}
+.pill-btn{padding:5px 11px;border-radius:999px;border:1px solid var(--bd);background:var(--s2);color:var(--t2);font-size:12px;cursor:pointer;transition:.15s;min-height:30px;display:inline-flex;align-items:center;gap:4px}
+.pill-btn:hover{border-color:var(--ac);color:var(--t1)}
+.pill-btn.on{background:rgba(91,127,255,.18);border-color:var(--ac);color:var(--t1);font-weight:600}
+.chip-selected{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.chip-tag{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:6px;background:rgba(91,127,255,.16);border:1px solid var(--ac);color:var(--t1);font-size:12px}
+.chip-tag button{border:none;background:none;color:var(--t2);cursor:pointer;font-size:13px;line-height:1;padding:0 2px}
+.chip-tag button:hover{color:var(--rd)}
+.chip-add-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.chip-add-row input[type=text]{flex:1;min-width:160px;max-width:260px}
+.rt-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.rt-chan{background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:12px;margin-bottom:10px}
+.rt-chan-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;font-weight:600;font-size:13.5px}
+.rt-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;background:var(--s3);color:var(--t2)}
+.rt-badge.ok{background:rgba(74,222,128,.16);color:var(--gn)}
+.rt-badge.warn{background:rgba(251,191,36,.16);color:var(--yl)}
+.slot-list{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+.slot-chip{display:inline-flex;align-items:center;gap:6px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:5px 8px}
+.slot-chip input[type=time]{border:1px solid var(--bd);background:var(--s3);color:var(--t1);border-radius:6px;padding:4px 6px;font-size:13px}
+.snap-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-bottom:10px}
+.snap-item{text-align:left;padding:8px 10px;border-radius:8px;border:1px solid var(--bd);background:var(--s2);color:var(--t1);cursor:pointer;font-size:12px;transition:.15s}
+.snap-item:hover,.snap-item.on{border-color:var(--ac);background:rgba(91,127,255,.12)}
+.snap-preview{margin-top:10px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:10px;text-align:center}
+.snap-preview img{max-width:100%;max-height:460px;border-radius:6px;border:1px solid var(--bd)}
 </style>
 </head>
 <body>
@@ -1930,8 +2198,26 @@ let S = {
     draft: null, settingsDraft: null, settingsDirty: false,
     saving: false, settingsSaving: false, runPending: false, fetchSeq: 0,
     operatorQuery: '', operatorOpen: false
-  }
+  },
+  runtimeSettings: null,
+  rtSyncTasks: true,
+  rtSecretsCleared: {},
+  visualCron: {
+    loaded: false, infrast_managed: false, daily_enabled: false, daily_times: ['10:00'],
+    custom_daily_count: 0, update_enabled: false, update_time: '03:30', next_daily_for: ''
+  },
+  snapshots: [],
+  selectedSnapshot: ''
 };
+
+const CLIENT_LABELS = {
+  Official: '官服',
+  Bilibili: 'B服',
+  YoStarEN: '国际服 (EN)',
+  YoStarJP: '日服 (JP)',
+  YoStarKR: '韩服 (KR)'
+};
+function clientLabel(ct) { return CLIENT_LABELS[ct] || ct || '官服'; }
 
 // ═══ Constants ═══
 const TASK_TYPES = [
@@ -2070,11 +2356,15 @@ function loadStageCatalogInBackground() {
 }
 
 async function loadAll() {
-  const [cfg, status, weekly, infrastPlans, medicine] = await Promise.all([
+  const [cfg, status, weekly, infrastPlans, medicine, rtCfg] = await Promise.all([
     api('config'), api('status'), api('weekly-plan').catch(() => null),
     api('infrast/plans').catch(() => null),
-    api('medicine-plan').catch(error => ({ok:false, error:{code:'load_failed', message:error.message || '读取理智药计划失败'}}))
+    api('medicine-plan').catch(error => ({ok:false, error:{code:'load_failed', message:error.message || '读取理智药计划失败'}})),
+    api('runtime-settings').catch(() => null)
   ]);
+  if (rtCfg && typeof rtCfg === 'object' && !rtCfg.error) {
+    S.runtimeSettings = rtCfg;
+  }
   S.dailyTasks = cfg.tasks || [];
   S.commonStages = Array.isArray(cfg.common_stages) ? cfg.common_stages : [];
   const keepWeeklyDraft = S.page === 'weekly' && (S.weeklyDirty || S.weeklySaving || S.weeklyBusy);
@@ -2262,11 +2552,16 @@ function renderHome() {
   const runOptions = [`<option value="current">按当前规则</option>`].concat(
     PLAN_WEEKDAYS.map(day => `<option value="${day.v}" ${S.runWeekday===day.v?'selected':''}>${day.n}（仅本次测试）</option>`)
   ).join('');
-  let h = `<section class="card"><div class="eyebrow">今天</div><div class="hero-stage">今天刷 ${esc(stageDisplayLabel(todaySummary.stage))}</div>
+  const activeClient = st.client_type || (S.runtimeSettings && S.runtimeSettings.client_type) || 'Official';
+  const hostDiag = (S.runtimeSettings && S.runtimeSettings.host_diag) || {};
+  let h = `<section class="card"><div class="eyebrow">今天 · ${esc(clientLabel(activeClient))}</div><div class="hero-stage">今天刷 ${esc(stageDisplayLabel(todaySummary.stage))}</div>
     <div class="hero-sub">${esc(weeklyMode)}${annihilationNote}${todaySummary.drop?' · '+esc(todaySummary.drop):''}</div>
     <div class="hero-actions"><button class="btn btn-p" onclick="doRun(S.runWeekday)" ${st.active?'disabled':''}>运行今日日常</button><button class="btn btn-s" onclick="go('weekly')">编辑今日计划</button>
     <button class="btn btn-s" onclick="toggleSkipNextDaily()">${skip.active?'已跳过下次日常 · 撤销':'跳过下次日常'}</button>
     <label class="manual-weekday"><select aria-label="运行配置" onchange="S.runWeekday=this.value">${runOptions}</select></label></div></section>`;
+  if (hostDiag.lockscreen_secure) {
+    h += `<div class="info-box" style="border-color:var(--yl)"><span>⚠ 锁屏解锁提醒</span><strong>检测到密码/图案锁屏</strong><div class="infrast-plan-meta">${esc(hostDiag.lockscreen_hint || '息屏后定时任务无法自动越过安全锁屏，建议将系统锁屏改为“无”或“滑动”。')} <a href="#" onclick="go('conn');return false" style="color:var(--ac)">查看设置</a></div></div>`;
+  }
   if (skip.active) {
     const target = skip.scheduled_for ? new Date(skip.scheduled_for).toLocaleString('zh-CN', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '下一次定时';
     h += `<div class="info-box"><span>一次性跳过已启用</span><strong>${esc(target)}</strong><div class="infrast-plan-meta">只跳过该次定时日常；资源更新和手动运行不受影响。</div></div>`;
@@ -2324,7 +2619,16 @@ async function doUpdate() {
   await loadAll(); go('home');
 }
 async function doApkUpdate() {
-  await api('apk-update', {method:'POST'});
+  const ct = (S.status && S.status.client_type) || (S.runtimeSettings && S.runtimeSettings.client_type) || 'Official';
+  if (ct !== 'Official') {
+    showMsg('err', '内置 APK 自动更新仅支持国服官服 (Official)；当前为 ' + clientLabel(ct) + '，请通过对应渠道更新。');
+    return;
+  }
+  const r = await api('apk-update', {method:'POST'});
+  if (r && r.ok === false && r.error) {
+    showMsg('err', r.error);
+    return;
+  }
   await loadAll(); go('home');
 }
 async function doStartupHealth() {
@@ -2345,10 +2649,12 @@ async function doKill() {
 }
 async function toggleSkipNextDaily() {
   const current = (S.status && S.status.skip_next_daily) || {active:false};
+  const nextIso = (S.status && S.status.next_daily_for) || '';
+  const nextLabel = nextIso ? new Date(nextIso).toLocaleString('zh-CN', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
   const action = current.active ? 'cancel-skip-next-daily' : 'skip-next-daily';
   const prompt = current.active
     ? '撤销跳过，让下一次定时日常正常运行？'
-    : '确认只跳过下一次 02:00 / 10:00 / 16:00 定时日常吗？资源更新和手动运行不受影响。';
+    : `确认只跳过下一次定时日常${nextLabel ? '（' + nextLabel + '）' : ''}吗？资源更新和手动运行不受影响。`;
   if (!confirm(prompt)) return;
   const r = await api('run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})});
   if (!r.ok) {
@@ -3949,14 +4255,14 @@ function renderSettingsPanel(task, idx) {
       break;
     case 'Recruit':
       h += field_check(idx, 'refresh', '刷新标签', p.refresh!==false);
-      h += field_text(idx, 'select', '自动选择(星级)', JSON.stringify(p.select||[4,5]), '如 [4,5]');
-      h += field_text(idx, 'confirm', '确认(星级)', JSON.stringify(p.confirm||[3,4,5]), '如 [3,4,5]');
+      h += field_int_pills(idx, 'select', '自动选择(星级)', [[1,'1★'],[2,'2★'],[3,'3★'],[4,'4★'],[5,'5★'],[6,'6★']], Array.isArray(p.select)?p.select:[4,5]);
+      h += field_int_pills(idx, 'confirm', '自动确认(星级)', [[1,'1★'],[2,'2★'],[3,'3★'],[4,'4★'],[5,'5★'],[6,'6★']], Array.isArray(p.confirm)?p.confirm:[3,4,5]);
       h += field_num(idx, 'times', '招募次数', p.times===undefined?4:p.times, 0, 99);
       h += field_check(idx, 'set_time', '设置时间', p.set_time!==false);
       h += field_check(idx, 'expedite', '使用加急许可', p.expedite===true);
       h += field_check(idx, 'skip_robot', '识别到小车词条时跳过', p.skip_robot!==false);
       h += field_select_num(idx, 'extra_tags_mode', '选择更多 Tags 模式', [[0,'默认行为'],[1,'尽量选3个(可能冲突)'],[2,'多高星Tag组合']], p.extra_tags_mode||0);
-      h += field_text(idx, 'first_tags', '首选 Tags', JSON.stringify(p.first_tags||[]), '如 ["高级资深干员"]');
+      h += field_tag_chips(idx, 'first_tags', '首选 Tags', ['高级资深干员','资深干员','支援机械','控场','爆发','召唤','快速复活','削弱','位移','特种干员'], Array.isArray(p.first_tags)?p.first_tags:[], '输入词条，逗号分隔');
       h += field_select(idx, 'server', '服务器', [['CN','国服/官服'],['US','美服'],['JP','日服'],['KR','韩服']], p.server||'CN');
       h += field_check(idx, 'report_to_penguin', '汇报数据到企鹅物流', p.report_to_penguin===true);
       h += field_check(idx, 'report_to_yituliu', '汇报数据到一图流', p.report_to_yituliu===true);
@@ -4014,8 +4320,8 @@ function renderSettingsPanel(task, idx) {
     case 'Mall':
       h += field_check(idx, 'shopping', '启用购物', p.shopping!==false);
       h += field_check(idx, 'visit_friends', '访问好友基建获取信用', p.visit_friends!==false);
-      h += field_text(idx, 'buy_first', '优先购买', JSON.stringify(p.buy_first||[]), '如 ["招聘许可","龙门币"]');
-      h += field_text(idx, 'blacklist', '黑名单', JSON.stringify(p.blacklist||[]), '如 ["家具零件"]');
+      h += field_tag_chips(idx, 'buy_first', '优先购买', ['招聘许可','龙门币','加急许可','合成玉','技巧概要·卷2','技巧概要·卷1','作战记录','赤金','碳','家具零件'], Array.isArray(p.buy_first)?p.buy_first:[], '输入商品名，逗号分隔');
+      h += field_tag_chips(idx, 'blacklist', '黑名单', ['家具零件','加急许可','碳','碳素','碳素组','基础作战记录'], Array.isArray(p.blacklist)?p.blacklist:[], '输入商品名，逗号分隔');
       h += field_check(idx, 'force_shopping_if_credit_full', '信用满购物时无视黑名单', p.force_shopping_if_credit_full!==false);
       h += field_check(idx, 'only_buy_discount', '只购买折扣物品 (第二轮)', p.only_buy_discount===true);
       h += field_check(idx, 'reserve_max_credit', '信用点低于 300 停止购买', p.reserve_max_credit===true);
@@ -4087,7 +4393,7 @@ function renderSettingsPanel(task, idx) {
         [32,'RA-15 初雪60杀'],
         [48,'RA-4 赤金解锁维什戴尔杀Boss']
       ], p.mode===undefined?0:p.mode);
-      h += field_text(idx, 'tools_to_craft', '自动制造物品', JSON.stringify(p.tools_to_craft||["荧光棒"]), '如 ["荧光棒"]');
+      h += field_tag_chips(idx, 'tools_to_craft', '自动制造物品', ['荧光棒','采石钻机','伐木老手','净水装置','支援鹤机的零件'], Array.isArray(p.tools_to_craft)?p.tools_to_craft:['荧光棒'], '输入制造物品名，逗号分隔');
       h += field_num(idx, 'num_craft_batches', '单次最大制造轮数', p.num_craft_batches===undefined?16:p.num_craft_batches, 1, 99);
       break;
     case 'Copilot':
@@ -4511,7 +4817,7 @@ function renderFightPanel(idx, p, task) {
   h += field_select_num(idx, 'series', '连战次数', [[0,'自动 (Auto)'],[-1,'禁用连战'],[1,'1次'],[2,'2连战'],[3,'3连战'],[4,'4连战'],[5,'5连战'],[6,'6连战']], p.series===undefined?0:p.series);
   h += field_check(idx, 'DrGrandet', '省理智碎石模式 (DrGrandet)', p.DrGrandet===true);
   h += field_select(idx, 'server', '服务器', [['CN','国服/官服'],['US','美服'],['JP','日服'],['KR','韩服']], p.server||'CN');
-  h += field_select(idx, 'client_type', '崩溃重启客户端', [['','不启用'],['Official','官服'],['Bilibili','B服']], p.client_type||'');
+  h += field_select(idx, 'client_type', '崩溃重启客户端', [['','不启用'],['Official','官服'],['Bilibili','B服'],['YoStarEN','国际服'],['YoStarJP','日服'],['YoStarKR','韩服']], p.client_type||'');
   h += field_check(idx, 'report_to_penguin', '企鹅物流数据汇报', p.report_to_penguin===true);
   h += field_check(idx, 'report_to_yituliu', '一图流数据汇报', p.report_to_yituliu===true);
   if (p.report_to_yituliu === true) {
@@ -4537,6 +4843,77 @@ function field_select(idx, key, label, opts, val) {
 function field_select_num(idx, key, label, opts, val) {
   let o = opts.map(([v,n]) => `<option value="${v}" ${v==val?'selected':''}>${esc(n)}</option>`).join('');
   return `<div class="fg"><label>${esc(label)}</label><select onchange="setParamNum(${idx},'${key}',this.value)">${o}</select></div>`;
+}
+function field_int_pills(idx, key, label, opts, vals) {
+  const active = new Set((Array.isArray(vals) ? vals : []).map(v => parseInt(v, 10)).filter(v => Number.isFinite(v)));
+  const buttons = opts.map(([v, n]) => {
+    const on = active.has(v) ? ' on' : '';
+    return `<button type="button" class="pill-btn${on}" onclick="toggleIntPill(${idx},'${key}',${v})">${esc(n)}</button>`;
+  }).join('');
+  return `<div class="fg" style="align-items:flex-start"><label style="padding-top:5px">${esc(label)}</label><div class="pill-group">${buttons}</div></div>`;
+}
+function field_tag_chips(idx, key, label, presets, vals, ph) {
+  const list = Array.isArray(vals) ? vals.map(String).filter(Boolean) : [];
+  const active = new Set(list);
+  const selectedHtml = list.length
+    ? `<div class="chip-selected">${list.map((item, ci) => `<span class="chip-tag">${esc(item)}<button type="button" title="移除" onclick="removeTagChipAt(${idx},'${key}',${ci})">×</button></span>`).join('')}</div>`
+    : `<div style="font-size:12px;color:var(--t2);margin-bottom:6px">暂未选择（点击下方常用项或手动添加）</div>`;
+  const presetHtml = `<div class="pill-group">${presets.map((p, pi) => {
+    const on = active.has(p) ? ' on' : '';
+    return `<button type="button" class="pill-btn${on}" data-preset="${esc(p)}" onclick="toggleTagChip(${idx},'${key}',this.dataset.preset)">${active.has(p)?'✓ ':''}${esc(p)}</button>`;
+  }).join('')}</div>`;
+  const inputId = `chip_in_${idx}_${key}`;
+  return `<div class="fg" style="align-items:flex-start"><label style="padding-top:5px">${esc(label)}</label><div style="flex:1;min-width:220px">${selectedHtml}${presetHtml}<div class="chip-add-row"><input type="text" id="${inputId}" placeholder="${esc(ph||'输入后回车添加')}" onkeydown="if(event.key==='Enter'){event.preventDefault();addCustomTagChips(${idx},'${key}','${inputId}')}"><button type="button" class="btn btn-s" onclick="addCustomTagChips(${idx},'${key}','${inputId}')">+ 添加</button></div></div></div>`;
+}
+function defaultArrayParam(taskType, key) {
+  if (taskType === 'Recruit' && key === 'select') return [4, 5];
+  if (taskType === 'Recruit' && key === 'confirm') return [3, 4, 5];
+  if (taskType === 'Reclamation' && key === 'tools_to_craft') return ['荧光棒'];
+  return [];
+}
+function toggleIntPill(idx, key, numVal) {
+  if (!S.tasks[idx].params) S.tasks[idx].params = {};
+  const rawArr = Array.isArray(S.tasks[idx].params[key]) ? S.tasks[idx].params[key] : defaultArrayParam(S.tasks[idx].type, key);
+  const cur = Array.from(new Set(rawArr.map(v => parseInt(v, 10)).filter(v => Number.isFinite(v))));
+  const next = cur.includes(numVal) ? cur.filter(x => x !== numVal) : [...cur, numVal].sort((a, b) => a - b);
+  S.tasks[idx].params[key] = next;
+  markTaskDirty();
+  render();
+}
+function toggleTagChip(idx, key, val) {
+  if (!S.tasks[idx].params) S.tasks[idx].params = {};
+  const rawArr = Array.isArray(S.tasks[idx].params[key]) ? S.tasks[idx].params[key] : defaultArrayParam(S.tasks[idx].type, key);
+  const cur = rawArr.map(String).filter(Boolean);
+  const next = cur.includes(val) ? cur.filter(x => x !== val) : [...cur, val];
+  S.tasks[idx].params[key] = next;
+  markTaskDirty();
+  render();
+}
+function removeTagChipAt(idx, key, chipIdx) {
+  if (!S.tasks[idx].params) S.tasks[idx].params = {};
+  const rawArr = Array.isArray(S.tasks[idx].params[key]) ? S.tasks[idx].params[key] : defaultArrayParam(S.tasks[idx].type, key);
+  const cur = rawArr.map(String).filter(Boolean);
+  cur.splice(chipIdx, 1);
+  S.tasks[idx].params[key] = cur;
+  markTaskDirty();
+  render();
+}
+function addCustomTagChips(idx, key, inputId) {
+  const el = document.getElementById(inputId);
+  if (!el) return;
+  const raw = (el.value || '').trim().replace(/^\[|\]$/g, '');
+  if (!raw) return;
+  if (!S.tasks[idx].params) S.tasks[idx].params = {};
+  const rawArr = Array.isArray(S.tasks[idx].params[key]) ? S.tasks[idx].params[key] : defaultArrayParam(S.tasks[idx].type, key);
+  const cur = rawArr.map(String).filter(Boolean);
+  raw.split(/[,，]+/).forEach(part => {
+    const cleaned = part.trim().replace(/^["']+|["']+$/g, '').trim();
+    if (cleaned && !cur.includes(cleaned)) cur.push(cleaned);
+  });
+  S.tasks[idx].params[key] = cur;
+  el.value = '';
+  markTaskDirty();
+  render();
 }
 
 // ─── Task actions ───
@@ -4600,10 +4977,12 @@ function toggleFac(idx, fac, on) {
 }
 
 function getDefaultParams(type) {
+  const rtClient = (S.runtimeSettings && S.runtimeSettings.client_type) || 'Official';
+  const rtServer = (S.runtimeSettings && S.runtimeSettings.server_code) || 'CN';
   switch(type) {
-    case 'StartUp': return {client_type:'Official', start_game_enabled:true};
-    case 'Fight': return {stage:'', medicine:0, medicine_expire_days:0, stone:0, times:999, series:0, report_to_penguin:false, DrGrandet:false, server:'CN', client_type:''};
-    case 'Recruit': return {refresh:true, select:[4,5], confirm:[3,4,5], times:4, set_time:true, expedite:false, extra_tags_mode:0, skip_robot:true};
+    case 'StartUp': return {client_type:rtClient, start_game_enabled:true};
+    case 'Fight': return {stage:'', medicine:0, medicine_expire_days:0, stone:0, times:999, series:0, report_to_penguin:false, DrGrandet:false, server:rtServer, client_type:''};
+    case 'Recruit': return {refresh:true, select:[4,5], confirm:[3,4,5], times:4, set_time:true, expedite:false, extra_tags_mode:0, skip_robot:true, server:rtServer};
     case 'Infrast': return {
       mode: 0,
       facility: [...FACILITIES],
@@ -4636,7 +5015,7 @@ function getDefaultParams(type) {
       mining: true,
       specialaccess: true
     };
-    case 'CloseDown': return {client_type:'Official'};
+    case 'CloseDown': return {client_type:rtClient};
     case 'Roguelike': return {
       theme:'Sami',
       mode:0,
@@ -4679,53 +5058,514 @@ function getDefaultParams(type) {
 
 function bindTaskEvents() {}
 
-// ─── Logs ───
+// ─── Logs & Failure Screenshots ───
 function renderLogs() {
-  return `<div class="card"><h2>📄 运行日志</h2><div class="logbox" id="logbox" style="max-height:350px">加载中...</div>
+  const snaps = Array.isArray(S.snapshots) ? S.snapshots : [];
+  const snapListHtml = snaps.length
+    ? `<div class="snap-grid">${snaps.map((s, si) => `<button type="button" class="snap-item${S.selectedSnapshot===s.id?' on':''}" data-sid="${esc(s.id)}" onclick="selectFailureSnapshot(this.dataset.sid)"><div style="font-weight:600">${esc(s.category)}</div><div style="color:var(--t2);font-size:11px;margin-top:2px">${esc(s.time)} · ${esc(s.size_kb)} KB</div><div style="color:var(--t2);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</div></button>`).join('')}</div>`
+    : `<div class="help" style="margin-bottom:6px">暂无启动健康检查或失败现场截图。当任务触发异常采集或运行「启动健康检查」后，可在此直接查看游戏画面快照。</div>`;
+  const curSnap = snaps.find(x => x.id === S.selectedSnapshot);
+  const previewHtml = curSnap
+    ? `<div class="snap-preview"><div style="font-size:12px;color:var(--t2);margin-bottom:8px">${esc(curSnap.category)} · ${esc(curSnap.name)} (${esc(curSnap.time)})</div><img src="/api/failure-snapshots/image?id=${encodeURIComponent(curSnap.id)}&_t=${encodeURIComponent(curSnap.time)}" alt="${esc(curSnap.name)}" loading="lazy"></div>`
+    : '';
+  return `<div class="card"><h2>🖼 失败与启动诊断截图</h2><div id="snap_box">${snapListHtml}${previewHtml}</div>
+    <div class="btn-row"><button class="btn btn-s" onclick="loadLogs()">🔄 刷新日志与截图</button></div></div>
+    <div class="card"><h2>📄 运行日志</h2><div class="logbox" id="logbox" style="max-height:350px">加载中...</div>
     <div class="btn-row"><button class="btn btn-s" onclick="loadLogs()">🔄 刷新</button></div></div>
     <div class="card"><h2>🔍 MaaCore 日志</h2><div class="logbox" id="corelog" style="max-height:350px">加载中...</div></div>`;
 }
 async function loadLogs() {
-  const d = await api('logs');
+  const [d, snapRes] = await Promise.all([
+    api('logs'),
+    api('failure-snapshots').catch(() => ({items:[]}))
+  ]);
+  S.snapshots = Array.isArray(snapRes.items) ? snapRes.items : [];
+  if (S.snapshots.length && !S.snapshots.some(x => x.id === S.selectedSnapshot)) {
+    S.selectedSnapshot = S.snapshots[0].id;
+  }
+  const snapBox = document.getElementById('snap_box');
+  if (snapBox) {
+    const snaps = S.snapshots;
+    const snapListHtml = snaps.length
+      ? `<div class="snap-grid">${snaps.map(s => `<button type="button" class="snap-item${S.selectedSnapshot===s.id?' on':''}" data-sid="${esc(s.id)}" onclick="selectFailureSnapshot(this.dataset.sid)"><div style="font-weight:600">${esc(s.category)}</div><div style="color:var(--t2);font-size:11px;margin-top:2px">${esc(s.time)} · ${esc(s.size_kb)} KB</div><div style="color:var(--t2);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</div></button>`).join('')}</div>`
+      : `<div class="help" style="margin-bottom:6px">暂无启动健康检查或失败现场截图。当任务触发异常采集或运行「启动健康检查」后，可在此直接查看游戏画面快照。</div>`;
+    const curSnap = snaps.find(x => x.id === S.selectedSnapshot);
+    const previewHtml = curSnap
+      ? `<div class="snap-preview"><div style="font-size:12px;color:var(--t2);margin-bottom:8px">${esc(curSnap.category)} · ${esc(curSnap.name)} (${esc(curSnap.time)})</div><img src="/api/failure-snapshots/image?id=${encodeURIComponent(curSnap.id)}&_t=${encodeURIComponent(curSnap.time)}" alt="${esc(curSnap.name)}" loading="lazy"></div>`
+      : '';
+    snapBox.innerHTML = snapListHtml + previewHtml;
+  }
   const el = document.getElementById('logbox');
   if (el) { el.textContent = d.log || '暂无'; el.scrollTop = el.scrollHeight; }
   const el2 = document.getElementById('corelog');
   if (el2) el2.textContent = d.core_log || '暂无';
 }
+function selectFailureSnapshot(sid) {
+  S.selectedSnapshot = sid;
+  if (S.page === 'logs') render();
+}
 
-// ─── Cron ───
+// ─── Cron (Visual + Raw) ───
 function renderCron() {
-  return `<div class="card"><h2>⏰ 定时任务</h2>
+  const vc = S.visualCron || {};
+  const nextText = vc.next_daily_for
+    ? new Date(vc.next_daily_for).toLocaleString('zh-CN', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})
+    : '暂无已启用的日常定时';
+
+  let dailyCard = `<div class="card"><h2>⏰ 每日自动刷取时间</h2>`;
+  if (vc.infrast_managed) {
+    dailyCard += `<div class="info-box"><span>受管模式</span><strong>已由「周基建排班」接管日常定时</strong>
+      <div class="infrast-plan-meta">当前日常刷取时间按 24 小时基建排班表自动触发（下次运行：${esc(nextText)}）。如需改回普通固定时间，请先在基建排班页停用托管。</div></div>
+      <div class="btn-row"><button type="button" class="btn btn-s" onclick="go('infrast-plans')">前往周基建排班</button></div>`;
+  } else {
+    const customLocked = (vc.custom_daily_count || 0) > 0;
+    if (customLocked) {
+      dailyCard += `<div class="info-box" style="border-color:var(--yl)"><span>自定义规则提示</span><strong>检测到 ${esc(vc.custom_daily_count)} 条自定义参数的日常定时</strong>
+        <div class="infrast-plan-meta">可视化面板已锁定日常时段，避免误覆盖自定义参数；请展开下方「高级模式」直接编辑原始 crontab（下方自动更新时间仍可独立保存）。</div></div>`;
+    }
+    const slots = (Array.isArray(vc.daily_times) && vc.daily_times.length) ? vc.daily_times : ['04:30', '16:30'];
+    const slotDisabled = (!vc.daily_enabled || customLocked) ? 'disabled' : '';
+    const slotHtml = slots.map((t, idx) => `<span class="slot-chip"><input type="time" value="${esc(t)}" onchange="updateVisualSlot(${idx},this.value)" ${slotDisabled}><button type="button" class="btn btn-s" style="padding:2px 7px" onclick="removeVisualSlot(${idx})" ${(!vc.daily_enabled || customLocked || slots.length<=1)?'disabled':''}>×</button></span>`).join('');
+    dailyCard += `<div class="fg"><label style="min-width:140px">启用每日定时刷取</label><input type="checkbox" ${vc.daily_enabled?'checked':''} ${customLocked?'disabled':''} onchange="toggleVisualDaily(this.checked)">
+      <span style="font-size:12px;color:var(--t2)">下次预计运行：<b>${esc(nextText)}</b></span></div>
+      <div class="slot-list">${slotHtml}<button type="button" class="btn btn-s" onclick="addVisualSlot()" ${slotDisabled}>+ 添加时间点</button></div>
+      <div class="fg" style="gap:6px"><span style="font-size:12px;color:var(--t2)">快捷预设：</span>
+        <button type="button" class="pill-btn" ${customLocked?'disabled':''} onclick="applyVisualPreset(['04:30','16:30'])">早晚两次 (04:30 + 16:30)</button>
+        <button type="button" class="pill-btn" ${customLocked?'disabled':''} onclick="applyVisualPreset(['04:30','12:30','20:30'])">早中晚三次 (04:30/12:30/20:30)</button>
+        <button type="button" class="pill-btn" ${customLocked?'disabled':''} onclick="applyVisualPreset(['10:00'])">每日单次 (10:00)</button>
+      </div>
+      ${customLocked ? '' : '<div class="btn-row"><button type="button" class="btn btn-p" onclick="saveVisualCron()">💾 保存定时设置</button></div>'}`;
+  }
+  dailyCard += `</div>`;
+
+  const updTimeVal = vc.update_time === undefined ? '03:30' : vc.update_time;
+  const updateCard = `<div class="card"><h2>🔄 每日自动更新 MAA 资源</h2>
+    <div class="fg"><label style="min-width:140px">启用每日自动更新</label><input type="checkbox" ${vc.update_enabled?'checked':''} onchange="S.visualCron.update_enabled=this.checked;render()">
+      <label style="min-width:70px;margin-left:8px">更新时间</label><input type="time" value="${esc(updTimeVal)}" onchange="S.visualCron.update_time=this.value" ${!vc.update_enabled?'disabled':''} style="padding:5px 8px;border-radius:6px;border:1px solid var(--bd);background:var(--s3);color:var(--t1)">
+    </div>
+    <div class="help" style="margin-bottom:10px">建议设在首次日常刷取前 30~60 分钟（默认 03:30），自动同步新活动关卡导航与公招词条数据。</div>
+    <div class="btn-row"><button type="button" class="btn btn-p" onclick="saveVisualCron()">💾 保存定时设置</button></div>
+  </div>`;
+
+  const rawCard = `<details id="cron_adv_details" class="advanced-panel"${S.cronAdvOpen?' open':''} ontoggle="S.cronAdvOpen=this.open"><summary>高级模式：直接编辑原始 Crontab</summary><div class="advanced-body card">
     <textarea id="crontext" spellcheck="false">加载中...</textarea>
-    <div class="btn-row"><button class="btn btn-p" onclick="saveCron()">💾 保存</button></div>
+    <div class="btn-row"><button class="btn btn-p" onclick="saveCron()">💾 保存原始 Crontab</button></div>
     <div class="help"><b>格式:</b> 分 时 日 月 周 命令<br>
     <b>示例:</b> <code>0 10 * * * /root/maa-scripts/maa-run.sh daily >> /var/log/maa/cron.log 2>&1</code></div>
-  </div>`;
+  </div></details>`;
+
+  return dailyCard + updateCard + rawCard;
+}
+function toggleVisualDaily(on) {
+  S.visualCron.daily_enabled = !!on;
+  if (on && (!Array.isArray(S.visualCron.daily_times) || !S.visualCron.daily_times.length)) {
+    S.visualCron.daily_times = ['04:30', '16:30'];
+  }
+  render();
+}
+function updateVisualSlot(idx, val) {
+  if (!Array.isArray(S.visualCron.daily_times)) S.visualCron.daily_times = [];
+  S.visualCron.daily_times[idx] = (val || '').trim();
+}
+function addVisualSlot() {
+  if (!Array.isArray(S.visualCron.daily_times)) S.visualCron.daily_times = [];
+  if (S.visualCron.daily_times.length >= 12) return;
+  S.visualCron.daily_times.push('20:00');
+  render();
+}
+function removeVisualSlot(idx) {
+  if (!Array.isArray(S.visualCron.daily_times) || S.visualCron.daily_times.length <= 1) return;
+  S.visualCron.daily_times.splice(idx, 1);
+  render();
+}
+function applyVisualPreset(times) {
+  S.visualCron.daily_enabled = true;
+  S.visualCron.daily_times = [...times];
+  render();
 }
 async function loadCron() {
+  const res = await api('schedule/visual').catch(() => null);
+  if (res && !res.error) {
+    const detEl = document.getElementById('cron_adv_details');
+    if (detEl) S.cronAdvOpen = !!detEl.open;
+    S.visualCron = {
+      loaded: true,
+      infrast_managed: !!res.infrast_managed,
+      daily_enabled: !!res.daily_enabled,
+      daily_times: (Array.isArray(res.daily_times) && res.daily_times.length) ? res.daily_times : ['04:30', '16:30'],
+      custom_daily_count: res.custom_daily_count || 0,
+      update_enabled: !!res.update_enabled,
+      update_time: res.update_time || '03:30',
+      next_daily_for: res.next_daily_for || ''
+    };
+    if (S.page === 'cron') {
+      const m = document.getElementById('main');
+      if (m) m.innerHTML = renderCron();
+    }
+    const el = document.getElementById('crontext');
+    if (el) el.value = res.raw_content || '';
+    return;
+  }
   const d = await api('crontab');
   const el = document.getElementById('crontext');
   if (el) el.value = d.content || '';
 }
+async function saveVisualCron() {
+  const vc = S.visualCron || {};
+  const lockDaily = !!(vc.infrast_managed || (vc.custom_daily_count || 0) > 0);
+  const payload = {
+    daily_enabled: lockDaily ? null : !!vc.daily_enabled,
+    daily_times: vc.daily_times || [],
+    update_enabled: !!vc.update_enabled,
+    update_time: vc.update_time === undefined ? '03:30' : String(vc.update_time)
+  };
+  const r = await api('schedule/visual', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) {
+    const msg = (r.error && r.error.message) ? r.error.message : (r.error || '保存失败');
+    showMsg('err', '保存失败: ' + msg);
+    return;
+  }
+  await loadAll();
+  await loadCron();
+  showMsg('ok', '定时设置已保存 ✓');
+}
 async function saveCron() {
   const v = document.getElementById('crontext').value;
   const r = await api('crontab', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({content:v})});
+  if (r.ok) {
+    await loadAll();
+    await loadCron();
+  }
   showMsg(r.ok ? 'ok' : 'err', r.ok ? '定时任务已保存 ✓' : '保存失败');
 }
 
-// ─── Connection ───
-function renderConn() {
-  return `<div class="card"><h2>🔗 连接配置</h2>
-    <textarea id="proftext" spellcheck="false" style="min-height:200px">加载中...</textarea>
-    <div class="btn-row"><button class="btn btn-p" onclick="saveConn('profile')">💾 保存连接</button></div></div>
-    <div class="card"><h2>⚙ CLI 配置</h2>
-    <textarea id="clitext" spellcheck="false" style="min-height:180px">加载中...</textarea>
-    <div class="btn-row"><button class="btn btn-p" onclick="saveConn('cli')">💾 保存CLI</button></div></div>`;
+// ─── Settings & Connection ───
+function secretInputHtml(id, secretKey, hasVal, ph) {
+  const cleared = !!S.rtSecretsCleared[secretKey];
+  const activeSaved = hasVal && !cleared;
+  const placeholder = activeSaved ? '已保存（留空保持不变）' : (cleared ? '已标记清除（点击保存生效）' : (ph || ''));
+  const badge = activeSaved
+    ? `<button type="button" class="btn btn-s" style="padding:3px 8px;font-size:11px" onclick="S.rtSecretsCleared['${secretKey}']=true;renderConnPreservingFiles()">清除</button>`
+    : (cleared ? `<button type="button" class="btn btn-s" style="padding:3px 8px;font-size:11px" onclick="delete S.rtSecretsCleared['${secretKey}'];renderConnPreservingFiles()">撤销清除</button>` : '');
+  return `<input type="password" id="${id}" value="" placeholder="${esc(placeholder)}" autocomplete="new-password" style="width:220px">${badge}`;
 }
-async function loadConn() {
-  const d = await api('files');
-  document.getElementById('proftext').value = d.profile || '';
-  document.getElementById('clitext').value = d.cli || '';
+function renderConnPreservingFiles() {
+  const profEl = document.getElementById('proftext');
+  const cliEl = document.getElementById('clitext');
+  const detEl = document.getElementById('conn_adv_details');
+  const profVal = profEl ? profEl.value : '';
+  const cliVal = cliEl ? cliEl.value : '';
+  if (detEl) S.connAdvOpen = !!detEl.open;
+  render();
+  const np = document.getElementById('proftext');
+  const nc = document.getElementById('clitext');
+  if (np) np.value = profVal;
+  if (nc) nc.value = cliVal;
+}
+function renderConn() {
+  const rt = S.runtimeSettings || {
+    client_type: 'Official',
+    device: {mute_during_run:false, sleep_after_run:'scheduled'},
+    network: {http_proxy:'', github_mirror:''},
+    notify: {
+      enabled:false,
+      telegram:{enabled:false, chat_id:'', api_base:'https://api.telegram.org', has_bot_token:false},
+      pushplus:{enabled:false, topic:'', has_token:false},
+      serverchan:{enabled:false, has_sendkey:false},
+      bark:{enabled:false, server_url:'https://api.day.app', has_device_key:false},
+      webhook:{enabled:false, provider:'generic', has_url:false, has_sign_secret:false}
+    },
+    host_diag: {}
+  };
+  const dev = rt.device || {};
+  const net = rt.network || {};
+  const ntf = rt.notify || {};
+  const tg = ntf.telegram || {};
+  const pp = ntf.pushplus || {};
+  const sc = ntf.serverchan || {};
+  const bk = ntf.bark || {};
+  const wh = ntf.webhook || {};
+  const diag = rt.host_diag || {};
+
+  const pkgBadge = diag.package_installed === true
+    ? `<span class="rt-badge ok">已安装 (${esc(diag.active_package || rt.package_name || '')})</span>`
+    : (diag.package_installed === false ? `<span class="rt-badge warn">未检测到 ${esc(diag.active_package || rt.package_name || '')}</span>` : '');
+  const lockBadge = diag.lockscreen_secure
+    ? `<span class="rt-badge warn">⚠ 已设密码/图案锁屏</span>`
+    : (diag.adb_online ? `<span class="rt-badge ok">✓ 锁屏状态正常</span>` : `<span class="rt-badge">ADB 离线</span>`);
+  const dozeBadge = diag.doze_whitelisted === true
+    ? `<span class="rt-badge ok">✓ 游戏已加入省电白名单</span>`
+    : (diag.doze_whitelisted === false ? `<span class="rt-badge warn">建议将游戏设为后台无限制</span>` : '');
+
+  let h = `<div class="card"><h2>📱 客户端版本与手机挂机策略</h2>
+    <div class="fg"><label style="min-width:130px">明日方舟客户端</label>
+      <select id="rt_client_type" style="width:200px">
+        ${[['Official','官服 (Official)'],['Bilibili','B服 (Bilibili)'],['YoStarEN','国际服 (YoStarEN)'],['YoStarJP','日服 (YoStarJP)'],['YoStarKR','韩服 (YoStarKR)']].map(([v,n]) => `<option value="${v}" ${rt.client_type===v?'selected':''}>${esc(n)}</option>`).join('')}
+      </select>
+      ${pkgBadge}
+    </div>
+    <div class="fg"><label style="min-width:130px">同步任务客户端</label>
+      <input type="checkbox" id="rt_sync_tasks" ${S.rtSyncTasks!==false?'checked':''} onchange="S.rtSyncTasks=this.checked">
+      <span style="font-size:12px;color:var(--t2)">保存时同步更新日常与周计划 (StartUp / Fight / Recruit / CloseDown) 的客户端与服务器字段</span>
+    </div>
+    <div class="fg"><label style="min-width:130px">运行期间自动静音</label>
+      <input type="checkbox" id="rt_mute" ${dev.mute_during_run?'checked':''}>
+      <span style="font-size:12px;color:var(--t2)">启动游戏前将媒体音量静置为 0，任务结束后自动恢复原音量</span>
+    </div>
+    <div class="fg"><label style="min-width:130px">任务结束自动息屏</label>
+      <select id="rt_sleep" style="width:240px">
+        <option value="scheduled" ${(dev.sleep_after_run||'scheduled')==='scheduled'?'selected':''}>仅定时任务结束后息屏（推荐）</option>
+        <option value="always" ${dev.sleep_after_run==='always'?'selected':''}>每次任务结束后均息屏</option>
+        <option value="off" ${dev.sleep_after_run==='off'?'selected':''}>不自动息屏</option>
+      </select>
+    </div>
+    <div class="atip" style="margin-top:8px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px"><b>宿主物理环境诊断</b> ${lockBadge} ${dozeBadge}
+        <button type="button" class="btn btn-s" style="padding:2px 8px;font-size:11px;margin-left:auto" onclick="refreshHostDiag()">🔄 重新检测</button>
+      </div>
+      <div>• <b>锁屏检查：</b>${esc(diag.lockscreen_hint || '点击“重新检测”读取当前锁屏状态')}</div>
+      <div>• <b>省电建议：</b>${esc(diag.doze_hint || '建议在系统电池设置中允许明日方舟后台无限制运行。')}</div>
+    </div>
+  </div>`;
+
+  h += `<div class="card"><h2>🌐 网络代理与 GitHub 镜像加速</h2>
+    <div class="fg"><label style="min-width:130px">HTTP/SOCKS5 代理</label>
+      <input type="text" id="rt_proxy" value="${esc(net.http_proxy||'')}" placeholder="如 http://127.0.0.1:7890（留空直连）" style="width:280px">
+      <span style="font-size:12px;color:var(--t2)">用于 MAA 更新、关卡活动拉取及外网通知推送（自动绕过 127.0.0.1 本地 ADB）</span>
+    </div>
+    <div class="fg"><label style="min-width:130px">GitHub 镜像前缀</label>
+      <input type="text" id="rt_mirror" value="${esc(net.github_mirror||'')}" placeholder="如 https://ghfast.top（留空使用官方源）" style="width:280px">
+      <span style="font-size:12px;color:var(--t2)">当 Git 更新受阻回退 Tarball 下载 MaaResource 时自动拼接加速前缀</span>
+    </div>
+  </div>`;
+
+  h += `<div class="card"><h2>🔔 消息通知渠道（微信 / Bark / 飞书钉钉企微 / Telegram）</h2>
+    <div class="fg"><label style="min-width:130px">启用通知推送</label>
+      <input type="checkbox" id="rt_notify_enabled" ${ntf.enabled?'checked':''}>
+      <span style="font-size:12px;color:var(--t2)">任务完成、异常告警、公招高星与培养专精进度将推送到以下已勾选渠道${rt.legacy_tg_configured?'（检测到旧版 tg.txt 兜底可用）':''}</span>
+    </div>
+
+    <div class="rt-chan">
+      <div class="rt-chan-hd"><label><input type="checkbox" id="rt_pp_on" ${pp.enabled?'checked':''}> PushPlus（微信推送，国内免代理推荐）</label>${pp.has_token?'<span class="rt-badge ok">已存 Token</span>':''}</div>
+      <div class="fg"><label>Token</label>${secretInputHtml('rt_pp_token','pp_token',!!pp.has_token,'PushPlus 好友令牌')}<label style="min-width:60px">群组编码</label><input type="text" id="rt_pp_topic" value="${esc(pp.topic||'')}" placeholder="选填 topic" style="width:130px"></div>
+    </div>
+
+    <div class="rt-chan">
+      <div class="rt-chan-hd"><label><input type="checkbox" id="rt_sc_on" ${sc.enabled?'checked':''}> Server酱（支持 Turbo 版 SCT 与 Server酱³ sctp）</label>${sc.has_sendkey?'<span class="rt-badge ok">已存 SendKey</span>':''}</div>
+      <div class="fg"><label>SendKey</label>${secretInputHtml('rt_sc_key','sc_key',!!sc.has_sendkey,'SCT... 或 sctp...')}</div>
+    </div>
+
+    <div class="rt-chan">
+      <div class="rt-chan-hd"><label><input type="checkbox" id="rt_bk_on" ${bk.enabled?'checked':''}> Bark（iOS 苹果原生推送）</label>${bk.has_device_key?'<span class="rt-badge ok">已存 Key</span>':''}</div>
+      <div class="fg"><label>服务器</label><input type="text" id="rt_bk_srv" value="${esc(bk.server_url||'https://api.day.app')}" placeholder="https://api.day.app" style="width:200px"><label style="min-width:68px">DeviceKey</label>${secretInputHtml('rt_bk_key','bk_key',!!bk.has_device_key,'Bark 设备 Key')}</div>
+    </div>
+
+    <div class="rt-chan">
+      <div class="rt-chan-hd"><label><input type="checkbox" id="rt_wh_on" ${wh.enabled?'checked':''}> 群机器人 Webhook（飞书 / 钉钉 / 企业微信 / 通用 JSON）</label>${wh.has_url?'<span class="rt-badge ok">已存 URL</span>':''}</div>
+      <div class="fg"><label>平台类型</label>
+        <select id="rt_wh_provider" style="width:150px">
+          ${[['feishu','飞书机器人'],['dingtalk','钉钉机器人'],['wecom','企业微信机器人'],['generic','通用 JSON POST']].map(([v,n]) => `<option value="${v}" ${(wh.provider||'generic')===v?'selected':''}>${esc(n)}</option>`).join('')}
+        </select>
+        <label style="min-width:70px">Webhook</label>${secretInputHtml('rt_wh_url','wh_url',!!wh.has_url,'https://open.feishu.cn/...')}
+      </div>
+      <div class="fg"><label>加签密钥</label>${secretInputHtml('rt_wh_sec','wh_sec',!!wh.has_sign_secret,'飞书/钉钉加签密钥 (选填)')}</div>
+    </div>
+
+    <div class="rt-chan">
+      <div class="rt-chan-hd"><label><input type="checkbox" id="rt_tg_on" ${tg.enabled?'checked':''}> Telegram Bot（支持自定义反代域名或走上方 HTTP 代理）</label>${tg.has_bot_token?'<span class="rt-badge ok">已存 Token</span>':''}</div>
+      <div class="fg"><label>API 地址</label><input type="text" id="rt_tg_base" value="${esc(tg.api_base||'https://api.telegram.org')}" placeholder="https://api.telegram.org" style="width:210px"><label style="min-width:60px">Chat ID</label><input type="text" id="rt_tg_chat" value="${esc(tg.chat_id||'')}" placeholder="如 123456789" style="width:140px"></div>
+      <div class="fg"><label>Bot Token</label>${secretInputHtml('rt_tg_token','tg_token',!!tg.has_bot_token,'Telegram 机器人令牌')}</div>
+    </div>
+
+    <div class="btn-row">
+      <button type="button" class="btn btn-p" onclick="saveRuntimeSettingsUI()">💾 保存全局设置</button>
+      <button type="button" class="btn btn-s" onclick="testNotifyUI()">📨 保存并发送测试通知</button>
+    </div>
+  </div>`;
+
+  h += `<div class="card"><h2>📦 配置一键备份与恢复</h2>
+    <div class="fg"><label style="min-width:170px">导出包含通知密钥/Token</label><input type="checkbox" id="bk_include_secrets">
+      <span style="font-size:12px;color:var(--t2)">默认脱敏导出（分享排障更安全）；重装迁移自用可勾选包含密钥</span>
+    </div>
+    <div class="btn-row">
+      <button type="button" class="btn btn-s" onclick="exportBackupUI()">⬇ 导出配置备份 (.json)</button>
+      <label class="btn btn-s" style="cursor:pointer;display:inline-flex;align-items:center">⬆ 选择备份文件恢复<input type="file" accept=".json,application/json" style="display:none" onchange="importBackupUI(this)"></label>
+    </div>
+  </div>`;
+
+  h += `<details id="conn_adv_details" class="advanced-panel"${S.connAdvOpen?' open':''} ontoggle="S.connAdvOpen=this.open"><summary>高级底层配置（default.toml 连接配置 / cli.toml）</summary><div class="advanced-body">
+    <div class="card"><h2>🔗 连接配置 (profiles/default.toml)</h2>
+      <textarea id="proftext" spellcheck="false" style="min-height:200px">加载中...</textarea>
+      <div class="btn-row"><button class="btn btn-p" onclick="saveConn('profile')">💾 保存连接</button></div></div>
+    <div class="card"><h2>⚙ CLI 配置 (cli.toml)</h2>
+      <textarea id="clitext" spellcheck="false" style="min-height:180px">加载中...</textarea>
+      <div class="btn-row"><button class="btn btn-p" onclick="saveConn('cli')">💾 保存CLI</button></div></div>
+  </div></details>`;
+  return h;
+}
+function resolveSecretVal(elId, secretKey, hasFlag) {
+  const el = document.getElementById(elId);
+  const typed = el ? el.value.trim() : '';
+  if (typed) return typed;
+  if (S.rtSecretsCleared[secretKey]) return '';
+  return hasFlag ? '__UNCHANGED__' : '';
+}
+function collectRuntimeSettingsPayload() {
+  const rt = S.runtimeSettings || {};
+  const ntf = rt.notify || {};
+  return {
+    client_type: (document.getElementById('rt_client_type') || {}).value || 'Official',
+    sync_tasks: !!(document.getElementById('rt_sync_tasks') && document.getElementById('rt_sync_tasks').checked),
+    device: {
+      mute_during_run: !!(document.getElementById('rt_mute') && document.getElementById('rt_mute').checked),
+      sleep_after_run: (document.getElementById('rt_sleep') || {}).value || 'scheduled'
+    },
+    network: {
+      http_proxy: ((document.getElementById('rt_proxy') || {}).value || '').trim(),
+      github_mirror: ((document.getElementById('rt_mirror') || {}).value || '').trim()
+    },
+    notify: {
+      enabled: !!(document.getElementById('rt_notify_enabled') && document.getElementById('rt_notify_enabled').checked),
+      pushplus: {
+        enabled: !!(document.getElementById('rt_pp_on') && document.getElementById('rt_pp_on').checked),
+        token: resolveSecretVal('rt_pp_token', 'pp_token', !!(ntf.pushplus && ntf.pushplus.has_token)),
+        topic: ((document.getElementById('rt_pp_topic') || {}).value || '').trim()
+      },
+      serverchan: {
+        enabled: !!(document.getElementById('rt_sc_on') && document.getElementById('rt_sc_on').checked),
+        sendkey: resolveSecretVal('rt_sc_key', 'sc_key', !!(ntf.serverchan && ntf.serverchan.has_sendkey))
+      },
+      bark: {
+        enabled: !!(document.getElementById('rt_bk_on') && document.getElementById('rt_bk_on').checked),
+        server_url: ((document.getElementById('rt_bk_srv') || {}).value || 'https://api.day.app').trim(),
+        device_key: resolveSecretVal('rt_bk_key', 'bk_key', !!(ntf.bark && ntf.bark.has_device_key))
+      },
+      webhook: {
+        enabled: !!(document.getElementById('rt_wh_on') && document.getElementById('rt_wh_on').checked),
+        provider: (document.getElementById('rt_wh_provider') || {}).value || 'generic',
+        url: resolveSecretVal('rt_wh_url', 'wh_url', !!(ntf.webhook && ntf.webhook.has_url)),
+        sign_secret: resolveSecretVal('rt_wh_sec', 'wh_sec', !!(ntf.webhook && ntf.webhook.has_sign_secret))
+      },
+      telegram: {
+        enabled: !!(document.getElementById('rt_tg_on') && document.getElementById('rt_tg_on').checked),
+        api_base: ((document.getElementById('rt_tg_base') || {}).value || 'https://api.telegram.org').trim(),
+        chat_id: ((document.getElementById('rt_tg_chat') || {}).value || '').trim(),
+        bot_token: resolveSecretVal('rt_tg_token', 'tg_token', !!(ntf.telegram && ntf.telegram.has_bot_token))
+      }
+    }
+  };
+}
+async function loadConn(forceDiag=false) {
+  const detEl = document.getElementById('conn_adv_details');
+  if (detEl) S.connAdvOpen = !!detEl.open;
+  const [d, rt] = await Promise.all([
+    api('files'),
+    api('runtime-settings' + (forceDiag ? '?refresh=1' : '')).catch(() => null)
+  ]);
+  if (rt && !rt.error) {
+    S.runtimeSettings = rt;
+    S.rtSecretsCleared = {};
+    if (S.page === 'conn') {
+      const m = document.getElementById('main');
+      if (m) m.innerHTML = renderConn();
+    }
+  }
+  const pEl = document.getElementById('proftext');
+  const cEl = document.getElementById('clitext');
+  if (pEl) pEl.value = d.profile || '';
+  if (cEl) cEl.value = d.cli || '';
+}
+async function refreshHostDiag() {
+  await loadConn(true);
+  showMsg('ok', '手机锁屏与环境诊断已刷新 ✓');
+}
+async function saveRuntimeSettingsUI(silent=false) {
+  const payload = collectRuntimeSettingsPayload();
+  const r = await api('runtime-settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) {
+    const msg = (r.error && r.error.message) ? r.error.message : (r.error || '参数无效');
+    showMsg('err', '保存失败: ' + msg);
+    return false;
+  }
+  S.runtimeSettings = r.settings || S.runtimeSettings;
+  S.rtSecretsCleared = {};
+  await loadAll();
+  await loadConn(false);
+  if (!silent) {
+    const syncNote = Array.isArray(r.synced_files) && r.synced_files.length ? `（已同步 ${r.synced_files.length} 个任务文件）` : '';
+    showMsg('ok', '全局设置已保存 ✓' + syncNote);
+  }
+  return true;
+}
+async function testNotifyUI() {
+  const saved = await saveRuntimeSettingsUI(true);
+  if (!saved) return;
+  const r = await api('notify/test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  if (!r.ok) {
+    showMsg('err', '测试通知未成功: ' + (r.error || '请检查渠道开关与密钥'));
+    return;
+  }
+  const detail = (r.results || []).map(x => `${x.channel}:${x.ok?'成功':'失败('+x.detail+')'}`).join('，');
+  showMsg(r.all_ok ? 'ok' : 'err', `测试推送结果 (${r.succeeded}/${r.attempted})：${detail}`);
+}
+async function exportBackupUI() {
+  const inc = !!(document.getElementById('bk_include_secrets') && document.getElementById('bk_include_secrets').checked);
+  const data = await api('backup/export', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({include_secrets: inc})
+  });
+  if (!data || data.error || data.ok === false) {
+    showMsg('err', '导出备份失败: ' + ((data && data.error) || '未知错误'));
+    return;
+  }
+  const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  a.href = url;
+  a.download = `maazero-backup-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showMsg('ok', '配置备份已导出 ✓');
+}
+async function importBackupUI(inputEl) {
+  const file = inputEl && inputEl.files && inputEl.files[0];
+  if (!file) return;
+  if (!confirm(`确认从「${file.name}」恢复配置并覆盖当前同名任务/排班设置吗？`)) {
+    inputEl.value = '';
+    return;
+  }
+  try {
+    const text = await file.text();
+    const r = await api('backup/import', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: text
+    });
+    if (!r.ok) {
+      const msg = (r.error && r.error.message) ? r.error.message : (r.error || '格式校验未通过');
+      showMsg('err', '恢复失败: ' + msg);
+      return;
+    }
+    await loadAll();
+    await loadConn(false);
+    showMsg('ok', `已成功恢复 ${r.restored_count || 0} 项配置${r.crontab_restored ? '及定时任务' : ''} ✓`);
+  } catch (err) {
+    showMsg('err', '读取备份文件失败: ' + (err.message || err));
+  } finally {
+    inputEl.value = '';
+  }
 }
 async function saveConn(which) {
   const val = document.getElementById(which === 'profile' ? 'proftext' : 'clitext').value;
@@ -4734,7 +5574,7 @@ async function saveConn(which) {
   showMsg(r.ok ? 'ok' : 'err', r.ok ? '已保存 ✓' : '保存失败');
 }
 
-function esc(s) { if (s === null || s === undefined) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function esc(s) { if (s === null || s === undefined) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 // ═══ Init ═══
 document.addEventListener('keydown', event => {
@@ -4759,16 +5599,36 @@ def web_html():
     return get_html()
 
 
+class _StrictBodyError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+SENSITIVE_NO_CORS_PATHS = (
+    "/api/runtime-settings",
+    "/api/notify/test",
+    "/api/backup/export",
+    "/api/backup/import",
+)
+
+
 # ═══════════════════════════════════════
 # HTTP Server
 # ═══════════════════════════════════════
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
+    def _allows_cors(self):
+        req_path = urllib.parse.urlparse(self.path).path
+        return req_path not in SENSITIVE_NO_CORS_PATHS
+
     def _json(self, code, data):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if self._allows_cors():
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
@@ -4779,17 +5639,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body.encode("utf-8") if isinstance(body, str) else body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", 0))
-        if n <= 0:
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return {}
+        if n <= 0 or n > 2_097_152:
             return {}
         raw = self.rfile.read(n)
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError as e:
-            import sys
-            print(f"JSON parse error: {e}", file=sys.stderr)
-            print(f"Raw body (first 500): {raw[:500]}", file=sys.stderr)
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
             return {}
+
+    def _strict_json_body(self, *, max_bytes=65536, allow_empty=False):
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            if allow_empty:
+                return {}
+            raise _StrictBodyError(400, "Content-Length 无效")
+        if not isinstance(content_length, str) or not re.fullmatch(r"[0-9]+", content_length):
+            raise _StrictBodyError(400, "Content-Length 无效")
+        length = int(content_length)
+        if length == 0:
+            if allow_empty:
+                return {}
+            raise _StrictBodyError(400, "请求体不能为空")
+        if length > max_bytes:
+            raise _StrictBodyError(413, "请求体超过大小限制")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise _StrictBodyError(400, "请求体长度不完整")
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise _StrictBodyError(400, "请求体不是有效的 UTF-8 JSON")
+        if not isinstance(body, dict):
+            raise _StrictBodyError(400, "请求体必须是 JSON 对象")
+        return body
 
     def _import_body(self):
         content_length = self.headers.get("Content-Length")
@@ -5124,6 +6011,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p == "/api/stages":
             self._json(200, get_stage_catalog())
         elif p == "/api/status":
+            active_client, active_pkg, _ = resolve_active_client(CONFIG_DIR)
+            try:
+                next_iso = next_daily_run(read_crontab_bytes()).isoformat(timespec="seconds")
+            except Exception:
+                next_iso = ""
             with run_lock:
                 d = {
                     "active": running_task["active"],
@@ -5132,8 +6024,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "output": running_task["output"][-8000:],
                     "startup_health": read_startup_health_state(),
                     "skip_next_daily": load_skip_next_daily(CONFIG_DIR),
+                    "client_type": active_client,
+                    "package_name": active_pkg,
+                    "next_daily_for": next_iso,
                 }
             self._json(200, d)
+        elif p == "/api/runtime-settings":
+            qs = urllib.parse.parse_qs(parsed.query)
+            force_refresh = qs.get("refresh", ["0"])[0] == "1"
+            payload = public_runtime_settings(CONFIG_DIR, SCRIPT_DIR)
+            payload["host_diag"] = get_host_device_diag(force=force_refresh)
+            self._json(200, payload)
+        elif p == "/api/schedule/visual":
+            try:
+                with schedule_write_lock:
+                    recover_schedule_or_raise(CONFIG_DIR)
+                    raw = read_crontab_bytes()
+                    visual = parse_visual_crontab(raw)
+                self._json(200, {
+                    **visual,
+                    "raw_content": raw.decode("utf-8", "replace"),
+                })
+            except Exception as error:
+                self._schedule_error(error)
+        elif p == "/api/failure-snapshots":
+            self._json(200, {"items": list_failure_screenshots()})
+        elif p == "/api/failure-snapshots/image":
+            qs = urllib.parse.parse_qs(parsed.query)
+            token = (qs.get("id") or [""])[0]
+            try:
+                img_bytes = read_failure_screenshot_bytes(token)
+            except FileNotFoundError:
+                self._json(404, {"error": "snapshot not found"})
+                return
+            except ValueError:
+                self._json(400, {"error": "invalid snapshot id"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "private, max-age=60")
+            self.send_header("Content-Length", str(len(img_bytes)))
+            self.end_headers()
+            self.wfile.write(img_bytes)
+        elif p == "/api/backup/export":
+            qs = urllib.parse.parse_qs(parsed.query)
+            inc_raw = (qs.get("include_secrets") or ["0"])[0].strip().lower()
+            if inc_raw not in ("", "0", "false"):
+                self._json(400, {"ok": False, "error": "导出含密钥备份必须使用 POST 请求"})
+                return
+            try:
+                raw_cron = read_crontab_bytes()
+            except Exception:
+                raw_cron = b""
+            bundle = export_config_backup(CONFIG_DIR, raw_cron, include_secrets=False)
+            self._json(200, bundle)
         elif p == "/api/startup-health":
             self._json(200, read_startup_health_state())
         elif p == "/api/logs":
@@ -5412,6 +6356,131 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(500, medicine_error_payload(error, 500))
             return
 
+        if p == "/api/backup/export":
+            try:
+                body = self._strict_json_body(allow_empty=True)
+                inc = bool(body.get("include_secrets", False))
+                try:
+                    raw_cron = read_crontab_bytes()
+                except Exception:
+                    raw_cron = b""
+                bundle = export_config_backup(CONFIG_DIR, raw_cron, include_secrets=inc)
+                self._json(200, bundle)
+            except _StrictBodyError as error:
+                self._json(error.status, {"ok": False, "error": error.message})
+            except ValueError as error:
+                self._json(400, {"ok": False, "error": str(error)})
+            except Exception:
+                self._json(500, {"ok": False, "error": "导出备份失败"})
+            return
+
+        if p == "/api/backup/import":
+            try:
+                body = self._import_body()
+                with schedule_write_lock:
+                    recover_schedule_or_raise(CONFIG_DIR)
+                    result = import_config_backup(
+                        CONFIG_DIR, body, install_crontab_fn=install_crontab_bytes
+                    )
+                _invalidate_host_diag_cache()
+                self._json(200, {"ok": True, **result})
+            except PlanImportError as error:
+                self._import_error(error)
+            except ScheduleError as error:
+                self._schedule_error(error)
+            except ValueError as error:
+                self._json(400, {"ok": False, "error": str(error)})
+            except Exception:
+                self._json(500, {"ok": False, "error": "恢复配置备份失败"})
+            return
+
+        if p == "/api/runtime-settings":
+            try:
+                body = self._strict_json_body(allow_empty=False)
+                sync_flag = bool(body.get("sync_tasks", False))
+                with schedule_write_lock:
+                    if sync_flag:
+                        recover_schedule_or_raise(CONFIG_DIR)
+                    saved = save_runtime_settings(
+                        CONFIG_DIR, body, sync_tasks=sync_flag, script_dir=SCRIPT_DIR
+                    )
+                _invalidate_host_diag_cache()
+                saved["host_diag"] = get_host_device_diag(force=False)
+                self._json(200, {"ok": True, "settings": saved, "synced_files": saved.get("synced_files", [])})
+            except _StrictBodyError as error:
+                self._json(error.status, {"ok": False, "error": error.message})
+            except ScheduleError as error:
+                self._schedule_error(error)
+            except ValueError as error:
+                self._json(400, {"ok": False, "error": str(error)})
+            except Exception:
+                self._json(500, {"ok": False, "error": "保存运行设置失败"})
+            return
+
+        if p == "/api/notify/test":
+            try:
+                self._strict_json_body(allow_empty=True)
+            except _StrictBodyError as error:
+                self._json(error.status, {"ok": False, "error": error.message})
+                return
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            res = send_notifications(
+                f"[MaaZero] WebUI 测试通知发送成功。\n时间: {now_str}",
+                title="[MaaZero] 测试通知",
+                config_dir=CONFIG_DIR,
+                script_dir=SCRIPT_DIR,
+                force_test=True,
+                retries=1,
+                retry_delay_s=0.0,
+            )
+            if res["attempted"] == 0:
+                self._json(400, {
+                    "ok": False,
+                    "error": "尚未启用任何通知渠道（也未检测到旧版 tg.txt），请先勾选至少一个通知渠道并填写密钥。",
+                })
+                return
+            self._json(200, {"ok": bool(res["any_ok"]), **res})
+            return
+
+        if p == "/api/schedule/visual":
+            try:
+                body = self._strict_json_body(allow_empty=False)
+                if "daily_enabled" not in body and "update_enabled" not in body:
+                    raise ValueError("缺少 daily_enabled 或 update_enabled 字段")
+                daily_enabled = body.get("daily_enabled")
+                if daily_enabled is not None and not isinstance(daily_enabled, bool):
+                    raise ValueError("daily_enabled 必须是布尔值或 null")
+                daily_times = body.get("daily_times", [])
+                update_enabled = bool(body.get("update_enabled", False))
+                raw_upd_time = body.get("update_time")
+                update_time = str(raw_upd_time) if raw_upd_time is not None else ("03:30" if not update_enabled else "")
+                with schedule_write_lock:
+                    recover_schedule_or_raise(CONFIG_DIR)
+                    current_raw = read_crontab_bytes()
+                    updated_raw = apply_visual_crontab(
+                        current_raw,
+                        daily_enabled=daily_enabled,
+                        daily_times=daily_times if isinstance(daily_times, list) else [],
+                        update_enabled=update_enabled,
+                        update_time=update_time,
+                    )
+                    install_crontab_bytes(updated_raw)
+                    visual = parse_visual_crontab(updated_raw)
+                self._json(200, {
+                    "ok": True,
+                    **visual,
+                    "raw_content": updated_raw.decode("utf-8", "replace"),
+                })
+            except _StrictBodyError as error:
+                self._json(error.status, {"ok": False, "error": error.message})
+            except ScheduleError as error:
+                self._schedule_error(error)
+            except ValueError as error:
+                self._json(400, {"ok": False, "error": str(error)})
+            except Exception:
+                self._json(500, {"ok": False, "error": "保存定时设置失败"})
+            return
+
         body = self._body()
 
         if p == "/api/config":
@@ -5515,7 +6584,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"ok": ok})
 
         elif p == "/api/apk-update":
-            ok = update_apk_bg()
+            active_client, _, _ = resolve_active_client(CONFIG_DIR)
+            force_off = bool(body.get("force_official"))
+            if active_client != "Official" and not force_off:
+                self._json(409, {
+                    "ok": False,
+                    "error": f"当前全局客户端为 {active_client}，内置 APK 自动更新仅适用于国服官服 (Official)",
+                })
+                return
+            ok = update_apk_bg(force=bool(body.get("force")), force_official=force_off)
             self._json(200, {"ok": ok})
 
         elif p == "/api/startup-health":
@@ -5532,10 +6609,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if pid:
                 kill_bg_session(pid)
 
-            # 通过 ADB 兜底强退明日方舟（使用标准 ADB_ADDR）
+            _, active_pkg, _ = resolve_active_client(CONFIG_DIR)
+            # 通过 ADB 兜底强退明日方舟（动态匹配当前客户端包名）
             try:
                 subprocess.run(
-                    ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", "com.hypergryph.arknights"],
+                    ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", active_pkg],
                     env=get_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
                 )
             except Exception:
@@ -5550,11 +6628,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif p == "/api/game":
             action = body.get("action", "")
+            _, active_pkg, _ = resolve_active_client(CONFIG_DIR)
             cmd = []
             if action == "start":
-                cmd = ["adb", "-s", ADB_ADDR, "shell", "monkey", "-p", "com.hypergryph.arknights", "-c", "android.intent.category.LAUNCHER", "1"]
+                cmd = ["adb", "-s", ADB_ADDR, "shell", "monkey", "-p", active_pkg, "-c", "android.intent.category.LAUNCHER", "1"]
             elif action == "stop":
-                cmd = ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", "com.hypergryph.arknights"]
+                cmd = ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", active_pkg]
             
             if cmd:
                 try:
@@ -5591,9 +6670,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if self._allows_cors():
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
 

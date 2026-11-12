@@ -15,8 +15,24 @@ MAA_LOG_DIR="${MAA_LOG_DIR:-/var/log/maa}"
 MAA_ADB_ADDR="${MAA_ADB_ADDR:-127.0.0.1:5555}"
 export MAA_HOME MAA_CONFIG_DIR MAA_STATE_DIR MAA_CACHE_DIR MAA_LOG_DIR MAA_ADB_ADDR
 
+SCHEDULE_CONTROL_SCRIPT="${MAA_SCHEDULE_CONTROL_SCRIPT:-$MAA_HOME/maa_schedule_control.py}"
+MAA_RT_CLIENT_TYPE="Official"
+MAA_RT_AK_PACKAGE="com.hypergryph.arknights"
+MAA_RT_HTTP_PROXY=""
+if [[ -f "$SCHEDULE_CONTROL_SCRIPT" ]]; then
+    if _rt_env=$(python3 "$SCHEDULE_CONTROL_SCRIPT" env --config-dir "$MAA_CONFIG_DIR" 2>/dev/null); then
+        eval "$_rt_env"
+    fi
+fi
+if [[ -n "${MAA_RT_HTTP_PROXY:-}" ]]; then
+    export HTTP_PROXY="$MAA_RT_HTTP_PROXY" HTTPS_PROXY="$MAA_RT_HTTP_PROXY"
+    export http_proxy="$MAA_RT_HTTP_PROXY" https_proxy="$MAA_RT_HTTP_PROXY"
+    export NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1"
+fi
+
+EXPLICIT_PKG_OVERRIDE="${ARKNIGHTS_PACKAGE:-}"
 APK_URL="${ARKNIGHTS_APK_URL:-https://ak.hypergryph.com/downloads/android_lastest}"
-PKG="${ARKNIGHTS_PACKAGE:-com.hypergryph.arknights}"
+PKG="${ARKNIGHTS_PACKAGE:-${MAA_RT_AK_PACKAGE:-com.hypergryph.arknights}}"
 ADB_ADDR="$MAA_ADB_ADDR"
 LOG_DIR="$MAA_LOG_DIR"
 STATE_DIR="$MAA_STATE_DIR"
@@ -28,6 +44,7 @@ APK_FILE="$CACHE_DIR/arknights-latest.apk"
 MIN_FREE_KB="${ARKNIGHTS_APK_MIN_FREE_KB:-6291456}"
 DOWNLOAD_TIMEOUT="${ARKNIGHTS_APK_DOWNLOAD_TIMEOUT:-60m}"
 FORCE=0
+FORCE_OFFICIAL=0
 DRY_RUN=0
 ORIGINAL_ARGS=("$@")
 
@@ -45,13 +62,31 @@ error() { log ERROR "$@"; }
 
 usage() {
     cat <<EOF
-Usage: $0 [--check] [--force] [--dry-run]
+Usage: $0 [--check] [--force] [--force-official] [--dry-run]
 
-  --check    Check Hypergryph APK metadata and install only when changed.
-  --force    Download and install even if metadata has not changed.
-  --dry-run  Only print the decision; do not download or install.
+  --check           Check Hypergryph APK metadata and install only when changed.
+  --force           Download and install even if metadata has not changed.
+  --force-official  Force official CN client check/install even if global client differs.
+  --dry-run         Only print the decision; do not download or install.
 EOF
 }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check) ;;
+        --force) FORCE=1 ;;
+        --force-official) FORCE_OFFICIAL=1; PKG="com.hypergryph.arknights" ;;
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) error "未知参数: $1"; usage; exit 2 ;;
+    esac
+    shift
+done
+
+if [[ -z "$EXPLICIT_PKG_OVERRIDE" && "$FORCE_OFFICIAL" -eq 0 && "${MAA_RT_CLIENT_TYPE:-Official}" != "Official" ]]; then
+    warn "当前全局客户端设置为 ${MAA_RT_CLIENT_TYPE} (${PKG})；内置 APK 自动更新仅适用于国服官服 (Official)，请通过 Bilibili 或对应海外应用商店更新客户端。"
+    exit 0
+fi
 
 if [[ "${FLOCKER:-}" != "$LOCK_FILE" ]]; then
     env FLOCKER="$LOCK_FILE" flock -n -E 75 -o "$LOCK_FILE" "$0" "${ORIGINAL_ARGS[@]}"
@@ -62,19 +97,16 @@ if [[ "${FLOCKER:-}" != "$LOCK_FILE" ]]; then
     exit "$ec"
 fi
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --check) ;;
-        --force) FORCE=1 ;;
-        --dry-run) DRY_RUN=1 ;;
-        -h|--help) usage; exit 0 ;;
-        *) error "未知参数: $1"; usage; exit 2 ;;
-    esac
-    shift
-done
-
 send_tg_message() {
     local text="$1"
+    if [[ -f "$SCHEDULE_CONTROL_SCRIPT" ]]; then
+        python3 "$SCHEDULE_CONTROL_SCRIPT" notify \
+            --config-dir "$MAA_CONFIG_DIR" \
+            --script-dir "$MAA_HOME" \
+            --title "[MaaZero] 客户端更新通知" \
+            --message "$text" >/dev/null 2>&1 || true
+        return 0
+    fi
     local tg_file=""
     for candidate in "$MAA_CONFIG_DIR/tg.txt" "$MAA_HOME/tg.txt"; do
         if [[ -s "$candidate" ]]; then

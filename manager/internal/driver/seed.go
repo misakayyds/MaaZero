@@ -39,9 +39,34 @@ type = "StartUp"
 params = { client_type = "Official", start_game_enabled = true }
 
 [[tasks]]
+name = "基建换班"
+type = "Infrast"
+params = { mode = 0, facility = ["Mfg", "Trade", "Control", "Power", "Reception", "Office", "Dorm"], drones = "_NotUse", threshold = 0.3, dorm_trust_enabled = false, dorm_notstationed_enabled = true, replenish = true, reception_message_board = true, reception_clue_exchange = true, reception_send_clue = true, continue_training = true }
+
+[[tasks]]
+name = "理智作战"
+type = "Fight"
+params = { stage = "", medicine = 0, medicine_expire_days = 0, stone = 0, times = 999, series = 0, DrGrandet = false, server = "CN" }
+
+[[tasks]]
+name = "自动公招"
+type = "Recruit"
+params = { refresh = true, select = [4, 5], confirm = [3, 4, 5], times = 4, set_time = true, expedite = false, extra_tags_mode = 0, skip_robot = true, server = "CN" }
+
+[[tasks]]
+name = "信用收支"
+type = "Mall"
+params = { shopping = true, buy_first = ["招聘许可", "龙门币"], blacklist = ["家具零件", "加急许可"], force_shopping_if_credit_full = true, visit_friends = true, only_buy_discount = false, reserve_max_credit = false }
+
+[[tasks]]
 name = "领取奖励"
 type = "Award"
-params = { enable = true }
+params = { award = true, mail = true, recruit = false, orundum = false, mining = false, specialaccess = false }
+
+[[tasks]]
+name = "关闭游戏"
+type = "CloseDown"
+params = { client_type = "Official" }
 `
 
 // seedDefaultConfigs creates minimal working maa-cli configuration files inside

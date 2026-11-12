@@ -142,6 +142,23 @@ STARTUP_TASK: dict[str, Any] = {
 DEPOT_TASK: dict[str, Any] = {"name": "仓库扫描", "type": "Depot"}
 OPERBOX_TASK: dict[str, Any] = {"name": "干员扫描", "type": "OperBox"}
 
+
+def startup_task_for_config(config_dir: Path | None = None) -> dict[str, Any]:
+    client_type = "Official"
+    if config_dir is not None:
+        try:
+            ctrl = load_sibling("maa_schedule_control")
+            resolved = ctrl.resolve_active_client(config_dir)
+            if isinstance(resolved, tuple) and resolved and isinstance(resolved[0], str):
+                client_type = resolved[0]
+        except Exception:
+            client_type = "Official"
+    return {
+        "name": "开始唤醒",
+        "type": "StartUp",
+        "params": {"client_type": client_type, "start_game_enabled": True},
+    }
+
 # runtime 生成的 Fight 必须显式关掉药/石，防止从原任务泄漏。
 NO_CONSUMABLE_FIGHT_DEFAULTS: dict[str, int] = {"medicine": 0, "stone": 0, "expiring_medicine": 0}
 
@@ -1169,7 +1186,26 @@ def telegram_sender(
     retries: int = 3,
     retry_delay_s: float = 3.0,
 ) -> bool:
-    """按既有 tg.txt 双行格式发送通知（支持最多 3 次重试）；任何异常都不外泄（可能含 token/URL）。"""
+    """按多渠道配置或既有 tg.txt 双行格式发送通知；任何异常都不外泄（可能含 token/URL）。"""
+
+    try:
+        ctrl = load_sibling("maa_schedule_control")
+        rt_exists = ctrl.runtime_settings_file(config_dir).is_file()
+        settings = ctrl.load_runtime_settings(config_dir)
+        if settings.get("notify", {}).get("enabled"):
+            res = ctrl.send_notifications(
+                text,
+                title="[MaaZero] 培养目标通知",
+                config_dir=config_dir,
+                script_dir=script_dir,
+                retries=retries,
+                retry_delay_s=retry_delay_s,
+            )
+            return bool(res.get("any_ok")) if int(res.get("attempted", 0)) > 0 else False
+        if rt_exists:
+            return False
+    except Exception:
+        pass
 
     import time
     import urllib.parse
@@ -2231,16 +2267,17 @@ class CultivationRuntime:
         oper_task = self._oper_progress_task(require_enabled=True)
         # 只扫一遍收尾（StartUp 负责把游戏带回主界面，游戏若仍在前台则直接续接）；
         # 绝不重跑本轮任务链。
+        startup_item = startup_task_for_config(self.config_dir)
         if oper_task is not None:
             phase = [
-                dict(STARTUP_TASK),
+                startup_item,
                 oper_task,
                 dict(DEPOT_TASK),
                 dict(OPERBOX_TASK),
             ]
             self._log("收尾扫描: StartUp + OperProgress + Depot + OperBox（随日常收尾自动推进专精）")
         else:
-            phase = [dict(STARTUP_TASK), dict(DEPOT_TASK), dict(OPERBOX_TASK)]
+            phase = [startup_item, dict(DEPOT_TASK), dict(OPERBOX_TASK)]
             self._log("收尾扫描: StartUp + Depot + OperBox（每轮一次，不重跑整轮）")
         result = self._maa_runner.run(
             phase, name_prefix="cultivation-closing", document=document
@@ -2281,7 +2318,7 @@ def ensure_scan_task_file(config_dir: Path) -> Path:
     """写入 StartUp + Depot + OperBox 扫描任务文件（内容一致则不重写）。"""
 
     path = Path(config_dir) / "tasks" / f"{SCAN_TASK_NAME}.toml"
-    text = dump_document({"tasks": [dict(STARTUP_TASK), dict(DEPOT_TASK), dict(OPERBOX_TASK)]})
+    text = dump_document({"tasks": [startup_task_for_config(config_dir), dict(DEPOT_TASK), dict(OPERBOX_TASK)]})
     try:
         if path.read_text(encoding="utf-8") == text:
             return path
@@ -2298,7 +2335,7 @@ def ensure_mastery_task_file(config_dir: Path, oper_task: Mapping[str, Any]) -> 
     text = dump_document(
         {
             "tasks": [
-                dict(STARTUP_TASK),
+                startup_task_for_config(config_dir),
                 dict(oper_task),
                 dict(DEPOT_TASK),
                 dict(OPERBOX_TASK),

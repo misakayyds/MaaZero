@@ -18,6 +18,7 @@ from maa_operator_box import (
     save_failed_attempt,
     save_successful_scan,
 )
+from maa_schedule_control import resolve_active_client
 
 
 SCRIPT_DIR = Path(os.environ.get("MAA_HOME", Path(__file__).resolve().parent))
@@ -49,14 +50,24 @@ type = "OperBox"
 """
 
 
-def atomic_task_file() -> None:
-    path = CONFIG_DIR / "tasks" / "operator-scan.toml"
+def _render_task_text(config_dir: Path | str = CONFIG_DIR) -> str:
+    try:
+        client_type, _, _ = resolve_active_client(Path(config_dir))
+    except Exception:
+        client_type = "Official"
+    return TASK_TEXT.replace('"Official"', json.dumps(client_type))
+
+
+def atomic_task_file(config_dir: Path | str = CONFIG_DIR) -> Path:
+    path = Path(config_dir) / "tasks" / "operator-scan.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_text("utf-8") == TASK_TEXT:
-        return
+    expected = _render_task_text(config_dir)
+    if path.exists() and path.read_text("utf-8") == expected:
+        return path
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(TASK_TEXT, encoding="utf-8", newline="\n")
+    temporary.write_text(expected, encoding="utf-8", newline="\n")
     os.replace(temporary, path)
+    return path
 
 
 def maa_version() -> str:

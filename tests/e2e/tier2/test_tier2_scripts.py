@@ -546,3 +546,656 @@ class Tier2ScriptsTest(E2ETestCase):
         for script in self.source_dir.glob("*.sh"):
             content = script.read_text(encoding="utf-8", errors="replace")
             self.assertNotIn("mount -o remount,rw /system", content)
+
+    # ========================================================================
+    # UX Parity & Mobile Policy Regression Tests (P0 + P1 + P3)
+    # ========================================================================
+
+    def test_ux_01_runtime_settings_secrets_and_client_sync(self) -> None:
+        """Verify runtime-settings secret masking, __UNCHANGED__ preservation, and client_type sync."""
+        daily_path = self.config_dir / "tasks" / "daily.toml"
+        mon_path = self.config_dir / "tasks" / "daily-mon.toml"
+        sample_toml = (
+            '[[tasks]]\nname = "开始唤醒"\ntype = "StartUp"\n'
+            'params = { client_type = "Bilibili", start_game_enabled = true }\n\n'
+            '[[tasks]]\nname = "理智作战"\ntype = "Fight"\n'
+            'params = { stage = "1-7", server = "CN" }\n\n'
+            '[[tasks]]\nname = "自动公招"\ntype = "Recruit"\n'
+            'params = { server = "CN", select = [4, 5] }\n\n'
+            '[[tasks]]\nname = "关闭游戏"\ntype = "CloseDown"\n'
+            'params = { client_type = "Bilibili" }\n'
+        )
+        daily_path.write_text(sample_toml, encoding="utf-8", newline="\n")
+        mon_path.write_text(sample_toml, encoding="utf-8", newline="\n")
+
+        # Without runtime-settings.json, client_type is inferred from daily.toml
+        inferred_client, inferred_pkg, inferred_srv = maa_schedule_control.resolve_active_client(self.config_dir)
+        self.assertEqual(inferred_client, "Bilibili")
+        self.assertEqual(inferred_pkg, "com.hypergryph.arknights.bilibili")
+        self.assertEqual(inferred_srv, "CN")
+
+        # Save settings with secrets + sync_tasks to YoStarEN
+        saved = maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {
+                "client_type": "YoStarEN",
+                "device": {"mute_during_run": True, "sleep_after_run": "always"},
+                "network": {
+                    "http_proxy": "http://127.0.0.1:7890",
+                    "github_mirror": "https://ghfast.top",
+                },
+                "notify": {
+                    "enabled": True,
+                    "pushplus": {"enabled": True, "token": "unit-pp-tok-1", "topic": "grp1"},
+                    "telegram": {
+                        "enabled": True,
+                        "bot_token": "unit-tg-tok-1",
+                        "chat_id": "100200",
+                        "api_base": "https://tg-proxy.example.com/",
+                    },
+                },
+            },
+            sync_tasks=True,
+        )
+        self.assertEqual(saved["client_type"], "YoStarEN")
+        self.assertEqual(saved["package_name"], "com.YoStarEN.Arknights")
+        self.assertEqual(saved["server_code"], "US")
+        self.assertIn("daily.toml", saved["synced_files"])
+        self.assertIn("daily-mon.toml", saved["synced_files"])
+        # Secrets must be masked in public view
+        self.assertEqual(saved["notify"]["pushplus"]["token"], "")
+        self.assertTrue(saved["notify"]["pushplus"]["has_token"])
+        self.assertEqual(saved["notify"]["telegram"]["bot_token"], "")
+        self.assertTrue(saved["notify"]["telegram"]["has_bot_token"])
+
+        # Verify task TOMLs were synced to YoStarEN (server = US)
+        synced_tasks = maa_task_config.load_tasks(mon_path)
+        by_type = {t["type"]: t["params"] for t in synced_tasks}
+        self.assertEqual(by_type["StartUp"]["client_type"], "YoStarEN")
+        self.assertEqual(by_type["CloseDown"]["client_type"], "YoStarEN")
+        self.assertEqual(by_type["Fight"]["server"], "US")
+        self.assertEqual(by_type["Recruit"]["server"], "US")
+
+        # Preserve secret with __UNCHANGED__, then explicitly clear pushplus token
+        maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {
+                "notify": {
+                    "pushplus": {"enabled": False, "token": ""},
+                    "telegram": {"enabled": True, "bot_token": "__UNCHANGED__", "chat_id": "100200"},
+                }
+            },
+        )
+        raw_loaded = maa_schedule_control.load_runtime_settings(self.config_dir)
+        self.assertEqual(raw_loaded["notify"]["pushplus"]["token"], "")
+        self.assertEqual(raw_loaded["notify"]["telegram"]["bot_token"], "unit-tg-tok-1")
+
+        # Invalid URL scheme must raise ValueError
+        with self.assertRaises(ValueError):
+            maa_schedule_control.save_runtime_settings(
+                self.config_dir,
+                {"network": {"http_proxy": "ftp://127.0.0.1:21"}},
+            )
+
+        # Verify CLI env emission
+        env_res = self.run_python([
+            str(self.source_dir / "maa_schedule_control.py"),
+            "env",
+            "--config-dir", str(self.config_dir),
+        ])
+        self.assertEqual(env_res.returncode, 0)
+        self.assertIn("MAA_RT_CLIENT_TYPE=YoStarEN", env_res.stdout)
+        self.assertIn("MAA_RT_MUTE_DURING_RUN=1", env_res.stdout)
+        self.assertIn("MAA_RT_SLEEP_AFTER_RUN=always", env_res.stdout)
+
+    def test_ux_02_visual_crontab_editor_and_managed_coexistence(self) -> None:
+        """Verify visual crontab editor round-trip, infrast-schedule compatibility, and block guards."""
+        initial = (
+            b"# comment preserved\n"
+            b"# BEGIN MAA_WEBUI_OPERATOR_SCAN\n"
+            b"0 5 * * 1 python3 /root/maa-scripts/maa-operator-scan.py\n"
+            b"# END MAA_WEBUI_OPERATOR_SCAN\n"
+        )
+        updated = maa_schedule_control.apply_visual_crontab(
+            initial,
+            daily_enabled=True,
+            daily_times=["16:30", "04:30", "04:30"],
+            update_enabled=True,
+            update_time="03:45",
+        )
+        parsed = maa_schedule_control.parse_visual_crontab(updated)
+        self.assertFalse(parsed["infrast_managed"])
+        self.assertTrue(parsed["daily_enabled"])
+        self.assertEqual(parsed["daily_times"], ["04:30", "16:30"])
+        self.assertTrue(parsed["update_enabled"])
+        self.assertEqual(parsed["update_time"], "03:45")
+        self.assertIn(b"# BEGIN MAA_WEBUI_OPERATOR_SCAN", updated)
+
+        # Generated lines must be cleanly recognized by maa_infrast_schedule without unsafe_daily_lines
+        sched_view = maa_infrast_schedule.parse_managed_crontab(updated)
+        self.assertEqual(sched_view["unsafe_daily_lines"], [])
+        self.assertEqual(len(sched_view["unmanaged_daily_lines"]), 2)
+
+        # When # BEGIN MAA_WEBUI_SCHEDULE is active, modifying daily_enabled must raise ValueError,
+        # while daily_enabled=None allows updating maa-auto-update.sh cleanly.
+        managed_raw = (
+            b"# BEGIN MAA_WEBUI_SCHEDULE\n"
+            b"0 4 * * * /root/maa-scripts/maa-run.sh daily --scheduled-time 04:00\n"
+            b"# END MAA_WEBUI_SCHEDULE\n"
+        )
+        with self.assertRaises(ValueError):
+            maa_schedule_control.apply_visual_crontab(
+                managed_raw,
+                daily_enabled=True,
+                daily_times=["10:00"],
+                update_enabled=False,
+            )
+        upd_only = maa_schedule_control.apply_visual_crontab(
+            managed_raw,
+            daily_enabled=None,
+            update_enabled=True,
+            update_time="03:15",
+        )
+        parsed_managed = maa_schedule_control.parse_visual_crontab(upd_only)
+        self.assertTrue(parsed_managed["infrast_managed"])
+        self.assertTrue(parsed_managed["update_enabled"])
+        self.assertEqual(parsed_managed["update_time"], "03:15")
+        self.assertIn(b"# BEGIN MAA_WEBUI_SCHEDULE", upd_only)
+
+    def test_ux_03_multichannel_notifications_and_cultivation_client(self) -> None:
+        """Verify PushPlus, ServerChan (SCT & sctp), Bark, signed Webhook, Telegram, and cultivation client."""
+        import unittest.mock as mock
+        import maa_cultivation_runtime
+
+        maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {
+                "client_type": "Bilibili",
+                "notify": {
+                    "enabled": True,
+                    "pushplus": {"enabled": True, "token": "unit-pp-tok", "topic": "ops"},
+                    "serverchan": {"enabled": True, "sendkey": "sctp9988t_unit"},
+                    "bark": {"enabled": True, "server_url": "https://bark.example.com", "device_key": "unit-bk"},
+                    "webhook": {
+                        "enabled": True,
+                        "provider": "dingtalk",
+                        "url": "https://oapi.dingtalk.com/robot/send?access_token=unit",
+                        "sign_secret": "unit-ding-sec",
+                    },
+                    "telegram": {
+                        "enabled": True,
+                        "api_base": "https://tg.example.com",
+                        "chat_id": "8899",
+                        "bot_token": "unit-tg-tok",
+                    },
+                },
+            },
+        )
+
+        startup_task = maa_cultivation_runtime.startup_task_for_config(self.config_dir)
+        self.assertEqual(startup_task["params"]["client_type"], "Bilibili")
+
+        captured_requests = []
+
+        class _FakeResp:
+            status = 200
+
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self, _n: int = -1) -> bytes:
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def _fake_urlopen(req, timeout=15):
+            url = req.full_url
+            payload = json.loads(req.data.decode("utf-8"))
+            captured_requests.append((url, payload))
+            if "pushplus" in url or "bark.example.com" in url:
+                return _FakeResp(b'{"code": 200}')
+            if "telegram" in url or "tg.example.com" in url:
+                return _FakeResp(b'{"ok": true}')
+            return _FakeResp(b'{"code": 0, "errcode": 0}')
+
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            res = maa_schedule_control.send_notifications(
+                "日常任务已完成",
+                title="[MaaZero] 测试",
+                config_dir=self.config_dir,
+                retries=1,
+                retry_delay_s=0.0,
+            )
+
+        self.assertEqual(res["attempted"], 5)
+        self.assertEqual(res["succeeded"], 5)
+        self.assertTrue(res["all_ok"])
+
+        urls = [u for u, _ in captured_requests]
+        self.assertTrue(any("https://tg.example.com/botunit-tg-tok/sendMessage" == u for u in urls))
+        self.assertTrue(any("https://www.pushplus.plus/send" == u for u in urls))
+        self.assertTrue(any("https://9988.push.ft07.com/send/sctp9988t_unit.send" == u for u in urls))
+        self.assertTrue(any("https://bark.example.com/push" == u for u in urls))
+        self.assertTrue(any("timestamp=" in u and "sign=" in u for u in urls))
+
+        # Verify Feishu HMAC payload structure
+        feishu_url, feishu_body = maa_schedule_control._webhook_request_spec(
+            {"provider": "feishu", "url": "https://open.feishu.cn/hook/unit", "sign_secret": "unit-fs-sec"},
+            "[MaaZero]",
+            "hello",
+        )
+        self.assertEqual(feishu_url, "https://open.feishu.cn/hook/unit")
+        self.assertEqual(feishu_body["msg_type"], "text")
+        self.assertIn("timestamp", feishu_body)
+        self.assertIn("sign", feishu_body)
+
+    def test_ux_04_config_backup_export_and_validated_restore(self) -> None:
+        """Verify config backup redacts secrets by default, skips ephemeral tasks, and blocks bad imports."""
+        maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {
+                "client_type": "Official",
+                "notify": {
+                    "enabled": True,
+                    "pushplus": {"enabled": True, "token": "keep-existing-secret"},
+                },
+            },
+        )
+        # Ephemeral task file must be excluded from backup
+        (self.config_dir / "tasks" / "_infrast_temp.toml").write_text("[[tasks]]\n", encoding="utf-8")
+        (self.config_dir / "tasks" / "operator-scan.toml").write_text("[[tasks]]\n", encoding="utf-8")
+
+        bundle = maa_schedule_control.export_config_backup(
+            self.config_dir,
+            b"30 4 * * * /root/maa-scripts/maa-run.sh daily >> /var/log/maa/cron.log 2>&1\n",
+            include_secrets=False,
+        )
+        self.assertFalse(bundle["includes_secrets"])
+        self.assertIn("tasks/daily.toml", bundle["files"])
+        self.assertNotIn("tasks/_infrast_temp.toml", bundle["files"])
+        self.assertNotIn("tasks/operator-scan.toml", bundle["files"])
+        exported_rt = json.loads(bundle["files"]["runtime-settings.json"])
+        self.assertEqual(exported_rt["notify"]["pushplus"]["token"], "")
+
+        # Reject path traversal and invalid TOML
+        bad_traversal = json.loads(json.dumps(bundle))
+        bad_traversal["files"]["../evil.toml"] = '[[tasks]]\nname="x"\ntype="Award"\n'
+        with self.assertRaises(ValueError):
+            maa_schedule_control.import_config_backup(self.config_dir, bad_traversal)
+
+        bad_toml = json.loads(json.dumps(bundle))
+        bad_toml["files"]["tasks/daily.toml"] = "[[tasks]\nbroken"
+        with self.assertRaises(ValueError):
+            maa_schedule_control.import_config_backup(self.config_dir, bad_toml)
+
+        # Valid redacted import preserves existing on-disk secret and restores crontab
+        installed_cron: list[bytes] = []
+        restored = maa_schedule_control.import_config_backup(
+            self.config_dir,
+            bundle,
+            install_crontab_fn=installed_cron.append,
+        )
+        self.assertGreaterEqual(restored["restored_count"], 2)
+        self.assertTrue(restored["crontab_restored"])
+        self.assertEqual(len(installed_cron), 1)
+        after_rt = maa_schedule_control.load_runtime_settings(self.config_dir)
+        self.assertEqual(after_rt["notify"]["pushplus"]["token"], "keep-existing-secret")
+
+    def test_ux_05_webui_failure_screenshots_and_embedded_js_syntax(self) -> None:
+        """Verify failure screenshot gallery discovery, path-traversal guards, and embedded JS syntax."""
+        png_bytes = b"\x89PNG\r\n\x1a\n" + (b"\x00" * 80)
+        (self.log_dir / "startup-health-20261112.png").write_bytes(png_bytes)
+        snap_sub = self.log_dir / "failure-snapshots" / "20261112-043000"
+        snap_sub.mkdir(parents=True, exist_ok=True)
+        (snap_sub / "adb-screen.png").write_bytes(png_bytes)
+        iface_dir = self.state_dir / "debug" / "interface"
+        iface_dir.mkdir(parents=True, exist_ok=True)
+        (iface_dir / "capture.png").write_bytes(png_bytes)
+        (iface_dir / "not_png.png").write_bytes(b"NOT_A_PNG" + (b"x" * 80))
+
+        old_env = {k: os.environ.get(k) for k in ("MAA_CONFIG_DIR", "MAA_LOG_DIR", "MAA_STATE_DIR", "MAA_DATA_DIR")}
+        try:
+            os.environ["MAA_CONFIG_DIR"] = str(self.config_dir)
+            os.environ["MAA_LOG_DIR"] = str(self.log_dir)
+            os.environ["MAA_STATE_DIR"] = str(self.state_dir)
+            os.environ["MAA_DATA_DIR"] = str(self.data_dir)
+            spec = importlib.util.spec_from_file_location(
+                "maa_webui_ux_test", self.source_dir / "maa-webui.py"
+            )
+            assert spec is not None and spec.loader is not None
+            webui_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(webui_mod)
+
+            items = webui_mod.list_failure_screenshots()
+            ids = {item["id"] for item in items}
+            self.assertIn("log:startup-health-20261112.png", ids)
+            self.assertIn("snap:20261112-043000/adb-screen.png", ids)
+            self.assertIn("iface:capture.png", ids)
+
+            served = webui_mod.read_failure_screenshot_bytes("snap:20261112-043000/adb-screen.png")
+            self.assertEqual(served, png_bytes)
+
+            for bad_id in ("snap:../startup-health-20261112.png", "evil:capture.png", "iface:not_png.png"):
+                with self.assertRaises(ValueError):
+                    webui_mod.read_failure_screenshot_bytes(bad_id)
+
+            html = webui_mod.web_html()
+            scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.S)
+            self.assertGreaterEqual(len(scripts), 1)
+            node_bin = shutil.which("node")
+            if node_bin:
+                for idx, js_code in enumerate(scripts):
+                    js_file = self.sandbox_path / f"webui_check_{idx}.js"
+                    js_file.write_text(js_code, encoding="utf-8", newline="\n")
+                    chk = subprocess.run([node_bin, "--check", str(js_file)], capture_output=True, text=True)
+                    self.assertEqual(chk.returncode, 0, f"Embedded JS syntax error in block {idx}: {chk.stderr}")
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_ux_06_mobile_runner_and_apk_client_guards(self) -> None:
+        """Verify mobile mute/sleep/keyguard policies in maa-run.sh and client guard in arknights-apk-update.sh."""
+        runner_sh = (self.source_dir / "maa-run.sh").read_text(encoding="utf-8")
+        self.assertIn("mute_media_if_configured", runner_sh)
+        self.assertIn("restore_media_volume", runner_sh)
+        self.assertIn("sleep_screen_if_configured", runner_sh)
+        self.assertIn("KEYGUARD_LOCKED", runner_sh)
+        self.assertIn("223", runner_sh)  # KEYCODE_SLEEP
+        self.assertIn('grep -Fxq "package:$AK_PACKAGE"', runner_sh)
+
+        apk_sh = (self.source_dir / "arknights-apk-update.sh").read_text(encoding="utf-8")
+        self.assertIn("MAA_RT_CLIENT_TYPE", apk_sh)
+        self.assertIn("--force-official", apk_sh)
+        self.assertIn("maa_schedule_control.py", apk_sh)
+
+        auto_upd_sh = (self.source_dir / "maa-auto-update.sh").read_text(encoding="utf-8")
+        self.assertIn("MAA_RT_HTTP_PROXY", auto_upd_sh)
+        self.assertIn("MAA_RT_GITHUB_MIRROR", auto_upd_sh)
+        self.assertIn("NO_PROXY", auto_upd_sh)
+
+    def test_ux_07_webui_http_routes_e2e(self) -> None:
+        """Verify live HTTP routes for runtime-settings, visual cron, apk-update guard, backup, and snapshots."""
+        import threading
+        import urllib.error
+        import urllib.request
+
+        png_bytes = b"\x89PNG\r\n\x1a\n" + (b"\x01" * 96)
+        (self.log_dir / "startup-health-http.png").write_bytes(png_bytes)
+
+        old_env = {k: os.environ.get(k) for k in ("MAA_CONFIG_DIR", "MAA_LOG_DIR", "MAA_STATE_DIR", "MAA_DATA_DIR")}
+        server = None
+        try:
+            os.environ["MAA_CONFIG_DIR"] = str(self.config_dir)
+            os.environ["MAA_LOG_DIR"] = str(self.log_dir)
+            os.environ["MAA_STATE_DIR"] = str(self.state_dir)
+            os.environ["MAA_DATA_DIR"] = str(self.data_dir)
+            spec = importlib.util.spec_from_file_location(
+                "maa_webui_http_ux_test", self.source_dir / "maa-webui.py"
+            )
+            assert spec is not None and spec.loader is not None
+            webui_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(webui_mod)
+
+            cron_store = {"raw": b""}
+            webui_mod.read_crontab_bytes = lambda: cron_store["raw"]
+            webui_mod.install_crontab_bytes = lambda data: cron_store.__setitem__("raw", data)
+            webui_mod.get_host_device_diag = lambda force=False: {
+                "adb_online": True,
+                "active_package": "com.hypergryph.arknights.bilibili",
+                "package_installed": True,
+                "lockscreen_secure": False,
+                "lockscreen_showing": False,
+                "lockscreen_hint": "ok",
+                "doze_whitelisted": True,
+                "doze_hint": "ok",
+            }
+
+            server = webui_mod.WEB_SERVER_CLASS(("127.0.0.1", 0), webui_mod.Handler)
+            port = server.server_address[1]
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            base_url = f"http://127.0.0.1:{port}"
+
+            def _req(path: str, method: str = "GET", payload=None):
+                data = None
+                headers = {}
+                if payload is not None:
+                    data = json.dumps(payload).encode("utf-8")
+                    headers["Content-Type"] = "application/json"
+                req = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+                except urllib.error.HTTPError as exc:
+                    return exc.code, exc.headers.get("Content-Type", ""), exc.read()
+
+            # 1. Save runtime-settings -> Bilibili
+            st, _, raw = _req(
+                "/api/runtime-settings",
+                method="POST",
+                payload={
+                    "client_type": "Bilibili",
+                    "sync_tasks": True,
+                    "device": {"mute_during_run": True, "sleep_after_run": "scheduled"},
+                    "notify": {"enabled": True, "pushplus": {"enabled": True, "token": "http-pp-tok"}},
+                },
+            )
+            self.assertEqual(st, 200)
+            saved_body = json.loads(raw.decode("utf-8"))
+            self.assertTrue(saved_body["ok"])
+            self.assertEqual(saved_body["settings"]["client_type"], "Bilibili")
+            self.assertTrue(saved_body["settings"]["notify"]["pushplus"]["has_token"])
+
+            # 2. APK update must return 409 when client != Official
+            st, _, raw = _req("/api/apk-update", method="POST", payload={})
+            self.assertEqual(st, 409)
+            self.assertFalse(json.loads(raw.decode("utf-8"))["ok"])
+
+            # 3. Visual schedule save & status next_daily_for
+            st, _, raw = _req(
+                "/api/schedule/visual",
+                method="POST",
+                payload={
+                    "daily_enabled": True,
+                    "daily_times": ["04:30", "16:30"],
+                    "update_enabled": True,
+                    "update_time": "03:30",
+                },
+            )
+            self.assertEqual(st, 200)
+            vis_body = json.loads(raw.decode("utf-8"))
+            self.assertEqual(vis_body["daily_times"], ["04:30", "16:30"])
+            self.assertTrue(vis_body["next_daily_for"])
+
+            st, _, raw = _req("/api/status")
+            self.assertEqual(st, 200)
+            status_body = json.loads(raw.decode("utf-8"))
+            self.assertEqual(status_body["client_type"], "Bilibili")
+            self.assertEqual(status_body["package_name"], "com.hypergryph.arknights.bilibili")
+            self.assertTrue(status_body["next_daily_for"])
+
+            # 4. Backup export & import round-trip over HTTP (GET with include_secrets=1 must be rejected)
+            st_bad_get, hdr_bad_get, _ = _req("/api/backup/export?include_secrets=1")
+            self.assertEqual(st_bad_get, 400)
+
+            st, _, raw = _req("/api/backup/export?include_secrets=0")
+            self.assertEqual(st, 200)
+            backup_bundle = json.loads(raw.decode("utf-8"))
+
+            st_post_exp, _, raw_post_exp = _req("/api/backup/export", method="POST", payload={"include_secrets": True})
+            self.assertEqual(st_post_exp, 200)
+            self.assertTrue(json.loads(raw_post_exp.decode("utf-8"))["includes_secrets"])
+
+            # Malformed JSON to /api/schedule/visual must return 400 and keep crontab intact
+            cron_before = cron_store["raw"]
+            bad_req = urllib.request.Request(
+                f"{base_url}/api/schedule/visual",
+                data=b"{broken-json",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(bad_req, timeout=5) as resp:
+                    st_bad_vis = resp.status
+            except urllib.error.HTTPError as exc:
+                st_bad_vis = exc.code
+            self.assertEqual(st_bad_vis, 400)
+            self.assertEqual(cron_store["raw"], cron_before)
+
+            st, _, raw = _req("/api/backup/import", method="POST", payload=backup_bundle)
+            self.assertEqual(st, 200)
+            self.assertTrue(json.loads(raw.decode("utf-8"))["ok"])
+
+            # 5. Failure snapshot list & PNG image fetch + traversal block
+            st, _, raw = _req("/api/failure-snapshots")
+            self.assertEqual(st, 200)
+            snap_items = json.loads(raw.decode("utf-8"))["items"]
+            self.assertTrue(any(x["id"] == "log:startup-health-http.png" for x in snap_items))
+
+            st, ctype, raw = _req("/api/failure-snapshots/image?id=log:startup-health-http.png")
+            self.assertEqual(st, 200)
+            self.assertEqual(ctype, "image/png")
+            self.assertEqual(raw, png_bytes)
+
+            st, _, _ = _req("/api/failure-snapshots/image?id=log:../evil.png")
+            self.assertEqual(st, 400)
+            st_non_startup, _, _ = _req("/api/failure-snapshots/image?id=log:arbitrary.png")
+            self.assertEqual(st_non_startup, 400)
+        finally:
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_ux_08_review_security_and_consistency_regressions(self) -> None:
+        """Verify operator-scan client sync, proxy auth masking, URL SSRF/scheme checks, and backup baseline."""
+        # 1. Proxy credential masking, preservation, and redacted backup round-trip
+        saved = maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {
+                "client_type": "Bilibili",
+                "sync_tasks": True,
+                "network": {
+                    "http_proxy": "http://pxuser:pxcred@proxy.example.com:8080",
+                    "github_mirror": "https://ghfast.top",
+                },
+                "notify": {"enabled": False},
+            },
+            sync_tasks=True,
+        )
+        self.assertEqual(saved["network"]["http_proxy"], "http://***:***@proxy.example.com:8080")
+        self.assertTrue(saved["network"]["has_proxy_auth"])
+
+        # Second sync with unchanged client_type reports 0 modified files
+        noop_sync = maa_schedule_control.sync_client_type_to_tasks(self.config_dir, "Bilibili")
+        self.assertEqual(noop_sync, [])
+
+        # Saving masked proxy string back preserves underlying credentials
+        maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {"network": {"http_proxy": "http://***:***@proxy.example.com:8080"}},
+        )
+        self.assertEqual(
+            maa_schedule_control.load_runtime_settings(self.config_dir)["network"]["http_proxy"],
+            "http://pxuser:pxcred@proxy.example.com:8080",
+        )
+
+        # 2. maa-operator-scan.py atomic_task_file respects active client_type (H-1)
+        spec_op = importlib.util.spec_from_file_location(
+            "maa_operator_scan_ux_test", self.source_dir / "maa-operator-scan.py"
+        )
+        assert spec_op is not None and spec_op.loader is not None
+        op_scan_mod = importlib.util.module_from_spec(spec_op)
+        spec_op.loader.exec_module(op_scan_mod)
+        op_task_path = op_scan_mod.atomic_task_file(self.config_dir)
+        op_task_text = op_task_path.read_text(encoding="utf-8")
+        self.assertIn('client_type = "Bilibili"', op_task_text)
+        self.assertNotIn('client_type = "Official"', op_task_text)
+
+        # 3. Explicit notify.enabled = False suppresses legacy tg.txt fallback (M-6)
+        (self.config_dir / "tg.txt").write_text("legacy_tok\n12345\n", encoding="utf-8")
+        res_muted = maa_schedule_control.send_notifications(
+            "should not send", config_dir=self.config_dir, retries=1, retry_delay_s=0.0
+        )
+        self.assertEqual(res_muted["attempted"], 0)
+
+        # 4. Loopback/unspecified notify URL, out-of-range port, and plain-HTTP github_mirror must be rejected
+        with self.assertRaises(ValueError):
+            maa_schedule_control.save_runtime_settings(
+                self.config_dir,
+                {"notify": {"webhook": {"url": "http://127.0.0.1:9999/hook"}}},
+            )
+        with self.assertRaises(ValueError):
+            maa_schedule_control.save_runtime_settings(
+                self.config_dir,
+                {"notify": {"webhook": {"url": "http://0.0.0.0:9999/hook"}}},
+            )
+        with self.assertRaises(ValueError):
+            maa_schedule_control.save_runtime_settings(
+                self.config_dir,
+                {"network": {"http_proxy": "http://pxuser:pxcred@proxy.example.com:78900"}},
+            )
+        self.assertEqual(
+            maa_schedule_control._mask_proxy_url("http://pxuser:pxcred@proxy.example.com:78900"),
+            ("", False),
+        )
+        with self.assertRaises(ValueError):
+            maa_schedule_control.save_runtime_settings(
+                self.config_dir,
+                {"network": {"github_mirror": "http://mirror.example.com"}},
+            )
+
+        # 5. Redacted backup strips proxy credentials on export, preserves on import,
+        #    rejects file:// URLs and invalid infrast plans, and restores empty crontab + cleans stale manifest
+        redacted_bundle = maa_schedule_control.export_config_backup(
+            self.config_dir, b"", include_secrets=False
+        )
+        exported_rt = json.loads(redacted_bundle["files"]["runtime-settings.json"])
+        self.assertEqual(exported_rt["network"]["http_proxy"], "http://proxy.example.com:8080")
+
+        evil_rt_bundle = json.loads(json.dumps(redacted_bundle))
+        evil_rt = json.loads(evil_rt_bundle["files"]["runtime-settings.json"])
+        evil_rt["notify"]["webhook"]["url"] = "file:///etc/hosts"
+        evil_rt_bundle["files"]["runtime-settings.json"] = json.dumps(evil_rt)
+        with self.assertRaises(ValueError):
+            maa_schedule_control.import_config_backup(self.config_dir, evil_rt_bundle)
+
+        bad_plan_bundle = json.loads(json.dumps(redacted_bundle))
+        bad_plan_bundle["files"]["infrast/broken.json"] = '{"title": "no plans array"}'
+        with self.assertRaises(ValueError):
+            maa_schedule_control.import_config_backup(self.config_dir, bad_plan_bundle)
+
+        import base64 as _b64
+
+        bad_tx_bundle = json.loads(json.dumps(redacted_bundle))
+        bad_tx_bundle["schedule_activation"] = {
+            "backups/infrast-schedule/00000000-0000-4000-8000-000000000001/transaction.json": _b64.b64encode(
+                b'{"state": "prepared", "activation": true}'
+            ).decode("ascii")
+        }
+        with self.assertRaises(ValueError):
+            maa_schedule_control.import_config_backup(self.config_dir, bad_tx_bundle)
+
+        # Plant a stale infrast-schedule.json not present in backup; import should remove it & install empty cron
+        stale_manifest = self.config_dir / "infrast-schedule.json"
+        stale_manifest.write_text('{"schema_version": 1}\n', encoding="utf-8")
+        installed_crons: list[bytes] = []
+        maa_schedule_control.import_config_backup(
+            self.config_dir, redacted_bundle, install_crontab_fn=installed_crons.append
+        )
+        self.assertFalse(stale_manifest.exists())
+        self.assertEqual(installed_crons, [b""])
+        self.assertEqual(
+            maa_schedule_control.load_runtime_settings(self.config_dir)["network"]["http_proxy"],
+            "http://pxuser:pxcred@proxy.example.com:8080",
+        )

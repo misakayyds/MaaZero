@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 import urllib.request
 
@@ -30,7 +31,46 @@ def publish_activity(data, path=None):
     atomic_write_text(path,json.dumps(data,ensure_ascii=False)+'\n')
 
 
-def get_activity(path=None, *, now=None):
+def _configured_proxy_url(config_dir=None):
+    try:
+        from maa_schedule_control import load_runtime_settings
+        settings = load_runtime_settings(config_dir)
+        return str((settings.get('network') or {}).get('http_proxy') or '').strip()
+    except Exception:
+        return ''
+
+
+def _fetch_activity_bytes(proxy_url: str) -> bytes:
+    if proxy_url.lower().startswith(('socks5://', 'socks5h://')):
+        esc_url = ACTIVITY_API.replace('\\', '\\\\').replace('"', '\\"')
+        esc_proxy = proxy_url.replace('\\', '\\\\').replace('"', '\\"')
+        cfg = (
+            f'url = "{esc_url}"\n'
+            f'proxy = "{esc_proxy}"\n'
+            'user-agent = "MAA-ActivityCache/1"\n'
+            'silent\nshow-error\nlocation\nfail\n'
+            'connect-timeout = 8\nmax-time = 12\n'
+        ).encode('utf-8')
+        res = subprocess.run(
+            ['curl', '--config', '-'],
+            input=cfg,
+            capture_output=True,
+            timeout=15,
+            check=True,
+        )
+        return res.stdout[:MAX_BYTES + 1]
+    request = urllib.request.Request(ACTIVITY_API, headers={'User-Agent': 'MAA-ActivityCache/1'})
+    if proxy_url:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
+        )
+        with opener.open(request, timeout=10) as response:
+            return response.read(MAX_BYTES + 1)
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.read(MAX_BYTES + 1)
+
+
+def get_activity(path=None, *, now=None, config_dir=None):
     """Return (catalog, warning); a failed refresh never overwrites good data."""
     path=Path(path) if path is not None else DEFAULT_CACHE
     now=time.time() if now is None else now
@@ -42,9 +82,7 @@ def get_activity(path=None, *, now=None):
     except (OSError,ValueError,TypeError):
         cached={}
     try:
-        request=urllib.request.Request(ACTIVITY_API,headers={'User-Agent':'MAA-ActivityCache/1'})
-        with urllib.request.urlopen(request,timeout=10) as response:
-            raw=response.read(MAX_BYTES+1)
+        raw=_fetch_activity_bytes(_configured_proxy_url(config_dir))
         if len(raw)>MAX_BYTES:
             raise ValueError('活动目录超过大小限制')
         data=validate_activity(json.loads(raw))
