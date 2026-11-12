@@ -35,7 +35,7 @@
   - `powershell -ExecutionPolicy Bypass -File packaging/project/tests/test_build_project_allowlist.ps1`
 
 ## 约定 / 红线
-- **内置脚本待审查门禁**: `packaging/project/source/` 下的 28 个业务脚本是从单机原型仓库迁入的初始快照，**尚未完成通用化路径解耦、Android 宿主边界收敛与代码规范终审**（详见 `packaging/project/README.md` 与 `docs/runtime-dependency-inventory.md` R01–R09）。未完成规范审查与真机隔离验收前，禁止将预览构建伪装为可交付普通用户的正式版。
+- **内置脚本边界门禁**: `packaging/project/source/` 下的白名单业务脚本通过环境变量解耦路径并在只读挂载沙箱内运行，禁止引入 `nsenter` 宿主越界、全局 `pkill -f` 或绕过签名清单的不受控更新（详见 `packaging/project/README.md` 与 `docs/release-checklist.md`）。
 - **行尾与编码**: 全仓源码与模块脚本强制使用纯 LF（UTF-8 无 BOM），尤其是 `module/` 下所有文件不得含任何 CR (`\r`) 字节。
 - **安全与密钥红线**: 任何仓库文件、测试 fixture、打包产物中禁止写入真实签名私钥、Telegram Token、SSH 密钥或个人内网拓扑信息。
 - **模块最小边界**: Root 模块（`module/`）只负责引导、开机启动 `127.0.0.1:8088` 守护与救援入口；卸载时必须保留 `/data/local/maa-platform` 用户数据。

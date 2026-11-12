@@ -10,6 +10,11 @@
 > 模型或会话 ID 如确有必要,写在正文里,不要放标题。
 <!-- /agent-kit:progress-format:v2 -->
 
+## 2026-11-12 09:45 +0800 — Antigravity / Windows
+- 完成: 清理开发与多智能体测试阶段遗留的本地临时文档/测试报告及 `docs/` 下已过时的早期计划/盘点文档，同步更新残留文档引用并验证打包与合规测试全绿。
+- 改动: 删除未跟踪/忽略的阶段性文件（`PROJECT.md`、`TEST_INFRA.md`、`TEST_READY.md`、`tests/e2e/{sample_report,test_challenger_report}.json`、`test-report-audit.json`、`.agents/teamwork/`）及已过时的入库过程文档（`docs/{implementation-plan,rootfs-build-plan,runtime-dependency-inventory,compatibility,user-flow}.md`、`docs/runtime-project-files.json`）；更新 `AGENTS.md`、`manager/README.md`、`packaging/project/README.md` 与 `packaging/project/source/README.md` 中的旧链接与过时快照声明。
+- 验证: 已验证全仓零失效文档引用、纯 LF / UTF-8 无 BOM、`packaging/test-module.ps1`（65/65）、`test_build_project*.ps1`（83 + 12 项）及 `python -B tests/e2e/runner.py --feature 14`（24/24 项合规扫描全绿）。
+
 ## 2026-11-12 09:18 +0800 — Antigravity / Windows
 - 完成: 完成 **MaaZero `v0.1.0`** 正式首发签名、纯净 `debian-rootfs-12.11.0-arm64.tar.gz` 构建、新设备首次自动拉取与部署运行时及 `MaaCore` 自举闭环、正式模块包 `MaaZero-v0.1.0.zip` 打包、GitHub Pages 自动验签部署工作流与正式 `README.md` / `docs/user-guide.md` / `docs/release-checklist.md` 编写，全仓单元、打包与 221 项 E2E 回归 100% 通过。
 - 改动:
