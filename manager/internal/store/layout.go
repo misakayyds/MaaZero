@@ -168,6 +168,15 @@ func (s *Store) safePath(path string) error {
 	return nil
 }
 
+func (s *Store) Root() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.root == nil {
+		return ""
+	}
+	return s.root.Name()
+}
+
 func (s *Store) ReleasePath(component, version string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

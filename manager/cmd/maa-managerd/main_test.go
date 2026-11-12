@@ -15,7 +15,7 @@ func TestVersionAndRejectedCommands(t *testing.T) {
 	if err := run([]string{"version"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "0.1.0-preview\n" {
+	if out.String() != "0.1.0\n" {
 		t.Fatal(out.String())
 	}
 	for _, args := range [][]string{{}, {"shell", "id"}, {"serve", "--listen", "0.0.0.0:8088"}} {
@@ -47,8 +47,8 @@ func TestDaemonVersionIsSingleSourced(t *testing.T) {
 	if got := strings.TrimSpace(out.String()); got != daemonVersion() {
 		t.Fatalf("cli reports %q but the daemon reports %q", got, daemonVersion())
 	}
-	if !strings.HasPrefix(daemonVersion(), "0.1.") || !strings.HasSuffix(daemonVersion(), "-preview") {
-		t.Fatalf("packaged preview version drifted: %q", daemonVersion())
+	if !strings.HasPrefix(daemonVersion(), "0.1.") {
+		t.Fatalf("packaged version drifted: %q", daemonVersion())
 	}
 }
 

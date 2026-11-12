@@ -2,7 +2,7 @@
   "schema_version": 1,
   "sequence": 1,
   "channel": "stable",
-  "generated_at": "2026-11-11T23:28:27Z",
+  "generated_at": "2026-11-12T01:10:32Z",
   "minimum_bootstrap_version": "0.1.0",
   "notices": [],
   "blocked_versions": [],
@@ -10,7 +10,7 @@
     {
       "id": "maa-managerd",
       "kind": "manager",
-      "version": "0.1.0-preview",
+      "version": "0.1.0",
       "required": true,
       "install_mode": "replace-file",
       "compatibility": {
@@ -29,16 +29,16 @@
       },
       "artifacts": [
         {
-          "url": "https://github.com/MaaXYZ/maa-phone-manager/releases/download/v0.1.0-preview/maa-managerd",
+          "url": "https://github.com/misakayyds/MaaZero/releases/download/v0.1.0/maa-managerd",
           "mirrors": [],
-          "sha256": "95568189a5c8756b2036528f9973f97b5ee5c8f753376838c4c1eb2ab66fb45f",
+          "sha256": "1342e8c8bb0825e441b9ea653ca4a3018f2b4dbac60f826998413e8ab2027712",
           "size": 7078050,
           "media_type": "application/octet-stream",
           "compression": "none",
           "provenance": {
-            "publisher": "MAA Phone Manager",
-            "source_url": "https://github.com/MaaXYZ/maa-phone-manager/tree/v0.1.0-preview",
-            "license_url": "https://github.com/MaaXYZ/maa-phone-manager/blob/v0.1.0-preview/LICENSE"
+            "publisher": "MaaZero",
+            "source_url": "https://github.com/misakayyds/MaaZero/tree/v0.1.0",
+            "license_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.0/LICENSE"
           }
         }
       ],
@@ -49,7 +49,7 @@
     {
       "id": "maa-phone-project",
       "kind": "project",
-      "version": "0.1.0-preview",
+      "version": "0.1.0",
       "required": true,
       "install_mode": "extract-versioned",
       "compatibility": {
@@ -68,16 +68,16 @@
       },
       "artifacts": [
         {
-          "url": "https://github.com/MaaXYZ/maa-phone-manager/releases/download/v0.1.0-preview/maa-phone-project-0.1.0-preview.tar.gz",
+          "url": "https://github.com/misakayyds/MaaZero/releases/download/v0.1.0/maa-phone-project-0.1.0.tar.gz",
           "mirrors": [],
-          "sha256": "927e89acf9e210e77143b252e93c5728c7d7be35f9135d31167c443eb144dcd4",
-          "size": 327760,
+          "sha256": "83b7dfd20583bc91022156640e989011bb9921846445e5c9c0f15da06045df46",
+          "size": 327987,
           "media_type": "application/gzip",
           "compression": "tar.gz",
           "provenance": {
-            "publisher": "MAA Phone Manager",
-            "source_url": "https://github.com/MaaXYZ/maa-phone-manager/tree/v0.1.0-preview",
-            "license_url": "https://github.com/MaaXYZ/maa-phone-manager/blob/v0.1.0-preview/LICENSE"
+            "publisher": "MaaZero",
+            "source_url": "https://github.com/misakayyds/MaaZero/tree/v0.1.0",
+            "license_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.0/LICENSE"
           }
         }
       ],
@@ -108,15 +108,15 @@
       },
       "artifacts": [
         {
-          "url": "https://github.com/MaaXYZ/maa-phone-manager/releases/download/rootfs-12.11.0/debian-rootfs-12.11.0-arm64.tar.gz",
+          "url": "https://github.com/misakayyds/MaaZero/releases/download/rootfs-12.11.0/debian-rootfs-12.11.0-arm64.tar.gz",
           "mirrors": [],
-          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
-          "size": 536870912,
+          "sha256": "099af65914bc8be785ed69536c830111dc4a29e622b760a58392b80ad4ae400d",
+          "size": 106257895,
           "media_type": "application/gzip",
           "compression": "tar.gz",
           "provenance": {
-            "publisher": "MAA Phone Manager CI from Debian packages",
-            "source_url": "https://snapshot.debian.org/archive/debian/20260901T000000Z/",
+            "publisher": "MaaZero from Debian Bookworm ARM64 packages",
+            "source_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.0/packaging/rootfs/recipe.json",
             "license_url": "https://www.debian.org/legal/licenses/"
           }
         }

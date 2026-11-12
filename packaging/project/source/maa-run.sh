@@ -2415,6 +2415,11 @@ update_resource_from_tarball() {
 update_resources_before_run() {
     local attempt=0
 
+    if [[ ! -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
+        info "首次运行未检测到 libMaaCore.so，正在自动初始化安装 MaaCore 与资源..."
+        timeout -k 30s "$UPDATE_TIMEOUT" maa install --batch 2>&1 | tee -a "$LOG_FILE" || warn "maa install 未完全成功，继续尝试 maa update..."
+    fi
+
     while (( attempt < UPDATE_RETRIES )); do
         attempt=$((attempt + 1))
         info "======================================="

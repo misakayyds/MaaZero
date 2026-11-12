@@ -67,7 +67,7 @@ def package_project_archive(src_dir: Path, out_file: Path, mtime: int = DEFAULT_
 def main() -> None:
     parser = argparse.ArgumentParser(description="Package maa-phone-project component archive")
     parser.add_argument("--src", type=Path, default=Path("dist/project/project"), help="Path to project scripts")
-    parser.add_argument("--out", type=Path, default=Path("dist/maa-phone-project-0.1.0-preview.tar.gz"), help="Output tar.gz archive")
+    parser.add_argument("--out", type=Path, default=Path("dist/maa-phone-project-0.1.0.tar.gz"), help="Output tar.gz archive")
     parser.add_argument("--mtime", type=int, default=DEFAULT_MTIME, help="Deterministic timestamp")
     args = parser.parse_args()
 

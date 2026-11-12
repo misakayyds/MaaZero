@@ -357,16 +357,31 @@ func (f *releaseFixture) stopServer() {
 
 func (f *releaseFixture) start(d *runtimeFixture) (*Controller, *store.Store) {
 	f.t.Helper()
-	s, err := store.Open(f.t.TempDir())
+	dir, err := os.MkdirTemp("", "maa-control-test-*")
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	f.t.Cleanup(func() { _ = s.Close() })
+	s, err := store.Open(dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		f.t.Fatal(err)
+	}
 	c, err := New(f.config(), s, d)
 	if err != nil {
+		_ = s.Close()
+		_ = os.RemoveAll(dir)
 		f.t.Fatal(err)
 	}
-	f.t.Cleanup(c.Close)
+	f.t.Cleanup(func() {
+		c.Close()
+		_ = s.Close()
+		for range 10 {
+			if os.RemoveAll(dir) == nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
 	c.client = f.server.Client()
 	return c, s
 }
@@ -859,5 +874,158 @@ func TestStartBootstrapActivatesCommittedRelease(t *testing.T) {
 
 	if got := d2.activeVersion(); got != "0.1.0" {
 		t.Fatalf("StartBootstrap activeVersion = %q, want 0.1.0; status=%+v", got, c2.Status())
+	}
+}
+
+func TestFirstInstallStagesRequiredRuntimeRootfsBeforeProject(t *testing.T) {
+	var rootfsBuf, projectBuf bytes.Buffer
+	{
+		gz := gzip.NewWriter(&rootfsBuf)
+		tw := tar.NewWriter(gz)
+		dirs := []string{"bin", "usr", "usr/bin", "etc"}
+		for _, dir := range dirs {
+			if err := tw.WriteHeader(&tar.Header{Name: dir + "/", Typeflag: tar.TypeDir, Mode: 0755}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		files := map[string]struct {
+			body string
+			mode int64
+		}{
+			"bin/bash":        {"#!/bin/sh\n", 0755},
+			"usr/bin/python3": {"#!/bin/sh\n", 0755},
+			"etc/os-release":  {"ID=debian\nVERSION_ID=\"12\"\n", 0644},
+		}
+		for name, entry := range files {
+			if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: entry.mode, Size: int64(len(entry.body))}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write([]byte(entry.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	{
+		gz := gzip.NewWriter(&projectBuf)
+		tw := tar.NewWriter(gz)
+		ver := "0.1.0"
+		if err := tw.WriteHeader(&tar.Header{Name: "version.txt", Typeflag: tar.TypeReg, Mode: 0600, Size: int64(len(ver))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(ver)); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile("../../../manifest/example-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest.ChannelManifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch r.URL.Path {
+		case "/stable.json":
+			_, _ = w.Write(payload)
+		case "/stable.json.sig":
+			_, _ = w.Write(ed25519.Sign(priv, payload))
+		case "/rootfs-12.11.0/debian-rootfs-12.11.0-arm64.tar.gz":
+			_, _ = w.Write(rootfsBuf.Bytes())
+		case "/v0.1.0/maa-phone-project-0.1.0.tar.gz":
+			_, _ = w.Write(projectBuf.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// Keep project + runtime components; omit manager binary for this controller unit test.
+	var comps []manifest.Component
+	for _, comp := range m.Components {
+		switch comp.Kind {
+		case "project":
+			comp.Version = "0.1.0"
+			comp.Artifacts[0].URL = srv.URL + "/v0.1.0/maa-phone-project-0.1.0.tar.gz"
+			comp.Artifacts[0].SHA256 = fmt.Sprintf("%x", sha256.Sum256(projectBuf.Bytes()))
+			comp.Artifacts[0].Size = int64(projectBuf.Len())
+			comp.Artifacts[0].Compression = "tar.gz"
+			comp.Artifacts[0].MediaType = "application/gzip"
+			comps = append(comps, comp)
+		case "runtime":
+			comp.Version = "12.11.0"
+			comp.Required = true
+			comp.Artifacts[0].URL = srv.URL + "/rootfs-12.11.0/debian-rootfs-12.11.0-arm64.tar.gz"
+			comp.Artifacts[0].SHA256 = fmt.Sprintf("%x", sha256.Sum256(rootfsBuf.Bytes()))
+			comp.Artifacts[0].Size = int64(rootfsBuf.Len())
+			comp.Artifacts[0].Compression = "tar.gz"
+			comp.Artifacts[0].MediaType = "application/gzip"
+			comps = append(comps, comp)
+		}
+	}
+	m.Components = comps
+	m.Sequence = 1
+
+	dataRoot := t.TempDir()
+	s, err := store.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	d := &runtimeFixture{}
+	c, err := New(Config{
+		ManifestURL: srv.URL + "/stable.json",
+		PublicKey:   base64.StdEncoding.EncodeToString(pub),
+		Device:      manifest.DeviceFacts{Architecture: "arm64-v8a", AndroidAPI: 35, RootManager: "kernelsu"},
+	}, s, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.client = srv.Client()
+
+	if err := c.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for c.Status().(Status).Busy {
+		if time.Now().After(deadline) {
+			t.Fatal("update worker stuck")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := d.activeVersion(); got != "0.1.0" {
+		t.Fatalf("activeVersion = %q, want 0.1.0; status=%+v", got, c.Status())
+	}
+	if got := s.Versions()["debian-rootfs"].Current; got != "12.11.0" {
+		t.Fatalf("debian-rootfs version = %q, want 12.11.0", got)
+	}
+	if _, err := os.Stat(filepath.Join(dataRoot, "runtime", "rootfs", "bin", "bash")); err != nil {
+		t.Fatalf("staged runtime/rootfs/bin/bash missing: %v", err)
 	}
 }

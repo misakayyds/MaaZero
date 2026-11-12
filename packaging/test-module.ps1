@@ -320,6 +320,27 @@ try {
         WebuiDirectory = $webui; UserGuidePath = $UserGuidePath; ReleaseConfig = $releaseConfig; Force = $true
     }
     Check ($forced -like "MODULE_ZIP_OK*") "-Force rebuilds an existing preview zip"
+
+    # 7. Formal -Release mode produces MaaZero-v<version>.zip and enforces release gates.
+    $relOut = Join-Path $tempRoot "out-release"
+    $relOutput = Invoke-Build @{
+        ManagerBinary = $goodBinary; Version = "0.1.0"; VersionCode = 100; OutputDirectory = $relOut;
+        WebuiDirectory = $webui; UserGuidePath = $UserGuidePath; ReleaseConfig = $releaseConfig; Release = $true
+    }
+    Check ($relOutput -like "MODULE_ZIP_OK*preview=false*") "-Release outputs MODULE_ZIP_OK with preview=false"
+    $relZip = Join-Path $relOut "MaaZero-v0.1.0.zip"
+    Check (Test-Path -LiteralPath $relZip -PathType Leaf) "-Release writes MaaZero-v0.1.0.zip"
+    $relEntries = Read-ZipEntries $relZip
+    Check ($relEntries.ContainsKey("README.md")) "-Release ships README.md inside zip"
+    Check (-not $relEntries.ContainsKey("README-preview.md")) "-Release omits README-preview.md"
+    $relProp = Get-Text $relEntries["module.prop"].Bytes
+    Check ($relProp -match "(?m)^name=MaaZero$") "-Release sets name=MaaZero in module.prop"
+    Check ($relProp -match "(?m)^version=0\.1\.0$") "-Release sets version=0.1.0 in module.prop"
+    Check ($relProp -match "(?m)^versionCode=100$") "-Release sets versionCode=100 in module.prop"
+    $relMeta = (Get-Text $relEntries["module-metadata.json"].Bytes) | ConvertFrom-Json
+    CheckEqual $relMeta.preview $false "-Release sets metadata.preview to false"
+    Expect-Refusal { Invoke-Build @{ ManagerBinary = $goodBinary; Version = "0.1.0"; OutputDirectory = (Join-Path $tempRoot "out-rel-noconf"); WebuiDirectory = $webui; UserGuidePath = $UserGuidePath; Release = $true } } "-Release without ReleaseConfig is refused" "ReleaseConfig"
+    Expect-Refusal { Invoke-Build @{ ManagerBinary = $goodBinary; Version = "0.1.0-preview"; OutputDirectory = (Join-Path $tempRoot "out-rel-badver"); WebuiDirectory = $webui; UserGuidePath = $UserGuidePath; ReleaseConfig = $releaseConfig; Release = $true } } "-Release refuses preview version string" "SemVer"
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {
         $resolved = (Resolve-Path -LiteralPath $tempRoot).Path

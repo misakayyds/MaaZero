@@ -1,0 +1,59 @@
+name: Deploy Channel Manifests to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "manifest/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  verify-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: Verify Ed25519 signatures before publishing
+        run: python3 -B packaging/sign-manifests.py --verify-only --dist-dir manifest/channels --release-out manifest/release.json
+
+      - name: Stage public Pages site
+        run: |
+          mkdir -p _site/channels
+          cp manifest/channels/stable.json _site/channels/stable.json
+          cp manifest/channels/stable.json.sig _site/channels/stable.json.sig
+          cp manifest/channels/beta.json _site/channels/beta.json
+          cp manifest/channels/beta.json.sig _site/channels/beta.json.sig
+          cp manifest/release.json _site/release.json
+          touch _site/.nojekyll
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "_site"
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

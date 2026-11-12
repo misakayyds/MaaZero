@@ -438,6 +438,11 @@ func (c *Controller) update(ctx context.Context, rollback bool) error {
 	if err := c.discardPending(); err != nil {
 		return err
 	}
+	if !rollback && p.manifest != nil {
+		if err := c.ensureRuntimeRootfs(ctx, p.manifest); err != nil {
+			return err
+		}
+	}
 	before := c.store.Versions()[p.component]
 	tx, err := c.store.BeginUpdate(p.component, before.Current, p.version, p.artifact.SHA256)
 	if err != nil {
@@ -618,6 +623,119 @@ func (c *Controller) downloadHTTPClient() *http.Client {
 	client := *c.client
 	client.Timeout = downloadTimeout
 	return &client
+}
+
+// ensureRuntimeRootfs provisions <dataRoot>/runtime/rootfs on a brand-new device
+// when the signed channel manifest declares a required runtime component and the
+// local chroot directory does not exist yet. Existing live rootfs trees are left
+// untouched so mounted chroot environments are never clobbered mid-run.
+func (c *Controller) ensureRuntimeRootfs(ctx context.Context, m *manifest.ChannelManifest) error {
+	var rtComp *manifest.Component
+	for i := range m.Components {
+		if m.Components[i].Kind == "runtime" && m.Components[i].Required {
+			rtComp = &m.Components[i]
+			break
+		}
+	}
+	if rtComp == nil {
+		return nil
+	}
+	dataRoot := c.store.Root()
+	if dataRoot == "" {
+		return errors.New("store root unavailable")
+	}
+	rootfsDest := filepath.Join(dataRoot, "runtime", "rootfs")
+	if _, err := os.Stat(rootfsDest); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	rtArt, err := m.SelectArtifact(rtComp.ID, c.cfg.Device)
+	if err != nil {
+		return err
+	}
+	rtReleaseDir, err := c.store.ReleasePath(rtComp.ID, rtComp.Version)
+	if err != nil {
+		return err
+	}
+	cacheDir := filepath.Dir(rtReleaseDir)
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		return err
+	}
+	cache := filepath.Join(cacheDir, rtArt.SHA256+".download")
+
+	before := c.store.Versions()[rtComp.ID]
+	var rtTx *store.Transaction
+	if before.Current != rtComp.Version {
+		rtTx, err = c.store.BeginUpdate(rtComp.ID, before.Current, rtComp.Version, rtArt.SHA256)
+		if err != nil {
+			return err
+		}
+		rtSucceeded := false
+		defer func() {
+			if !rtSucceeded {
+				_ = rtTx.Rollback("runtime_stage_failed")
+			}
+		}()
+		if err := rtTx.Advance(store.Downloading); err != nil {
+			return err
+		}
+		if _, err := os.Stat(cache); errors.Is(err, os.ErrNotExist) {
+			if err := (download.Client{HTTP: c.downloadHTTPClient()}).Fetch(ctx, rtArt, cache, nil); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		if err := rtTx.Advance(store.Verifying); err != nil {
+			return err
+		}
+		if err := rtTx.Advance(store.Staging); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(rootfsDest), 0755); err != nil {
+			return err
+		}
+		if _, err := install.StageRootfs(ctx, rtArt, cache, rootfsDest); err != nil {
+			return err
+		}
+		if seal, sealErr := sealedDescriptor(rtArt); sealErr == nil {
+			_ = os.MkdirAll(rtReleaseDir, 0700)
+			_ = os.WriteFile(filepath.Join(rtReleaseDir, descriptorName), seal[descriptorName], 0600)
+		}
+		_ = os.Remove(cache)
+		if err := rtTx.Advance(store.WaitingIdle); err != nil {
+			return err
+		}
+		if err := rtTx.Advance(store.Switching); err != nil {
+			return err
+		}
+		if err := rtTx.Advance(store.HealthCheck); err != nil {
+			return err
+		}
+		if err := rtTx.Commit(func() error { return nil }); err != nil {
+			return err
+		}
+		rtSucceeded = true
+		return nil
+	}
+
+	if _, err := os.Stat(cache); errors.Is(err, os.ErrNotExist) {
+		if err := (download.Client{HTTP: c.downloadHTTPClient()}).Fetch(ctx, rtArt, cache, nil); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(rootfsDest), 0755); err != nil {
+		return err
+	}
+	if _, err := install.StageRootfs(ctx, rtArt, cache, rootfsDest); err != nil {
+		return err
+	}
+	_ = os.Remove(cache)
+	return nil
 }
 
 // downloadAndStage fetches and publishes the candidate release. The release is

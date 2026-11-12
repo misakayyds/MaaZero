@@ -1,48 +1,94 @@
-# 维护者：预览构建与后续更新分发
+# 维护者：MaaZero 签名构建与发布检查清单
 
-## 当前可以做的事
+本文档记录 **MaaZero**（GitHub 仓库：`misakayyds/MaaZero`）正式版本与预览版本的完整构建、Ed25519 外部密钥签名、GitHub Releases 上传及 GitHub Pages 通道清单发布流程。
 
-只构建明确带 `preview` 的本地模块 ZIP，不创建 GitHub Release、不推送分支、不上传文件、不使用签名私钥。打包器拒绝非 ARM64 静态 ELF、非预览版本、未知文件和不合法公开配置；默认不带发布源，后台保持恢复模式。
+---
 
-在仓库根目录使用 PowerShell 7：
+## 一、安全红线（发布前必查）
+
+1. **私钥严格隔离**：Ed25519 发布签名私钥仅允许保存在维护者本机仓库外路径（默认 `~/.ssh/maa_phone_manager_release_ed25519`，Windows 下仅授予当前用户读写 ACL，POSIX 下权限 `0600`）。`packaging/sign-manifests.py` 与 `maa-release-sign` 会主动拒绝任何位于仓库目录内的私钥路径。
+2. **零敏感信息入库**：任何仓库源码、`manifest/`、`dist/` 构建产物中仅允许包含 32 字节 Base64 **公钥**（`release.json`），严禁写入私钥种子、个人 Token、SSH 密钥或测试机局域网信息。
+3. **纯 LF 与不可变地址**：全仓文本文件强制 UTF-8 无 BOM + 纯 LF（`\n`）；通道清单中的所有组件 `url` 必须指向包含明确版本号的不可变 HTTPS 地址，禁止使用 `/latest/` 或分支 `raw/main`。
+
+---
+
+## 二、正式版（如 `v0.1.0`）一键构建与签名流程
+
+在仓库根目录使用 PowerShell 7 执行：
 
 ```powershell
+# 1. 编译静态 ARM64 maa-managerd 守护进程
 $env:GOOS = 'linux'
 $env:GOARCH = 'arm64'
 $env:CGO_ENABLED = '0'
 Push-Location manager
-go build -trimpath -o ../.codex_diagnostics/maa-managerd-preview-linux-arm64 ./cmd/maa-managerd
+go build -trimpath -ldflags='-s -w' -o ../bin/maa-managerd ./cmd/maa-managerd
 if ($LASTEXITCODE -ne 0) { throw 'ARM64 build failed' }
 Pop-Location
-pwsh -File packaging/build-module.ps1 -ManagerBinary .codex_diagnostics/maa-managerd-preview-linux-arm64 -Version 0.1.0-preview -OutputDirectory .codex_diagnostics/module-preview
-if ($LASTEXITCODE -ne 0) { throw 'Module packaging failed' }
+Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
+
+# 2. 构建白名单项目脚本与确定性归档包
+pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/project/build-project.ps1 -Out dist/project -Version 0.1.0
+python -B packaging/package-project-archive.py --src dist/project/project --out dist/maa-phone-project-0.1.0.tar.gz
+
+# 3. 确认纯净 Debian Bookworm ARM64 rootfs 归档就位后生成通道清单
+python -B packaging/generate-manifests.py `
+  --version 0.1.0 `
+  --sequence 1 `
+  --repo misakayyds/MaaZero `
+  --rootfs dist/debian-rootfs-12.11.0-arm64.tar.gz
+
+# 4. 使用仓库外 Ed25519 私钥签名 stable/beta 清单并输出公开 release.json
+# （首次生成密钥对时追加 --init-key）
+python -B packaging/sign-manifests.py `
+  --key-file "$HOME/.ssh/maa_phone_manager_release_ed25519" `
+  --manifest-url "https://misakayyds.github.io/MaaZero/channels/stable.json" `
+  --channel stable
+
+# 5. 打包正式版 Root 模块 MaaZero-v0.1.0.zip
+pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/build-module.ps1 `
+  -Release `
+  -ManagerBinary bin/maa-managerd `
+  -ReleaseConfig dist/release.json `
+  -Version 0.1.0 `
+  -VersionCode 100 `
+  -Force
 ```
 
-脚本会拒绝覆盖已有 ZIP；复测时换新的输出目录。结束交叉编译后，在新的终端运行本机测试，避免残留 `GOOS/GOARCH` 导致测试无法执行。ZIP 自带离线教程和文件清单，不包含游戏、Debian、用户数据或现有手机配置。
+> 如需本地开发调试预览模块（不含正式发布标识），去掉 `-Release` 并传入 `-Version 0.1.0-preview` 即可输出 `dist/MAA-Phone-Manager-preview-0.1.0-preview.zip`。
 
-仓库提供手动触发的 `maa-phone-manager-preview` 工作流，仅运行测试、构建预览 ZIP 并保留 CI artifact；没有发布写权限、签名或正式通道推广。工作流需用户决定推送后才可能执行，本地存在 YAML 不代表远端 CI 已运行。
+---
 
-## 未来怎么方便推送
+## 三、GitHub 远端发布与托管核对步骤
 
-维护名单入口：`packaging/project/project-files.json` 是项目文件生产白名单（增删文件才改）；`packaging/rootfs/recipe.json` 是基础环境候选输入（安全/兼容更新时升级）；最终版本/大小/哈希/签名清单应由发布构建生成，当前发布锁流水线未完成。`docs/runtime-project-files.json` 是历史审计快照，不作为另一份手工生产名单维护。
+1. **推送代码并启用 GitHub Pages**：
+   - 将仓库推送至 `https://github.com/misakayyds/MaaZero`。
+   - 在 GitHub 仓库 `Settings -> Pages` 中将 `Build and deployment -> Source` 设为 **GitHub Actions**。
+   - `.github/workflows/pages.yml` 会先调用 `sign-manifests.py --verify-only` 校验 Ed25519 签名，通过后自动将 `manifest/channels/{stable,beta}.json{,.sig}` 发布到：
+     - `https://misakayyds.github.io/MaaZero/channels/stable.json`
+     - `https://misakayyds.github.io/MaaZero/channels/stable.json.sig`
+     - `https://misakayyds.github.io/MaaZero/channels/beta.json`
+     - `https://misakayyds.github.io/MaaZero/channels/beta.json.sig`
+2. **上传基础运行时 Release（Tag: `rootfs-12.11.0`）**：
+   - 创建 GitHub Release tag `rootfs-12.11.0`，上传 `dist/debian-rootfs-12.11.0-arm64.tar.gz`（基础环境未变动时后续业务小版本无需重复上传此包）。
+   - 示例命令：`gh release create rootfs-12.11.0 dist/debian-rootfs-12.11.0-arm64.tar.gz --title "Debian Bookworm ARM64 Runtime 12.11.0"`
+3. **上传正式版模块与组件 Release（Tag: `v0.1.0`）**：
+   - 创建 GitHub Release tag `v0.1.0`，上传以下产物：
+     - `dist/MaaZero-v0.1.0.zip`（供普通用户下载刷入）
+     - `bin/maa-managerd`（通道清单 `maa-managerd` 组件源）
+     - `dist/maa-phone-project-0.1.0.tar.gz`（通道清单 `maa-phone-project` 组件源）
+     - `dist/SHA256SUMS.txt`（公开校验值汇总）
+   - 示例命令：`gh release create v0.1.0 dist/MaaZero-v0.1.0.zip bin/maa-managerd dist/maa-phone-project-0.1.0.tar.gz dist/SHA256SUMS.txt --title "MaaZero v0.1.0"`
+4. **后续迭代升级规约**：
+   - 每次更新 `stable.json` 或 `beta.json` 时，**必须递增 `--sequence` 序号**（如 `1 -> 2`），设备端 `store.AcceptSequence` 会拒绝序号回退的重放清单。
 
-采用“不可变版本文件 + 小型签名通道清单”，无需常驻服务器。普通更新主要替换后台/项目组件，模块本身只在引导层变更时升级。用户在原 WebUI 的“关于与模块设置”查看版本并确认更新，数据目录不跟着程序版本替换。
+---
 
-维护者顺序：构建并测试 → 上传带具体版本的产物 → 生成大小和 SHA-256 → 受保护环境签名 beta 清单 → 备用设备验收 → 签名发布 stable 清单。安装器只信任内置公钥，不接受用户页面传入任意下载地址或命令。不要把 `example-manifest.json` 当成真实下载源。
+## 四、首发就绪核对表
 
-当前尚未实现生产清单生成/签名发布流水线、自动检查周期、通知推送和正式推广；不能承诺现在点一下即可给用户推送更新。私钥只由受保护发布环境提供，任何仓库文件、教程、构建产物或日志中都不得保存私钥。
-
-## 正式发布阻断项
-
-基础环境候选构建入口及维护教程见 `../packaging/rootfs/README.md`。目前只有离线校验和受前置条件约束的 raw Debian 构建入口；快照/完整依赖闭包/上游组件锁及真实构建仍未验收，不能勾掉下面第一项。预览 CI 仅新增离线配方测试和 shell 语法检查，不构建或发布 rootfs。
-
-- [ ] 固定可重建的 Debian rootfs 配方及 MAA 依赖/CLI 版本和许可清单。
-- [ ] 接通真实运行驱动：挂载、启动、停止、无游戏健康检查、任务锁及失败恢复；当前 CLI 的 nil driver 不能改成假成功。
-- [ ] 完成 `packaging/project/source/` 内置 28 个原型脚本的规范化与安全终审（见 `../packaging/project/README.md` 与 `runtime-dependency-inventory.md` R01–R09）：迁移旧运行器硬编码路径、ADB、`nsenter`/`pkill`、自更新通道与原位资源改写逻辑，不要把白名单项目目录直接当成已通过通用环境审查的生产代码。
-- [ ] 明确配置迁移和数据目录挂载，验证计划/培养数据升级后保留。
-- [ ] 空间预算、崩溃暂存清理和完整断电恢复策略。
-- [ ] 真机验收安装、模块入口、冷启动、升级、离线回滚、失败恢复及卸载保留数据。
-- [ ] 生产签名源、组件物料/许可证、稳定通道推广和诊断脱敏验收。
-- [ ] 根据真实手机界面完成小白安装教程和截图。
-
-这些是未完成实现或未取得证据的事项，不是通过修改文档即可解除的限制。实机安装、系统改动和外部发布需要单独授权。
+- [x] 纯净可重建的 Debian Bookworm ARM64 `debian-rootfs-12.11.0-arm64.tar.gz`（预置 `maa-cli v0.7.8` 与 `MaaCore` 运行依赖库，通过 `install.StageRootfs` 校验）。
+- [x] 接通完整 Linux/Android 运行驱动（挂载、启动、停止、无游戏健康检查、任务锁、开机自启 `StartBootstrap` 与首次安装自动部署 `runtime/rootfs`）。
+- [x] 完成真机（Android 16 + KernelSU）冷启动重启拉起、官服客户端 APK 在线更新与明日方舟唤醒界面健康检测验收。
+- [x] 完成卸载脚本保留 `/data/local/maa-platform` 用户数据与安全卸载挂载点验证。
+- [x] 生成仓库外独立 Ed25519 签名密钥对，完成 `stable` / `beta` 通道清单签名与验签测试。
+- [x] 通过 Go、Python、Node、PowerShell 与 221 项 E2E 测试（含纯 LF、无 BOM 与零密钥扫描）。

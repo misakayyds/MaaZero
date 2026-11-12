@@ -24,6 +24,9 @@ param(
     [string]$OutputDirectory = "",
     [string]$WebuiDirectory = "",
     [string]$UserGuidePath = "",
+    [string]$BrandName = "MaaZero",
+    [string]$Author = "misakayyds",
+    [switch]$Release,
     [switch]$AllowMissingWebuiAssets,
     [switch]$Force
 )
@@ -48,8 +51,20 @@ if ($WebuiDirectory.Length -eq 0) { $WebuiDirectory = Join-Path (Join-Path $PSSc
 if ($UserGuidePath.Length -eq 0) { $UserGuidePath = Join-Path (Join-Path (Join-Path $PSScriptRoot "..") "docs") "user-guide.md" }
 
 $minimumVersion = "1"
-if ($Version -notmatch "^\d+\.\d+\.\d+-preview(\.[0-9]+)?$") {
-    Fail "version must be an explicit preview version such as 0.1.0-preview (got [$Version])"
+if ($Release) {
+    if ($Version -notmatch "^\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)(?:\.[0-9]+)?)?$") {
+        Fail "release version must follow SemVer such as 0.1.0 or 0.1.0-rc.1 (got [$Version])"
+    }
+    if ($AllowMissingWebuiAssets) {
+        Fail "formal release builds must include webui assets (-AllowMissingWebuiAssets is forbidden with -Release)"
+    }
+    if ($BrandName -notmatch "^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$") {
+        Fail "invalid BrandName [$BrandName]"
+    }
+} else {
+    if ($Version -notmatch "^\d+\.\d+\.\d+-preview(\.[0-9]+)?$") {
+        Fail "version must be an explicit preview version such as 0.1.0-preview (got [$Version])"
+    }
 }
 if ($VersionCode -lt 1) { Fail "versionCode must be >= 1 (got $VersionCode)" }
 
@@ -145,6 +160,9 @@ if ($ReleaseConfig.Length -gt 0) {
     }
     $releaseIncluded = $true
 }
+if ($Release -and -not $releaseIncluded) {
+    Fail "formal release builds require -ReleaseConfig pointing to a public release.json"
+}
 
 $UserGuidePath = Resolve-ExistingPath $UserGuidePath "offline user guide (docs/user-guide.md)"
 
@@ -163,7 +181,8 @@ if (-not $webuiIncluded -and -not $AllowMissingWebuiAssets) {
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
-$zipPath = Join-Path $OutputDirectory ("MAA-Phone-Manager-preview-" + $Version + ".zip")
+$zipFileName = if ($Release) { $BrandName + "-v" + $Version + ".zip" } else { "MAA-Phone-Manager-preview-" + $Version + ".zip" }
+$zipPath = Join-Path $OutputDirectory $zipFileName
 if ((Test-Path -LiteralPath $zipPath) -and -not $Force) {
     Fail "output zip already exists: $zipPath (pass -Force to overwrite it)"
 }
@@ -233,14 +252,20 @@ try {
     }
     Add-StagedFile -RelativePath "webroot/assets/user-guide.md" -SourcePath $UserGuidePath -Mode "0644"
 
-    # module.prop carries the requested preview version instead of the placeholder.
+    # module.prop carries the requested build version and, in -Release mode, formal MaaZero metadata.
     $propSource = Join-Path $stagingBase "module.prop"
     $propLines = New-Object "System.Collections.Generic.List[string]"
     foreach ($line in ([System.IO.File]::ReadAllText($propSource, [System.Text.Encoding]::UTF8) -split "`n")) {
         $trimmed = $line.TrimEnd()
         if ($trimmed.Length -eq 0) { continue }
+        if ($Release -and ($trimmed -like "name=*")) { $propLines.Add("name=$BrandName"); continue }
         if ($trimmed -like "version=*") { $propLines.Add("version=$Version"); continue }
         if ($trimmed -like "versionCode=*") { $propLines.Add("versionCode=$VersionCode"); continue }
+        if ($Release -and ($trimmed -like "author=*")) { $propLines.Add("author=$Author"); continue }
+        if ($Release -and ($trimmed -like "description=*")) {
+            $propLines.Add("description=零电脑依赖、零命令行折腾、零系统接管的手机端 MAA 独立沙箱模块（支持 KernelSU / Magisk / APatch）。")
+            continue
+        }
         $propLines.Add($trimmed)
     }
     [System.IO.File]::WriteAllText($propSource, (($propLines -join "`n") + "`n"), (New-Object "System.Text.UTF8Encoding" $false))
@@ -250,46 +275,71 @@ try {
     if ($webuiIncluded) { $webuiAssetsState = "included" }
     $releaseState = "absent"
     if ($releaseIncluded) { $releaseState = "included" }
-    $tutorialLines = @(
-        "# MAA Phone Manager - local preview module",
-        "",
-        "This is a *preview* build: it only demonstrates the module layout locally and has",
-        "NOT passed device acceptance. Do not treat it as a release package.",
-        "",
-        "Offline user guide (Chinese): webroot/assets/user-guide.md",
-        "",
-        "## Included",
-        "",
-        "- bin/maa-managerd: static ARM64 daemon supplied with -ManagerBinary (SHA-256 $managerHash).",
-        "- service.sh: starts maa-managerd serve in the background, listening on 127.0.0.1:8088.",
-        "- action.sh: Magisk module action button; calls the fixed open-ui command.",
-        "- uninstall.sh: calls stop and keeps all user data.",
-        "- webroot/: KernelSU/APatch module page; it only runs the fixed open-ui command and",
-        "  offers no arbitrary command input.",
-        "- webroot/assets/: module settings assets plus the offline user guide.",
-        "",
-        "## Not included",
-        "",
-        "- No Debian rootfs, MaaCore, game resources or user data.",
-        "- No credentials, notification config, logs, screenshots or device backups.",
-        "- No system partition changes; nothing outside the module directory is written.",
-        "",
-        "## Data directory",
-        "",
-        "Runtime data lives in /data/local/maa-platform. Uninstalling the module stops the",
-        "daemon and keeps that directory.",
-        "",
-        "## Build and verify locally",
-        "",
-        "  powershell -ExecutionPolicy Bypass -File .\packaging\build-module.ps1 -ManagerBinary <arm64-static-binary> -Version " + $Version + " -VersionCode " + $VersionCode,
-        "  powershell -ExecutionPolicy Bypass -File .\packaging\test-module.ps1",
-        "",
-        "The packaging script never installs the module, never connects to a phone and never",
-        "writes user data."
-    )
-    $tutorialPath = Join-Path $stagingBase "README-preview.md"
+    if ($Release) {
+        $readmeDocName = "README.md"
+        $tutorialLines = @(
+            "# $BrandName v$Version - Android Root Module",
+            "",
+            "零电脑依赖、零命令行折腾、零系统接管的手机端 MAA 独立沙箱编排模块。",
+            "",
+            "Offline user guide (Chinese): webroot/assets/user-guide.md",
+            "",
+            "## Included",
+            "",
+            "- bin/maa-managerd: static ARM64 daemon (SHA-256 $managerHash).",
+            "- release.json: Ed25519 public verification key and signed HTTPS channel manifest URL.",
+            "- service.sh: starts maa-managerd on 127.0.0.1:8088 after boot.",
+            "- action.sh & webroot/: opens the local management WebUI from KernelSU / Magisk / APatch.",
+            "- uninstall.sh: stops background services, unmounts chroot cleanly, and preserves user data.",
+            "",
+            "## Data directory",
+            "",
+            "All runtime files, MaaCore resources, configs, and logs reside in /data/local/maa-platform.",
+            "Uninstalling this module never deletes /data/local/maa-platform."
+        )
+    } else {
+        $readmeDocName = "README-preview.md"
+        $tutorialLines = @(
+            "# MAA Phone Manager - local preview module",
+            "",
+            "This is a *preview* build: it only demonstrates the module layout locally and has",
+            "NOT passed device acceptance. Do not treat it as a release package.",
+            "",
+            "Offline user guide (Chinese): webroot/assets/user-guide.md",
+            "",
+            "## Included",
+            "",
+            "- bin/maa-managerd: static ARM64 daemon supplied with -ManagerBinary (SHA-256 $managerHash).",
+            "- service.sh: starts maa-managerd serve in the background, listening on 127.0.0.1:8088.",
+            "- action.sh: Magisk module action button; calls the fixed open-ui command.",
+            "- uninstall.sh: calls stop and keeps all user data.",
+            "- webroot/: KernelSU/APatch module page; it only runs the fixed open-ui command and",
+            "  offers no arbitrary command input.",
+            "- webroot/assets/: module settings assets plus the offline user guide.",
+            "",
+            "## Not included",
+            "",
+            "- No Debian rootfs, MaaCore, game resources or user data.",
+            "- No credentials, notification config, logs, screenshots or device backups.",
+            "- No system partition changes; nothing outside the module directory is written.",
+            "",
+            "## Data directory",
+            "",
+            "Runtime data lives in /data/local/maa-platform. Uninstalling the module stops the",
+            "daemon and keeps that directory.",
+            "",
+            "## Build and verify locally",
+            "",
+            "  powershell -ExecutionPolicy Bypass -File .\packaging\build-module.ps1 -ManagerBinary <arm64-static-binary> -Version " + $Version + " -VersionCode " + $VersionCode,
+            "  powershell -ExecutionPolicy Bypass -File .\packaging\test-module.ps1",
+            "",
+            "The packaging script never installs the module, never connects to a phone and never",
+            "writes user data."
+        )
+    }
+    $tutorialPath = Join-Path $stagingBase $readmeDocName
     [System.IO.File]::WriteAllText($tutorialPath, (($tutorialLines -join "`n") + "`n"), (New-Object "System.Text.UTF8Encoding" $false))
-    $staged.Add([pscustomobject]@{ Name = "README-preview.md"; Path = $tutorialPath; Mode = "0644" })
+    $staged.Add([pscustomobject]@{ Name = $readmeDocName; Path = $tutorialPath; Mode = "0644" })
 
     $inventory = New-Object "System.Collections.Generic.List[object]"
     foreach ($entry in ($staged | Sort-Object Name)) {
@@ -305,9 +355,11 @@ try {
             })
     }
 
+    $isPreview = (-not $Release)
     $metadata = [ordered]@{
         schema_version = 1
-        preview = $true
+        preview = $isPreview
+        brand = $BrandName
         module_id = "maa-phone-manager"
         version = $Version
         version_code = $VersionCode
@@ -375,14 +427,17 @@ try {
     } finally { $verifyArchive.Dispose() }
 
     $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-Host "MODULE_PREVIEW_WARNING: this package is a local preview build; it is never installed by this tooling."
-    if (-not $webuiIncluded) {
-        Write-Host "MODULE_PREVIEW_WARNING: webroot/assets/module-settings.js|css are missing; the packaged UI assets are incomplete."
+    if (-not $Release) {
+        Write-Host "MODULE_PREVIEW_WARNING: this package is a local preview build; it is never installed by this tooling."
+        if (-not $webuiIncluded) {
+            Write-Host "MODULE_PREVIEW_WARNING: webroot/assets/module-settings.js|css are missing; the packaged UI assets are incomplete."
+        }
+        if (-not $releaseIncluded) {
+            Write-Host "MODULE_PREVIEW_WARNING: no release.json supplied; the daemon starts in recovery-only mode."
+        }
     }
-    if (-not $releaseIncluded) {
-        Write-Host "MODULE_PREVIEW_WARNING: no release.json supplied; the daemon starts in recovery-only mode."
-    }
-    Write-Output ("MODULE_ZIP_OK path=" + $zipPath + " sha256=" + $zipHash + " entries=" + $staged.Count + " version=" + $Version + " versionCode=" + $VersionCode + " preview=true")
+    $previewFlagText = if ($Release) { "false" } else { "true" }
+    Write-Output ("MODULE_ZIP_OK path=" + $zipPath + " sha256=" + $zipHash + " entries=" + $staged.Count + " version=" + $Version + " versionCode=" + $VersionCode + " preview=" + $previewFlagText)
 } finally {
     if (Test-Path -LiteralPath $stagingBase) {
         $tempBase = [System.IO.Path]::GetTempPath()

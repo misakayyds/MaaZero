@@ -163,7 +163,15 @@ else
     log "1. 跳过 maa-cli 自更新；如需执行请设置 MAA_SELF_UPDATE=1"
 fi
 
-# 2. 自动更新 MaaCore 及资源
+# 2. 自动安装（首次运行无 MaaCore 时）并更新 MaaCore 及资源
+if [[ ! -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
+    if run_with_timeout "2a. 首次运行未检测到 libMaaCore.so，正在自动初始化安装 MaaCore 与资源..." timeout -k 30s "$UPDATE_TIMEOUT" maa install --batch; then
+        log "✅ 首次 MaaCore 与资源安装完成"
+    else
+        log "⚠️ maa install 执行未完全成功，继续尝试更新与同步流程"
+    fi
+fi
+
 resource_updated=0
 for attempt in $(seq 1 "$UPDATE_RETRIES"); do
     if run_with_timeout "2. 正在检查并更新 MaaCore 与资源 (channel=$MAA_CORE_CHANNEL, attempt=$attempt/$UPDATE_RETRIES)..." timeout -k 30s "$UPDATE_TIMEOUT" maa update "$MAA_CORE_CHANNEL" --batch --test-time "$MAA_UPDATE_TEST_TIME"; then

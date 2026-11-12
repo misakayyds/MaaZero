@@ -10,6 +10,18 @@
 > 模型或会话 ID 如确有必要,写在正文里,不要放标题。
 <!-- /agent-kit:progress-format:v2 -->
 
+## 2026-11-12 09:18 +0800 — Antigravity / Windows
+- 完成: 完成 **MaaZero `v0.1.0`** 正式首发签名、纯净 `debian-rootfs-12.11.0-arm64.tar.gz` 构建、新设备首次自动拉取与部署运行时及 `MaaCore` 自举闭环、正式模块包 `MaaZero-v0.1.0.zip` 打包、GitHub Pages 自动验签部署工作流与正式 `README.md` / `docs/user-guide.md` / `docs/release-checklist.md` 编写，全仓单元、打包与 221 项 E2E 回归 100% 通过。
+- 改动:
+  - 空设备首装与自举闭环：`manager/internal/store/layout.go` 新增 `Store.Root()`，`manager/internal/control/control.go` 新增 `ensureRuntimeRootfs`（当通道清单包含 `required` 的 `runtime` 组件且本地 `runtime/rootfs` 尚未创建时，先下载并经 `install.StageRootfs` 原子解包部署再安装激活业务脚本包，不影响已有挂载环境）；`packaging/project/source/{maa-auto-update.sh,maa-run.sh}` 在首次未检测到 `libMaaCore.so` 时自动执行 `maa install --batch` 完成初始化。
+  - 签名与正式打包工具链：新增 `manager/cmd/maa-release-sign/main.go` 与 `packaging/sign-manifests.py`（拒绝仓库内私钥路径，在仓库外生成并收紧 ACL 的 Ed25519 私钥种子，签发 `stable.json.sig` / `beta.json.sig` 与公开 `release.json`，支持 `--verify-only --verify-artifacts` 全组件解包验签）；`packaging/build-module.ps1` 新增 `-Release` 正式构建模式（保留默认预览门禁兼容全部既有测试，正式模式强制要求 `-ReleaseConfig` 并输出 `MaaZero-v0.1.0.zip`）；更新 `packaging/{generate-manifests.py,package-project-archive.py}` 默认指向 `misakayyds/MaaZero` 与 `0.1.0`；新增 `.github/workflows/pages.yml` 与 `LICENSE`。
+  - 纯净产物与正式文档：构建纯净无个人数据的 Debian Bookworm ARM64 运行时归档 `dist/debian-rootfs-12.11.0-arm64.tar.gz`（预置上游 `maa-cli v0.7.8` 与 `MaaCore` 依赖库），连同 `dist/maa-managerd`、`dist/maa-phone-project-0.1.0.tar.gz` 写入真实大小与 SHA-256 并完成 Ed25519 签名，打包生成 `dist/MaaZero-v0.1.0.zip` 与 `dist/SHA256SUMS.txt`；重写正式 `README.md`、`docs/user-guide.md`、`docs/release-checklist.md` 与 `manifest/channels/README.md`；修复 `manager/internal/control/control_test.go` 在 Windows Defender 实时扫描下的 `TempDir` 清理偶发句柄竞态。
+- 验证:
+  - 签名与产物级校验：`python -B packaging/sign-manifests.py --verify-only --verify-artifacts` 通过（`stable` / `beta` Ed25519 验签通过，`StageBinary`、`Stage`、`StageRootfs` 7596 文件 / 1115 目录 / 1071 符号链接全部通过）。
+  - 全量测试套件：`go vet ./...` 与 `go test ./... -count=1`（全部包通过，含新增 `TestFirstInstallStagesRequiredRuntimeRootfsBeforeProject` 与 `TestPublishedChannelSignaturesVerifyAgainstReleasePublicKey`）、`python -B -m unittest discover -s packaging/tests -v`（16/16）、`python -B packaging/rootfs/test_recipe.py`（12/12）、`node --test webui/tests/module-settings.test.mjs`（24/24）、4 套 PowerShell 测试（150 + 65 + 83 + 12 项）及 `python -B tests/e2e/runner.py`（221/221 项全绿，0 CR 字节、0 BOM、0 密钥泄漏）。
+- 风险: 远端 GitHub 仓库 `misakayyds/MaaZero` 尚未创建/推送（遵照协作规范未自动提交或推送），在将 `manifest/channels/*` 发布到 GitHub Pages 并上传 `v0.1.0` 与 `rootfs-12.11.0` Releases 之前，新设备在线拉取地址暂未生效；请务必妥善离线备份本机仓库外私钥 `~/.ssh/maa_phone_manager_release_ed25519`。
+- 下一步: 确认无误后执行 Git 提交，创建远端 `misakayyds/MaaZero` 仓库开启 GitHub Pages（GitHub Actions 源），并按 `docs/release-checklist.md` 上传 `rootfs-12.11.0` 与 `v0.1.0` Release 产物。
+
 ## 2026-11-12 07:33 +0800 — Antigravity / Windows
 - 完成: 在 ARM64 Android 16（KernelSU）真机上完成 `MAA Phone Manager` 模块刷入、整机冷启动自愈验证、`maa-cli` / `MaaCore` / `MaaResource` 初始化、通过 `:8088` 受控代理将明日方舟官服包从 `2.7.71` 在线更新至 `2.7.91` 并完成游戏内热更新资源加载，以及 `maa-run.sh --startup-health-check --stop-at-login` 冷启动拉起游戏、点击 `START` 进入登录界面即安全停靠（未尝试登录）；测试后清理真机临时文件与端口转发并保留运行环境在线，仓库全量单元、打包与 Tier 1–5 E2E 回归 100% 通过。
 - 改动:

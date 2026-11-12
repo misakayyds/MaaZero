@@ -3,6 +3,7 @@ package manifest
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -50,8 +51,14 @@ func TestGeneratedChannelManifestsMatchVerifier(t *testing.T) {
 	paths := []string{
 		filepath.Join("..", "..", "..", "manifest", "channels", "stable.json"),
 		filepath.Join("..", "..", "..", "manifest", "channels", "beta.json"),
+	}
+	for _, distCandidate := range []string{
 		filepath.Join("..", "..", "..", "dist", "channels", "stable.json"),
 		filepath.Join("..", "..", "..", "dist", "channels", "beta.json"),
+	} {
+		if _, err := os.Stat(distCandidate); err == nil {
+			paths = append(paths, distCandidate)
+		}
 	}
 	for _, manifestPath := range paths {
 		payload, err := os.ReadFile(manifestPath)
@@ -71,11 +78,53 @@ func TestGeneratedChannelManifestsMatchVerifier(t *testing.T) {
 		if strings.HasSuffix(manifestPath, "beta.json") {
 			expectedChannel = "beta"
 		}
-		if manifest.Sequence != 1 || manifest.Channel != expectedChannel {
+		if manifest.Sequence < 1 || manifest.Channel != expectedChannel {
 			t.Fatalf("manifest at %s identity mismatch: sequence %d channel %q", manifestPath, manifest.Sequence, manifest.Channel)
 		}
 		if len(manifest.Components) != 3 {
 			t.Fatalf("manifest at %s component count = %d, want 3", manifestPath, len(manifest.Components))
+		}
+	}
+}
+
+func TestPublishedChannelSignaturesVerifyAgainstReleasePublicKey(t *testing.T) {
+	releasePath := filepath.Join("..", "..", "..", "manifest", "release.json")
+	rawCfg, err := os.ReadFile(releasePath)
+	if os.IsNotExist(err) {
+		t.Skip("manifest/release.json not yet generated")
+	}
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", releasePath, err)
+	}
+	var cfg struct {
+		ManifestURL string `json:"manifest_url"`
+		PublicKey   string `json:"public_key"`
+		Channel     string `json:"channel"`
+	}
+	if err := json.Unmarshal(rawCfg, &cfg); err != nil {
+		t.Fatalf("Unmarshal(%s) error = %v", releasePath, err)
+	}
+	pub, err := base64.StdEncoding.DecodeString(cfg.PublicKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		t.Fatalf("invalid public_key in %s", releasePath)
+	}
+	for _, ch := range []string{"stable", "beta"} {
+		jsonPath := filepath.Join("..", "..", "..", "manifest", "channels", ch+".json")
+		sigPath := jsonPath + ".sig"
+		payload, err := os.ReadFile(jsonPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", jsonPath, err)
+		}
+		sig, err := os.ReadFile(sigPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", sigPath, err)
+		}
+		m, err := LoadAndVerify(payload, sig, pub)
+		if err != nil {
+			t.Fatalf("published signature verification failed for %s: %v", jsonPath, err)
+		}
+		if m.Channel != ch {
+			t.Fatalf("channel = %q, want %q", m.Channel, ch)
 		}
 	}
 }
