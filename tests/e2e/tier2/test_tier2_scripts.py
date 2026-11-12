@@ -121,6 +121,18 @@ class Tier2ScriptsTest(E2ETestCase):
         self.assertEqual(res.returncode, 2)
         self.assertIn("Unknown MAA_SCREENCAP_MODE", res.stdout + res.stderr)
 
+    def test_f02_t2_06_missing_libmaacore_and_cli_toml_channel_alignment(self) -> None:
+        """TC-F02-B06: Verify auto-update aligns channel with cli.toml and gates success on libMaaCore.so."""
+        for script_name in ("maa-auto-update.sh", "maa-run.sh"):
+            content = (self.source_dir / script_name).read_text(encoding="utf-8")
+            self.assertIn("resolve_core_channel", content, f"{script_name} must resolve channel from cli.toml")
+            self.assertIn('${detected:-stable}', content, f"{script_name} must default to stable matching seed.go")
+            self.assertIn('"$MAA_DATA_DIR/lib/libMaaCore.so"', content, f"{script_name} must check libMaaCore.so")
+            self.assertIn('-s "$RESOURCE_DIR/version.json"', content, f"{script_name} must skip redundant maa update when bundled resource is present")
+
+        update_sh = (self.source_dir / "maa-auto-update.sh").read_text(encoding="utf-8")
+        self.assertIn('if [[ "$resource_updated" -eq 1 && -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then', update_sh)
+
     # ========================================================================
     # Feature 4: 周计划调度 (Weekly Schedule Boundary Cases)
     # ========================================================================
@@ -477,6 +489,24 @@ class Tier2ScriptsTest(E2ETestCase):
         for sh_file in (self.repo_root / "module").glob("**/*.sh"):
             content = sh_file.read_text(encoding="utf-8", errors="replace")
             self.assertNotIn("pkill -f", content, f"Forbidden pkill -f found in {sh_file.name}")
+
+    def test_f09_t2_06_timeout_foreground_and_session_kill_protection(self) -> None:
+        """TC-F09-B06: Verify all shell timeout commands use --foreground and WebUI reaps session members."""
+        bare_timeout = re.compile(r"(?:^|[;&|(\s!])timeout\s+(?!--foreground\b)")
+        for sh_file in self.source_dir.glob("*.sh"):
+            for lineno, line in enumerate(sh_file.read_text(encoding="utf-8").splitlines(), start=1):
+                stripped = line.strip()
+                if stripped.startswith("#") or "urllib.request.urlopen" in line or "runner_outcome=" in line or '"124":' in line or "timeout when reading" in line:
+                    continue
+                self.assertIsNone(
+                    bare_timeout.search(line),
+                    f"{sh_file.name}:{lineno} invokes timeout without --foreground: {line}",
+                )
+
+        webui_py = (self.source_dir / "maa-webui.py").read_text(encoding="utf-8")
+        self.assertIn("def _is_zombie_pid(", webui_py)
+        self.assertIn("def kill_bg_session(", webui_py)
+        self.assertIn("os.getsid(", webui_py)
 
     # ========================================================================
     # Feature 10: 宿主硬件解耦与 nsenter 消除 (Hardware Decoupling Boundary Cases)

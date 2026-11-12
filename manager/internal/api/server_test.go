@@ -439,3 +439,36 @@ func TestInjectableRejectsNonPagesAndOversizedBodies(t *testing.T) {
 		t.Error("response without a request must not be injected")
 	}
 }
+
+func TestRecoveryPageIncludesCheckApplyAndRollbackControls(t *testing.T) {
+	s, _ := fixture(t)
+	c := exchange(t, s)
+	r := httptest.NewRequest("GET", "http://127.0.0.1:8088/", nil)
+	r.AddCookie(c)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("recovery status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	for _, required := range []string{
+		"MAA 模块恢复",
+		`id="check"`,
+		`id="apply"`,
+		`id="rollback"`,
+		`/api/v1/update/check`,
+		`/api/v1/update/apply`,
+		`/api/v1/rollback`,
+		`'X-MAA-Request':'1'`,
+		`confirm:true`,
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("recoveryHTML missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"<input", "<textarea", "<form"} {
+		if strings.Contains(strings.ToLower(body), forbidden) {
+			t.Fatalf("recoveryHTML must not expose %q", forbidden)
+		}
+	}
+}

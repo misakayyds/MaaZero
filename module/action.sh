@@ -12,13 +12,19 @@ case "$MODDIR" in
   *) MODDIR="$(pwd)" ;;
 esac
 
+BRAND="MAA Phone Manager"
+if [ -f "$MODDIR/README.md" ] && [ ! -f "$MODDIR/README-preview.md" ]; then
+  BRAND="$(sed -n 's/^name=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)"
+  [ -n "$BRAND" ] || BRAND="MaaZero"
+fi
+
 BIN="$MODDIR/bin/maa-managerd"
 
 if [ ! -x "$BIN" ]; then
-  echo "MAA Phone Manager: $BIN 不存在，无法打开管理页面"
+  echo "$BRAND: $BIN 不存在，无法打开管理页面"
   exit 0
 fi
 
 nohup "$BIN" open-ui --data-root "$DATA_ROOT" > /dev/null 2>&1 < /dev/null &
-echo "MAA Phone Manager: 正在打开管理页面 127.0.0.1:8088"
+echo "$BRAND: 正在打开管理页面 127.0.0.1:8088"
 exit 0

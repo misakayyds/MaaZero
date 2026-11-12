@@ -6,10 +6,19 @@
 MIN_API=30
 REQUIRED_ARCH=arm64
 
-ui_print "*******************************"
-ui_print " MAA Phone Manager 本地预览"
-ui_print " 只安装引导与救援程序，不含运行环境"
-ui_print "*******************************"
+if [ -f "$MODPATH/README.md" ] && [ ! -f "$MODPATH/README-preview.md" ]; then
+  BRAND="$(sed -n 's/^name=//p' "$MODPATH/module.prop" 2>/dev/null | head -n 1)"
+  [ -n "$BRAND" ] || BRAND="MaaZero"
+  ui_print "*******************************"
+  ui_print " $BRAND 独立沙箱引导模块"
+  ui_print " 只安装引导与救援程序，不含运行环境"
+  ui_print "*******************************"
+else
+  ui_print "*******************************"
+  ui_print " MAA Phone Manager 本地预览"
+  ui_print " 只安装引导与救援程序，不含运行环境"
+  ui_print "*******************************"
+fi
 
 if [ -z "$ARCH" ]; then
   ARCH="$(getprop ro.product.cpu.abi 2>/dev/null)"

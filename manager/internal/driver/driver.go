@@ -127,6 +127,9 @@ func (d *Driver) Activate(ctx context.Context, bundleDir string) error {
 
 	// 2. Perform mounts if not already mounted
 	if len(d.mountStack) == 0 {
+		// Reap any orphaned chroot processes left behind by a crashed daemon
+		// before attempting to unmount stale mounts.
+		reapChrootProcesses(ctx, d.cfg.RootfsPath)
 		// Clean any lingering stale mounts from previous runs/crashes
 		_ = cleanStaleMounts(d.mounter, d.cfg.RootfsPath)
 
@@ -168,12 +171,18 @@ func (d *Driver) Activate(ctx context.Context, bundleDir string) error {
 			d.mountStack = append(d.mountStack, e.Target)
 		}
 
-		// Configure DNS resolution inside rootfs
+		// Configure DNS resolution and shell profile inside rootfs
 		if err := setupDNS(d.cfg.RootfsPath); err != nil {
 			_ = unmountLIFO(d.mounter, d.mountStack)
 			d.mountStack = nil
 			d.activeDir = ""
 			return fmt.Errorf("setup dns: %w", err)
+		}
+		if err := normalizeRootfsProfile(d.cfg.RootfsPath); err != nil {
+			_ = unmountLIFO(d.mounter, d.mountStack)
+			d.mountStack = nil
+			d.activeDir = ""
+			return fmt.Errorf("normalize rootfs profile: %w", err)
 		}
 	} else if d.activeDir != bundleDir {
 		// Filesystems already mounted, update project bind mount to new release bundle

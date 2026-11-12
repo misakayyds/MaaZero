@@ -116,12 +116,16 @@ func New(cfg Config, s *store.Store, driver Driver) (*Controller, error) {
 	}
 	c := &Controller{cfg: cfg, store: s, driver: driver, reason: "尚未配置可信签名发布源"}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.client = &http.Client{Timeout: manifestTimeout, CheckRedirect: func(r *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return errors.New("too many redirects")
-		}
-		return validURL(r.URL.String())
-	}}
+	c.client = &http.Client{
+		Timeout:   manifestTimeout,
+		Transport: download.DefaultTransport(),
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			return validURL(r.URL.String())
+		},
+	}
 	if cfg.ManifestURL != "" || cfg.PublicKey != "" {
 		if err := validURL(cfg.ManifestURL); err != nil {
 			return nil, err

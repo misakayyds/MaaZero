@@ -195,6 +195,7 @@ func (s *linuxSupervisor) Stop(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
+	rootfsPath := s.cfg.RootfsPath
 	s.webuiRunning = false
 	s.cronRunning = false
 	s.webuiCmd = nil
@@ -205,5 +206,49 @@ func (s *linuxSupervisor) Stop(ctx context.Context) error {
 	s.cronPGID = 0
 	s.mu.Unlock()
 
+	reapChrootProcesses(ctx, rootfsPath)
+
 	return errors.Join(errs...)
+}
+
+// reapChrootProcesses terminates any lingering daemonized processes inside the
+// chroot rootfs (such as `adb fork-server`) that escaped their parent process
+// group via setsid/setpgid and would otherwise keep rootfs mounts busy.
+func reapChrootProcesses(ctx context.Context, rootfsPath string) {
+	selfPID := os.Getpid()
+	pids := findChrootPIDs("/proc", rootfsPath, selfPID, os.Readlink)
+	if len(pids) == 0 {
+		return
+	}
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(findChrootPIDs("/proc", rootfsPath, selfPID, os.Readlink)) == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			break
+		case <-time.After(50 * time.Millisecond):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	remaining := findChrootPIDs("/proc", rootfsPath, selfPID, os.Readlink)
+	if len(remaining) == 0 {
+		return
+	}
+	for _, pid := range remaining {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	killDeadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(killDeadline) {
+		if len(findChrootPIDs("/proc", rootfsPath, selfPID, os.Readlink)) == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

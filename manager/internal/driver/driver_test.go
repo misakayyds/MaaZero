@@ -468,3 +468,55 @@ func TestSupervisorReadinessProbe(t *testing.T) {
 		t.Fatal("expected probe to fail on timeout, but succeeded")
 	}
 }
+
+func TestFindChrootPIDsMatchesOnlyTargetRootfs(t *testing.T) {
+	procRoot := t.TempDir()
+	rootfs := filepath.Join(t.TempDir(), "runtime", "rootfs")
+	for _, name := range []string{"1", "100", "200", "300", "400", "self"} {
+		if err := os.MkdirAll(filepath.Join(procRoot, name), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links := map[string]string{
+		filepath.Join(procRoot, "1", "root"):   rootfs,                                  // PID 1 ignored
+		filepath.Join(procRoot, "100", "root"): "/",                                     // host process ignored
+		filepath.Join(procRoot, "200", "root"): rootfs,                                  // chroot process matched
+		filepath.Join(procRoot, "300", "root"): filepath.Join(rootfs, "nested"),         // nested chroot matched
+		filepath.Join(procRoot, "400", "root"): rootfs + "-other",                       // sibling prefix NOT matched
+	}
+	got := findChrootPIDs(procRoot, rootfs, 300, func(p string) (string, error) {
+		if v, ok := links[p]; ok {
+			return v, nil
+		}
+		return "", os.ErrNotExist
+	})
+	if len(got) != 1 || got[0] != 200 {
+		t.Fatalf("findChrootPIDs = %v, want [200]", got)
+	}
+	if unsafe := findChrootPIDs(procRoot, "/", 999, func(string) (string, error) { return "/", nil }); len(unsafe) != 0 {
+		t.Fatalf("root '/' must never match chroot PIDs, got %v", unsafe)
+	}
+}
+
+func TestNormalizeRootfsProfileRewritesIdLookup(t *testing.T) {
+	rootfs := t.TempDir()
+	etcDir := filepath.Join(rootfs, "etc")
+	if err := os.MkdirAll(etcDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	profilePath := filepath.Join(etcDir, "profile")
+	orig := "if [ \"$(id -u)\" -eq 0 ]; then\n  PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\nfi\n"
+	if err := os.WriteFile(profilePath, []byte(orig), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := normalizeRootfsProfile(rootfs); err != nil {
+		t.Fatalf("normalizeRootfsProfile failed: %v", err)
+	}
+	got, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "if [ \"$(/usr/bin/id -u)\" -eq 0 ]; then\n  PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\nfi\n" {
+		t.Fatalf("unexpected rewritten profile: %q", string(got))
+	}
+}

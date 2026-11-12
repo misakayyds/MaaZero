@@ -78,12 +78,15 @@ func (c Client) Fetch(ctx context.Context, a manifest.Artifact, destination stri
 		return err
 	}
 	defer f.Close()
-	client := http.Client{Timeout: 30 * time.Minute}
+	var client http.Client
 	if c.HTTP != nil {
 		client = *c.HTTP
-		if client.Timeout == 0 {
-			client.Timeout = 30 * time.Minute
-		}
+	}
+	if client.Timeout == 0 {
+		client.Timeout = 30 * time.Minute
+	}
+	if client.Transport == nil {
+		client.Transport = DefaultTransport()
 	}
 	previousRedirect := client.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {

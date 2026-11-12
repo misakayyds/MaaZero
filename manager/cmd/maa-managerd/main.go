@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -124,6 +125,10 @@ func run(args []string, out io.Writer) error {
 	if upstreamURL == "" {
 		upstreamURL = "http://127.0.0.1:8089"
 	}
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
 	drv, err := driver.New(driver.Config{
 		DataRoot:    *dataRoot,
 		RootfsPath:  rootfsPath,
@@ -133,17 +138,28 @@ func run(args []string, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("init driver: %w", err)
 	}
-	defer func() {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer stopCancel()
-		_ = drv.Stop(stopCtx)
-	}()
+	var (
+		backend      *control.Controller
+		shutdownOnce sync.Once
+		shutdownDone = make(chan struct{})
+	)
+	stopRuntime := func() {
+		shutdownOnce.Do(func() {
+			if backend != nil {
+				backend.Close()
+			}
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer stopCancel()
+			_ = drv.Stop(stopCtx)
+			close(shutdownDone)
+		})
+	}
+	defer stopRuntime()
 
-	backend, err := control.New(cfg, s, drv)
+	backend, err = control.New(cfg, s, drv)
 	if err != nil {
 		return err
 	}
-	defer backend.Close()
 	l, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -157,28 +173,44 @@ func run(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ipc, err := listenControl(*dataRoot, apiCfg.Host, handler, cancel)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	ipc, err := listenControl(*dataRoot, apiCfg.Host, handler, cancel, shutdownDone)
 	if err != nil {
 		return err
 	}
 	defer ipc.Close()
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	server := &http.Server{
+		Handler:           handler,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(l) }()
 	backend.StartBootstrap()
 	_, _ = fmt.Fprintln(out, "MAA manager preview started; authenticated local control only")
 	select {
 	case <-ctx.Done():
-		stopCtx, stop := context.WithTimeout(context.Background(), 20*time.Second)
+		stopCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stop()
 		err = server.Shutdown(stopCtx)
 		if err != nil {
 			_ = server.Close()
 		}
+		stopRuntime()
 		return err
 	case err := <-done:
+		stopRuntime()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -208,7 +240,26 @@ func createDataRoot(path string, stat func(string) (os.FileInfo, error)) error {
 	return nil
 }
 
-func listenControl(root, host string, handler *api.Server, stop context.CancelFunc) (net.Listener, error) {
+type controlListener struct {
+	net.Listener
+	wg sync.WaitGroup
+}
+
+func (c *controlListener) Close() error {
+	err := c.Listener.Close()
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
+	return err
+}
+
+func listenControl(root, host string, handler *api.Server, stop context.CancelFunc, shutdownDone <-chan struct{}) (net.Listener, error) {
 	path := filepath.Join(root, "control.sock")
 	if st, err := os.Lstat(path); err == nil {
 		if st.Mode()&os.ModeSocket == 0 {
@@ -228,12 +279,16 @@ func listenControl(root, host string, handler *api.Server, stop context.CancelFu
 		_ = l.Close()
 		return nil, err
 	}
+	cl := &controlListener{Listener: l}
+	cl.wg.Add(1)
 	go func() {
+		defer cl.wg.Done()
 		for {
 			conn, err := l.Accept()
 			if err != nil {
 				return
 			}
+			stopping := false
 			func() {
 				defer conn.Close()
 				_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
@@ -248,13 +303,24 @@ func listenControl(root, host string, handler *api.Server, stop context.CancelFu
 						_, _ = io.WriteString(conn, "http://"+host+"/#ticket="+ticket+"\n")
 					}
 				case "STOP":
-					_, _ = io.WriteString(conn, "OK\n")
+					stopping = true
+					_ = conn.SetDeadline(time.Now().Add(25 * time.Second))
 					stop()
+					if shutdownDone != nil {
+						select {
+						case <-shutdownDone:
+						case <-time.After(22 * time.Second):
+						}
+					}
+					_, _ = io.WriteString(conn, "OK\n")
 				}
 			}()
+			if stopping {
+				return
+			}
 		}
 	}()
-	return l, nil
+	return cl, nil
 }
 
 func command(root, action string) error {
@@ -263,11 +329,13 @@ func command(root, action string) error {
 		return errors.New("manager unavailable; open the module recovery instructions")
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	deadline := 5 * time.Second
 	verb := "OPEN\n"
 	if action == "stop" {
+		deadline = 30 * time.Second
 		verb = "STOP\n"
 	}
+	_ = conn.SetDeadline(time.Now().Add(deadline))
 	if _, err := io.WriteString(conn, verb); err != nil {
 		return err
 	}

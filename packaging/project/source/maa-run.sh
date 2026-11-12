@@ -219,7 +219,7 @@ MAX_RETRIES=3
 RETRY_DELAY=30
 UPDATE_RETRIES=2
 UPDATE_RETRY_DELAY=20
-UPDATE_TIMEOUT="15m"
+UPDATE_TIMEOUT="${MAA_UPDATE_TIMEOUT:-30m}"
 TASK_TIMEOUT="150m"
 CLOSING_SCAN_TIMEOUT="20m"
 LONG_RUN_ALERT_AFTER=3600
@@ -247,8 +247,34 @@ export MAA_STARTUP_STOP_AT_LOGIN="$STOP_AT_LOGIN"
 export MAA_KEEP_GAME_ON_EXIT="$KEEP_GAME_ON_EXIT"
 INFRAST_LEDGER_FILE="${MAA_INFRAST_LEDGER_FILE:-$MAA_STATE_DIR/infrast-schedule-ledger.json}"
 ACTIVITY_STAGE_FILE="${MAA_ACTIVITY_STAGE_FILE:-$MAA_CACHE_DIR/StageActivityV2.json}"
+resolve_core_channel() {
+    if [[ -n "${MAA_CORE_CHANNEL:-}" ]]; then
+        printf '%s' "$MAA_CORE_CHANNEL"
+        return 0
+    fi
+    local detected=""
+    if [[ -f "$MAA_CONFIG_DIR/cli.toml" ]]; then
+        detected=$(python3 - "$MAA_CONFIG_DIR/cli.toml" 2>/dev/null <<'PY' || true
+import pathlib
+import sys
+import tomllib
+
+p = pathlib.Path(sys.argv[1])
+try:
+    data = tomllib.loads(p.read_text("utf-8"))
+    ch = str(data.get("core", {}).get("channel", "")).strip().lower()
+    if ch in {"stable", "beta", "alpha"}:
+        print(ch)
+except Exception:
+    pass
+PY
+        )
+    fi
+    printf '%s' "${detected:-stable}"
+}
+
 MEDICINE_PLAN_SCRIPT="${MAA_MEDICINE_PLAN_SCRIPT:-$MAA_HOME/maa_medicine_service.py}"
-MAA_CORE_CHANNEL="${MAA_CORE_CHANNEL:-beta}"
+MAA_CORE_CHANNEL="$(resolve_core_channel)"
 MAA_UPDATE_TEST_TIME="${MAA_UPDATE_TEST_TIME:-0}"
 ASST_LOG_DIR="${MAA_ASST_LOG_DIR:-$MAA_STATE_DIR/debug}"
 MAA_RESOLUTION="1080x1920"
@@ -887,19 +913,19 @@ startup_overlay_watchdog_loop() {
 
     info "启动系统遮挡 watcher: $label"
     while true; do
-        resumed=$(timeout 8s adb $ADB_DEVICE shell dumpsys activity activities 2>/dev/null \
+        resumed=$(timeout --foreground 8s adb $ADB_DEVICE shell dumpsys activity activities 2>/dev/null \
             | grep -E 'mResumedActivity|topResumedActivity|ResumedActivity' \
             | head -n 8 || true)
 
         if printf '%s\n' "$resumed" | grep -q "$AK_PACKAGE"; then
-            focus=$(timeout 8s adb $ADB_DEVICE shell dumpsys window windows 2>/dev/null \
+            focus=$(timeout --foreground 8s adb $ADB_DEVICE shell dumpsys window windows 2>/dev/null \
                 | grep -E 'mCurrentFocus|mFocusedApp|mInputMethodTarget' \
                 | head -n 12 || true)
 
             if printf '%s\n' "$focus" | grep -q 'com.android.systemui'; then
                 dismiss_count=$((dismiss_count + 1))
                 warn "检测到系统弹窗遮挡 StartUp，尝试关闭: label=$label count=$dismiss_count focus=$(printf '%s' "$focus" | tr '\r\n' ' ' | cut -c1-260)"
-                timeout 4s adb $ADB_DEVICE shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+                timeout --foreground 4s adb $ADB_DEVICE shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
                 sleep 3
                 continue
             fi
@@ -974,11 +1000,11 @@ now_ms() {
 }
 
 probe_raw_screencap_size() {
-    timeout 8s adb $ADB_DEVICE exec-out screencap 2>/dev/null | wc -c 2>/dev/null | tr -d ' '
+    timeout --foreground 8s adb $ADB_DEVICE exec-out screencap 2>/dev/null | wc -c 2>/dev/null | tr -d ' '
 }
 
 probe_raw_screencap_header() {
-    timeout 8s adb $ADB_DEVICE exec-out screencap 2>/dev/null |
+    timeout --foreground 8s adb $ADB_DEVICE exec-out screencap 2>/dev/null |
         python3 -c 'import sys; data = sys.stdin.buffer.read(); sys.exit(1) if len(data) < 8 else print(int.from_bytes(data[0:4], "little"), int.from_bytes(data[4:8], "little"))' 2>/dev/null
 }
 
@@ -1012,7 +1038,7 @@ raw_header_matches_maa_resolution() {
 }
 
 arknights_activity_resumed() {
-    timeout 8s adb $ADB_DEVICE shell dumpsys activity activities 2>/dev/null \
+    timeout --foreground 8s adb $ADB_DEVICE shell dumpsys activity activities 2>/dev/null \
         | grep -E 'mResumedActivity|topResumedActivity|ResumedActivity' \
         | grep -q "$AK_PACKAGE"
 }
@@ -1105,19 +1131,19 @@ runtime_memory_pressure_is_high() {
 
 bench_raw_with_gzip_once() {
     local out_file="$1"
-    timeout 12s bash -c "adb $ADB_DEVICE exec-out 'screencap 2>/dev/null | gzip -1' | gzip -dc > '$out_file'" >/dev/null 2>&1
+    timeout --foreground 12s bash -c "adb $ADB_DEVICE exec-out 'screencap 2>/dev/null | gzip -1' | gzip -dc > '$out_file'" >/dev/null 2>&1
 }
 
 bench_encode_once() {
     local out_file="$1"
-    timeout 12s adb $ADB_DEVICE exec-out "screencap -p 2>/dev/null" > "$out_file" 2>/dev/null
+    timeout --foreground 12s adb $ADB_DEVICE exec-out "screencap -p 2>/dev/null" > "$out_file" 2>/dev/null
 }
 
 bench_raw_by_nc_once() {
     local out_file="$1"
     local port="$2"
     rm -f "$out_file"
-    timeout 10s python3 - "$port" "$out_file" <<'PY' &
+    timeout --foreground 10s python3 - "$port" "$out_file" <<'PY' &
 import socket
 import sys
 
@@ -1137,7 +1163,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
 PY
     local server_pid=$!
     sleep 0.2
-    timeout 8s adb $ADB_DEVICE exec-out "screencap 2>/dev/null | nc -w 3 127.0.0.1 $port" >/dev/null 2>&1
+    timeout --foreground 8s adb $ADB_DEVICE exec-out "screencap 2>/dev/null | nc -w 3 127.0.0.1 $port" >/dev/null 2>&1
     local cmd_ec=$?
     wait "$server_pid" 2>/dev/null || true
     return "$cmd_ec"
@@ -1472,7 +1498,7 @@ capture_task_startup_failure_state() {
     STARTUP_HEALTH_SCREENSHOT="$screen_file"
     STARTUP_HEALTH_LOGCAT_FILE="$logcat_file"
 
-    timeout 15s adb $ADB_DEVICE exec-out screencap -p > "$screen_file" 2>/dev/null || true
+    timeout --foreground 15s adb $ADB_DEVICE exec-out screencap -p > "$screen_file" 2>/dev/null || true
 
     started_for_logcat="$TASK_STARTED_AT"
     if [[ ! "$started_for_logcat" =~ ^[0-9]+$ || "$started_for_logcat" -le 0 ]]; then
@@ -1480,11 +1506,11 @@ capture_task_startup_failure_state() {
     fi
     logcat_since=$(date -d "@$(( started_for_logcat > 120 ? started_for_logcat - 120 : started_for_logcat ))" '+%m-%d %H:%M:%S.000' 2>/dev/null || true)
     if [[ -n "$logcat_since" ]]; then
-        timeout 25s adb $ADB_DEVICE logcat -d -T "$logcat_since" 2>/dev/null \
+        timeout --foreground 25s adb $ADB_DEVICE logcat -d -T "$logcat_since" 2>/dev/null \
             | grep -Ei 'hypergryph|arknights|Unity|GP7|ace\.gshell|AndroidRuntime|FATAL|ANR|crash|tombstone|lowmemorykiller|ActivityManager|ActivityTaskManager|InputDispatcher|Network|OkHttp|SSL|DNS|RefClass|InvocationTargetException|oiface|fps|chromium|MaaTouch|fingerprint|systemui|USB|仅充电|传输文件' \
             | tail -n 2000 > "$logcat_file" 2>/dev/null || true
     else
-        timeout 25s adb $ADB_DEVICE logcat -d 2>/dev/null \
+        timeout --foreground 25s adb $ADB_DEVICE logcat -d 2>/dev/null \
             | grep -Ei 'hypergryph|arknights|Unity|GP7|ace\.gshell|AndroidRuntime|FATAL|ANR|crash|tombstone|lowmemorykiller|ActivityManager|ActivityTaskManager|InputDispatcher|Network|OkHttp|SSL|DNS|RefClass|InvocationTargetException|oiface|fps|chromium|MaaTouch|fingerprint|systemui|USB|仅充电|传输文件' \
             | tail -n 2000 > "$logcat_file" 2>/dev/null || true
     fi
@@ -1512,7 +1538,7 @@ prepare_run_session() {
     original_config="$(maa dir config)" || return 1
     session_parent=$(mktemp -d /tmp/maa-run-session.XXXXXXXX) || return 1
     # Keep the tiny per-run evidence until reboot; never copy the general cache.
-    if ! timeout -k 5s 150s python3 "$RUN_SESSION_SCRIPT" prepare \
+    if ! timeout --foreground -k 5s 150s python3 "$RUN_SESSION_SCRIPT" prepare \
         --session "$session_parent/snapshot" --config-dir "$original_config" 2>&1 | tee -a "$LOG_FILE"; then
         error "RUN_SESSION: 热更新未完成，尚未开始游戏任务"
         return 1
@@ -1583,13 +1609,13 @@ run_startup_health_check() {
     write_startup_health_state "running" "STARTUP_RUNNING" "unknown" "maa startup-only task running"
 
     start_startup_overlay_watchdog "startup-health"
-    timeout -k 10s "$STARTUP_HEALTH_TIMEOUT" env MAA_LOG=debug python3 "$RUN_SESSION_SCRIPT" exec \
+    timeout --foreground -k 10s "$STARTUP_HEALTH_TIMEOUT" env MAA_LOG=debug python3 "$RUN_SESSION_SCRIPT" exec \
         --session "$MAA_RUN_SESSION" --config-dir "$test_dir" -- run startup_only --batch --no-summary > "$health_log" 2>&1
     ec=$?
     stop_startup_overlay_watchdog
 
-    timeout 15s adb $ADB_DEVICE exec-out screencap -p > "$health_png" 2>/dev/null || true
-    timeout 25s adb $ADB_DEVICE logcat -d -T "$logcat_since" 2>/dev/null \
+    timeout --foreground 15s adb $ADB_DEVICE exec-out screencap -p > "$health_png" 2>/dev/null || true
+    timeout --foreground 25s adb $ADB_DEVICE logcat -d -T "$logcat_since" 2>/dev/null \
         | grep -Ei 'hypergryph|arknights|Unity|GP7|ace\.gshell|RefClass|InvocationTargetException|AndroidRuntime|FATAL|ANR|crash|tombstone|oiface|fps|chromium|MaaTouch|ActivityManager|ActivityTaskManager' \
         | tail -n 1500 > "$health_logcat" 2>/dev/null || true
 
@@ -1824,7 +1850,7 @@ run_closing_scan() {
         return 0
     fi
     info "收尾扫描: 刷新干员与库存快照（每轮一次，失败不重跑）"
-    timeout -k 30s "$CLOSING_SCAN_TIMEOUT" python3 "$CULTIVATION_RUN_SCRIPT" --mode closing-scan \
+    timeout --foreground -k 30s "$CLOSING_SCAN_TIMEOUT" python3 "$CULTIVATION_RUN_SCRIPT" --mode closing-scan \
         --task-file "$task_file" --config-dir "$config_dir" >> "$LOG_FILE" 2>&1 || true
     return 0
 }
@@ -1989,10 +2015,10 @@ run_maa_task() {
                 cultivation_task_file="$cultivation_config_dir/tasks/${task}.toml"
             fi
             info "CULTIVATION_RUN: 培养目标已启用，本轮由培养运行编排接管 task=${task} 文件=${cultivation_task_file}（失败不自动重跑）"
-            timeout -k 30s "$TASK_TIMEOUT" python3 "$CULTIVATION_RUN_SCRIPT" --mode execute \
+            timeout --foreground -k 30s "$TASK_TIMEOUT" python3 "$CULTIVATION_RUN_SCRIPT" --mode execute \
                 --task-file "$cultivation_task_file" --config-dir "$cultivation_config_dir" > "$fifo" 2>&1 &
         else
-            timeout -k 30s "$TASK_TIMEOUT" python3 "$RUN_SESSION_SCRIPT" exec \
+            timeout --foreground -k 30s "$TASK_TIMEOUT" python3 "$RUN_SESSION_SCRIPT" exec \
                 --session "$MAA_RUN_SESSION" --config-dir "$(maa dir config)" \
                 -- run "$EFFECTIVE_TASK_NAME" --batch > "$fifo" 2>&1 &
         fi
@@ -2381,7 +2407,7 @@ update_resource_from_tarball() {
     rm -rf "$work_dir" "$tarball"
     mkdir -p "$work_dir"
 
-    if ! timeout -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" "$RESOURCE_TARBALL_URL" 2>&1 | tee -a "$LOG_FILE"; then
+    if ! timeout --foreground -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" "$RESOURCE_TARBALL_URL" 2>&1 | tee -a "$LOG_FILE"; then
         rm -rf "$work_dir" "$tarball"
         return 1
     fi
@@ -2414,10 +2440,29 @@ update_resource_from_tarball() {
 
 update_resources_before_run() {
     local attempt=0
+    local fresh_core_installed=0
 
     if [[ ! -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
-        info "首次运行未检测到 libMaaCore.so，正在自动初始化安装 MaaCore 与资源..."
-        timeout -k 30s "$UPDATE_TIMEOUT" maa install --batch 2>&1 | tee -a "$LOG_FILE" || warn "maa install 未完全成功，继续尝试 maa update..."
+        info "首次运行未检测到 libMaaCore.so，正在自动初始化安装 MaaCore 与资源 (channel=$MAA_CORE_CHANNEL)..."
+        if timeout --foreground -k 30s "$UPDATE_TIMEOUT" maa install --batch 2>&1 | tr '\r' '\n' | tee -a "$LOG_FILE"; then
+            if [[ -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
+                fresh_core_installed=1
+            fi
+        else
+            warn "maa install 未完全成功，继续尝试 maa update..."
+        fi
+    fi
+
+    local cli_toml_channel
+    cli_toml_channel="$(MAA_CORE_CHANNEL="" resolve_core_channel)"
+    if [[ "$fresh_core_installed" -eq 1 && "${MAA_CORE_CHANNEL,,}" == "${cli_toml_channel,,}" && ( -d "$RESOURCE_CLONE_DIR" || -s "$RESOURCE_DIR/version.json" ) ]]; then
+        if sync_resource_from_clone; then
+            date '+%Y-%m-%d %H:%M:%S' > "$UPDATE_MARKER"
+            info "首次 MaaCore 与资源初始化完成"
+            log_resource_versions
+            apply_resource_patch
+            return 0
+        fi
     fi
 
     while (( attempt < UPDATE_RETRIES )); do
@@ -2426,13 +2471,17 @@ update_resources_before_run() {
         info "运行前更新 MaaCore 与资源 (channel=$MAA_CORE_CHANNEL, 尝试 $attempt/$UPDATE_RETRIES)"
         info "======================================="
 
-        timeout -k 30s "$UPDATE_TIMEOUT" maa update "$MAA_CORE_CHANNEL" --batch --test-time "$MAA_UPDATE_TEST_TIME" 2>&1 | tee -a "$LOG_FILE"
+        timeout --foreground -k 30s "$UPDATE_TIMEOUT" maa update "$MAA_CORE_CHANNEL" --batch --test-time "$MAA_UPDATE_TEST_TIME" 2>&1 | tr '\r' '\n' | tee -a "$LOG_FILE"
         local ec=${PIPESTATUS[0]}
 
         if [[ "$ec" -eq 0 ]]; then
             if ! sync_resource_from_clone; then
                 warn "MaaResource clone 同步失败 attempt=$attempt/$UPDATE_RETRIES"
                 continue
+            fi
+            if [[ ! -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
+                error "MaaResource 已同步，但未检测到核心库 $MAA_DATA_DIR/lib/libMaaCore.so"
+                return 1
             fi
             date '+%Y-%m-%d %H:%M:%S' > "$UPDATE_MARKER"
             info "MaaCore 与资源更新完成"
@@ -2443,6 +2492,10 @@ update_resources_before_run() {
 
         warn "MaaCore 与资源更新失败 exit=$ec attempt=$attempt/$UPDATE_RETRIES"
         if update_resource_from_tarball; then
+            if [[ ! -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
+                error "MaaResource tarball 已同步，但未检测到核心库 $MAA_DATA_DIR/lib/libMaaCore.so；无法在缺少 MaaCore 时运行任务"
+                return 1
+            fi
             date '+%Y-%m-%d %H:%M:%S' > "$UPDATE_MARKER"
             info "MaaResource tarball 更新完成"
             log_resource_versions
@@ -2528,7 +2581,7 @@ collect_failure_snapshot() {
     tail -n 5000 "$ASST_LOG_DIR/asst.log" > "$dir/asst-tail.log" 2>/dev/null || true
     tail -n 2000 "$ASST_LOG_DIR/asst.bak.log" > "$dir/asst-bak-tail.log" 2>/dev/null || true
 
-    timeout 15s adb $ADB_DEVICE exec-out screencap -p > "$dir/current-screen.png" 2>/dev/null || true
+    timeout --foreground 15s adb $ADB_DEVICE exec-out screencap -p > "$dir/current-screen.png" 2>/dev/null || true
     if [[ -d "$ASST_LOG_DIR/interface" ]]; then
         find "$ASST_LOG_DIR/interface" -maxdepth 1 -type f -name '*.png' -printf '%T@ %p\n' 2>/dev/null \
             | sort -rn \
@@ -2584,8 +2637,8 @@ collect_failure_snapshot() {
         adb $ADB_DEVICE shell df -h /data /sdcard 2>/dev/null || true
         echo "=== android network ==="
         adb $ADB_DEVICE shell settings get global http_proxy 2>/dev/null || true
-        timeout 8s adb $ADB_DEVICE shell ping -c 1 -W 2 ak.hypergryph.com 2>/dev/null || true
-        timeout 12s adb $ADB_DEVICE shell curl -I --max-time 8 https://ak.hypergryph.com/downloads/android_lastest 2>/dev/null | head -n 40 || true
+        timeout --foreground 8s adb $ADB_DEVICE shell ping -c 1 -W 2 ak.hypergryph.com 2>/dev/null || true
+        timeout --foreground 12s adb $ADB_DEVICE shell curl -I --max-time 8 https://ak.hypergryph.com/downloads/android_lastest 2>/dev/null | head -n 40 || true
     } > "$dir/android-state.txt" 2>&1 || true
 
     started_for_logcat="$TASK_STARTED_AT"
@@ -2594,11 +2647,11 @@ collect_failure_snapshot() {
     fi
     logcat_since=$(date -d "@$(( started_for_logcat > 120 ? started_for_logcat - 120 : started_for_logcat ))" '+%m-%d %H:%M:%S.000' 2>/dev/null || true)
     if [[ -n "$logcat_since" ]]; then
-        timeout 25s adb $ADB_DEVICE logcat -d -T "$logcat_since" 2>/dev/null \
+        timeout --foreground 25s adb $ADB_DEVICE logcat -d -T "$logcat_since" 2>/dev/null \
             | grep -Ei 'hypergryph|arknights|Unity|GP7|ace\.gshell|AndroidRuntime|FATAL|ANR|crash|tombstone|lowmemorykiller|ActivityManager|ActivityTaskManager|InputDispatcher|Network|OkHttp|SSL|DNS|RefClass|InvocationTargetException|oiface|fps|chromium|MaaTouch|fingerprint' \
             | tail -n 2000 > "$dir/logcat-filtered.log" 2>/dev/null || true
     else
-        timeout 25s adb $ADB_DEVICE logcat -d 2>/dev/null \
+        timeout --foreground 25s adb $ADB_DEVICE logcat -d 2>/dev/null \
             | grep -Ei 'hypergryph|arknights|Unity|GP7|ace\.gshell|AndroidRuntime|FATAL|ANR|crash|tombstone|lowmemorykiller|ActivityManager|ActivityTaskManager|InputDispatcher|Network|OkHttp|SSL|DNS|RefClass|InvocationTargetException|oiface|fps|chromium|MaaTouch|fingerprint' \
             | tail -n 2000 > "$dir/logcat-filtered.log" 2>/dev/null || true
     fi

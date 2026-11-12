@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Platform-independent mount flags.
@@ -225,6 +226,33 @@ func setupDNS(rootfs string) error {
 		"nameserver 119.29.29.29\n" +
 		"nameserver 1.1.1.1\n"
 	return os.WriteFile(resolvPath, []byte(content), 0644)
+}
+
+// normalizeRootfsProfile ensures <rootfs>/etc/profile invokes /usr/bin/id via
+// an absolute path before PATH is set, avoiding `bash: id: command not found`
+// when chroot is entered from Android's /system/bin PATH environment.
+func normalizeRootfsProfile(rootfs string) error {
+	profilePath := filepath.Join(rootfs, "etc", "profile")
+	info, err := os.Lstat(profilePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 64<<10 {
+		return nil
+	}
+	raw, err := os.ReadFile(profilePath)
+	if err != nil {
+		return err
+	}
+	updated := strings.ReplaceAll(string(raw), `"$(id -u)"`, `"$(/usr/bin/id -u)"`)
+	updated = strings.ReplaceAll(updated, "`id -u`", "`/usr/bin/id -u`")
+	if updated == string(raw) {
+		return nil
+	}
+	return os.WriteFile(profilePath, []byte(updated), info.Mode().Perm())
 }
 
 // unmountLIFO unmounts targets in strict reverse order with MNT_DETACH fallback.

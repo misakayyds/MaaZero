@@ -16,5 +16,8 @@ printf '127.0.0.1 localhost maa-runtime\n::1 localhost ip6-localhost\n' > "$root
 : > "$root/etc/machine-id"
 printf 'en_US.UTF-8 UTF-8\n' > "$root/etc/locale.gen"
 chroot "$root" locale-gen
+if [ -f "$root/etc/profile" ]; then
+    sed -i 's#"$(id -u)"#"$(/usr/bin/id -u)"#g' "$root/etc/profile"
+fi
 # DNS, timezone and Android mounts are runtime-driver responsibilities.
 # No game launch, ADB connection, cron start, SSH server or device helpers here.

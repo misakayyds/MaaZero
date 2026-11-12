@@ -246,7 +246,7 @@ download_apk() {
     local part="$APK_FILE.part"
     rm -f "$part"
     info "开始下载官服 APK: $APK_URL"
-    timeout "$DOWNLOAD_TIMEOUT" curl -L --fail --retry 3 --retry-delay 10 \
+    timeout --foreground "$DOWNLOAD_TIMEOUT" curl -L --fail --retry 3 --retry-delay 10 \
         --connect-timeout 30 \
         -o "$part" "$APK_URL"
     mv "$part" "$APK_FILE"

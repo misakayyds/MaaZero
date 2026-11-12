@@ -15,10 +15,36 @@ export PATH="${HOME}/.local/bin:${MAA_HOME}/bin:/usr/local/sbin:/usr/local/bin:/
 export LANG="${LANG:-en_US.UTF-8}"
 export PYTHONDONTWRITEBYTECODE=1
 
+resolve_core_channel() {
+    if [[ -n "${MAA_CORE_CHANNEL:-}" ]]; then
+        printf '%s' "$MAA_CORE_CHANNEL"
+        return 0
+    fi
+    local detected=""
+    if [[ -f "$MAA_CONFIG_DIR/cli.toml" ]]; then
+        detected=$(python3 - "$MAA_CONFIG_DIR/cli.toml" 2>/dev/null <<'PY' || true
+import pathlib
+import sys
+import tomllib
+
+p = pathlib.Path(sys.argv[1])
+try:
+    data = tomllib.loads(p.read_text("utf-8"))
+    ch = str(data.get("core", {}).get("channel", "")).strip().lower()
+    if ch in {"stable", "beta", "alpha"}:
+        print(ch)
+except Exception:
+    pass
+PY
+        )
+    fi
+    printf '%s' "${detected:-stable}"
+}
+
 LOG_DIR="$MAA_LOG_DIR"
 LOG_FILE="$LOG_DIR/update-$(date +%Y%m%d-%H%M%S).log"
 LOCK_FILE="/tmp/maa-task.lock"
-UPDATE_TIMEOUT="15m"
+UPDATE_TIMEOUT="${MAA_UPDATE_TIMEOUT:-30m}"
 UPDATE_MARKER="$LOG_DIR/last-update-ok"
 UPDATE_RETRIES=2
 UPDATE_RETRY_DELAY=20
@@ -26,7 +52,8 @@ RESOURCE_TARBALL_URL="${MAA_RESOURCE_TARBALL_URL:-https://codeload.github.com/Ma
 RESOURCE_DIR="${MAA_RESOURCE_DIR:-$MAA_DATA_DIR/resource}"
 RESOURCE_CLONE_DIR="${MAA_RESOURCE_CLONE_DIR:-$MAA_DATA_DIR/MaaResource/resource}"
 RESOURCE_OVERLAY_SCRIPT="${MAA_RESOURCE_OVERLAY_SCRIPT:-$MAA_HOME/maa-resource-overlay.sh}"
-MAA_CORE_CHANNEL="${MAA_CORE_CHANNEL:-beta}"
+CLI_TOML_CHANNEL="$(MAA_CORE_CHANNEL="" resolve_core_channel)"
+MAA_CORE_CHANNEL="$(resolve_core_channel)"
 MAA_UPDATE_TEST_TIME="${MAA_UPDATE_TEST_TIME:-0}"
 
 # === 锁保护 (防止更新与运行任务抢占) ===
@@ -47,15 +74,55 @@ log() {
     echo "$msg" | tee -a "$LOG_FILE"
 }
 
-# acquire_lock was removed because flock relaunch is handled at the top of the script
+cache_progress_summary() {
+    python3 - "$MAA_CACHE_DIR" 2>/dev/null <<'PY' || true
+import pathlib
+import sys
+
+cache_dir = pathlib.Path(sys.argv[1])
+if not cache_dir.is_dir():
+    raise SystemExit(0)
+files = [p for p in cache_dir.rglob("*") if p.is_file()]
+if not files:
+    raise SystemExit(0)
+newest = max(files, key=lambda p: p.stat().st_mtime)
+size_mb = newest.stat().st_size / (1024 * 1024)
+if size_mb >= 0.1:
+    print(f"{newest.name} {size_mb:.1f} MiB")
+PY
+}
 
 run_with_timeout() {
     local label="$1"
     shift
+    local start_ts=$SECONDS
+    local monitor_pid=""
 
     log "$label"
-    "$@" >> "$LOG_FILE" 2>&1
-    local ec=$?
+    (
+        trap 'exit 0' TERM INT
+        tick=0
+        while sleep 1 </dev/null >/dev/null 2>&1; do
+            tick=$((tick + 1))
+            (( tick % 15 == 0 )) || continue
+            elapsed=$(( SECONDS - start_ts ))
+            cache_info=$(cache_progress_summary)
+            if [[ -n "$cache_info" ]]; then
+                log "⏳ 正在执行（已耗时 ${elapsed}s，缓存文件: ${cache_info}）..."
+            else
+                log "⏳ 正在执行（已耗时 ${elapsed}s）..."
+            fi
+        done
+    ) &
+    monitor_pid=$!
+
+    "$@" 2>&1 | tr '\r' '\n' | tee -a "$LOG_FILE"
+    local ec=${PIPESTATUS[0]}
+
+    if [[ -n "$monitor_pid" ]]; then
+        kill "$monitor_pid" 2>/dev/null || true
+        wait "$monitor_pid" 2>/dev/null || true
+    fi
     return "$ec"
 }
 
@@ -118,7 +185,7 @@ update_resource_from_tarball() {
     rm -rf "$work_dir" "$tarball"
     mkdir -p "$work_dir"
 
-    if ! timeout -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" "$RESOURCE_TARBALL_URL" >> "$LOG_FILE" 2>&1; then
+    if ! timeout --foreground -k 30s "$UPDATE_TIMEOUT" curl -L --fail --connect-timeout 20 --max-time 600 -o "$tarball" "$RESOURCE_TARBALL_URL" >> "$LOG_FILE" 2>&1; then
         rm -rf "$work_dir" "$tarball"
         return 1
     fi
@@ -154,7 +221,7 @@ exit_code=0
 
 # 1. maa-cli 自更新不放在高频路径，避免网络抖动拖住资源更新。
 if [[ "${MAA_SELF_UPDATE:-0}" == "1" ]]; then
-    if run_with_timeout "1. 正在检查并更新 maa-cli (self update)..." timeout -k 30s "$UPDATE_TIMEOUT" maa self update --batch; then
+    if run_with_timeout "1. 正在检查并更新 maa-cli (self update)..." timeout --foreground -k 30s "$UPDATE_TIMEOUT" maa self update --batch; then
         log "✅ maa-cli 检查/更新成功"
     else
         log "⚠️ maa-cli 检查/更新失败，继续检查 MaaCore 与资源"
@@ -164,37 +231,51 @@ else
 fi
 
 # 2. 自动安装（首次运行无 MaaCore 时）并更新 MaaCore 及资源
+fresh_core_installed=0
 if [[ ! -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
-    if run_with_timeout "2a. 首次运行未检测到 libMaaCore.so，正在自动初始化安装 MaaCore 与资源..." timeout -k 30s "$UPDATE_TIMEOUT" maa install --batch; then
-        log "✅ 首次 MaaCore 与资源安装完成"
+    if run_with_timeout "2a. 首次运行未检测到 libMaaCore.so，正在自动初始化安装 MaaCore 与资源 (channel=$MAA_CORE_CHANNEL)..." timeout --foreground -k 30s "$UPDATE_TIMEOUT" maa install --batch; then
+        if [[ -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
+            fresh_core_installed=1
+            log "✅ 首次 MaaCore 与资源安装完成"
+        else
+            log "⚠️ maa install 返回 0 但仍未检测到 libMaaCore.so，继续尝试更新与同步流程"
+        fi
     else
         log "⚠️ maa install 执行未完全成功，继续尝试更新与同步流程"
     fi
 fi
 
 resource_updated=0
-for attempt in $(seq 1 "$UPDATE_RETRIES"); do
-    if run_with_timeout "2. 正在检查并更新 MaaCore 与资源 (channel=$MAA_CORE_CHANNEL, attempt=$attempt/$UPDATE_RETRIES)..." timeout -k 30s "$UPDATE_TIMEOUT" maa update "$MAA_CORE_CHANNEL" --batch --test-time "$MAA_UPDATE_TEST_TIME"; then
-        if sync_resource_from_clone; then
+if [[ "$fresh_core_installed" -eq 1 && "${MAA_CORE_CHANNEL,,}" == "${CLI_TOML_CHANNEL,,}" && ( -d "$RESOURCE_CLONE_DIR" || -s "$RESOURCE_DIR/version.json" ) ]]; then
+    if sync_resource_from_clone; then
+        resource_updated=1
+    fi
+fi
+
+if [[ "$resource_updated" -eq 0 ]]; then
+    for attempt in $(seq 1 "$UPDATE_RETRIES"); do
+        if run_with_timeout "2. 正在检查并更新 MaaCore 与资源 (channel=$MAA_CORE_CHANNEL, attempt=$attempt/$UPDATE_RETRIES)..." timeout --foreground -k 30s "$UPDATE_TIMEOUT" maa update "$MAA_CORE_CHANNEL" --batch --test-time "$MAA_UPDATE_TEST_TIME"; then
+            if sync_resource_from_clone; then
+                resource_updated=1
+                break
+            fi
+            log "❌ MaaResource clone 同步失败 attempt=$attempt/$UPDATE_RETRIES"
+        fi
+
+        log "❌ MaaCore 与资源 检查/更新失败 attempt=$attempt/$UPDATE_RETRIES"
+        if update_resource_from_tarball; then
             resource_updated=1
             break
         fi
-        log "❌ MaaResource clone 同步失败 attempt=$attempt/$UPDATE_RETRIES"
-    fi
 
-    log "❌ MaaCore 与资源 检查/更新失败 attempt=$attempt/$UPDATE_RETRIES"
-    if update_resource_from_tarball; then
-        resource_updated=1
-        break
-    fi
+        if [[ "$attempt" -lt "$UPDATE_RETRIES" ]]; then
+            log "等待 ${UPDATE_RETRY_DELAY}s 后重试资源更新..."
+            sleep "$UPDATE_RETRY_DELAY"
+        fi
+    done
+fi
 
-    if [[ "$attempt" -lt "$UPDATE_RETRIES" ]]; then
-        log "等待 ${UPDATE_RETRY_DELAY}s 后重试资源更新..."
-        sleep "$UPDATE_RETRY_DELAY"
-    fi
-done
-
-if [[ "$resource_updated" -eq 1 ]]; then
+if [[ "$resource_updated" -eq 1 && -f "$MAA_DATA_DIR/lib/libMaaCore.so" ]]; then
     log "✅ MaaCore 与资源 检查/更新成功"
     log_resource_versions
     date '+%Y-%m-%d %H:%M:%S' > "$UPDATE_MARKER"
@@ -212,6 +293,9 @@ if [[ "$resource_updated" -eq 1 ]]; then
     else
         log "⚠️ 基建技能建议门槛索引更新失败，保留上一份可用索引"
     fi
+elif [[ "$resource_updated" -eq 1 ]]; then
+    log "❌ 资源目录已同步，但未检测到核心库 $MAA_DATA_DIR/lib/libMaaCore.so；MaaCore 安装尚未完成"
+    exit_code=1
 else
     log "❌ MaaCore 与资源 检查/更新最终失败"
     exit_code=1

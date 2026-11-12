@@ -174,6 +174,84 @@ def popen_bg(cmd, env=None):
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _is_zombie_pid(pid, proc_root="/proc"):
+    try:
+        with open(os.path.join(proc_root, str(pid), "stat"), "r", encoding="utf-8", errors="ignore") as f:
+            stat_text = f.read()
+        rparen = stat_text.rfind(")")
+        if rparen >= 0:
+            fields = stat_text[rparen + 2 :].split()
+            if fields and fields[0] == "Z":
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _session_member_pids(leader_pid, proc_root="/proc"):
+    if not leader_pid or leader_pid <= 1 or not hasattr(os, "getsid"):
+        return []
+    self_pid = os.getpid()
+    members = []
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return []
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid <= 1 or pid == self_pid:
+            continue
+        try:
+            if os.getsid(pid) == leader_pid and not _is_zombie_pid(pid, proc_root=proc_root):
+                members.append(pid)
+        except OSError:
+            continue
+    return members
+
+
+def kill_bg_session(leader_pid, proc_root="/proc"):
+    if not leader_pid:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(leader_pid, signal.SIGTERM)
+            except OSError:
+                pass
+            for member in _session_member_pids(leader_pid, proc_root=proc_root):
+                try:
+                    os.kill(member, signal.SIGTERM)
+                except OSError:
+                    pass
+            for _ in range(20):
+                time.sleep(0.1)
+                pg_alive = False
+                if not _is_zombie_pid(leader_pid, proc_root=proc_root):
+                    try:
+                        os.killpg(leader_pid, 0)
+                        pg_alive = True
+                    except OSError:
+                        pass
+                if not pg_alive and not _session_member_pids(leader_pid, proc_root=proc_root):
+                    break
+            else:
+                try:
+                    os.killpg(leader_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                for member in _session_member_pids(leader_pid, proc_root=proc_root):
+                    try:
+                        os.kill(member, signal.SIGKILL)
+                    except OSError:
+                        pass
+        else:
+            os.kill(leader_pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 def read_crontab_bytes():
     result = subprocess.run(
         ["crontab", "-l"], capture_output=True, timeout=5, env=get_env()
@@ -967,10 +1045,12 @@ def run_task_bg(task_name, weekday=None, infrast_now=False):
             proc.wait()
             with run_lock:
                 running_task["output"] += f"\n\n--- 结束 (exit={proc.returncode}) ---"
+                running_task["pid"] = None
                 running_task["active"] = False
         except Exception as e:
             with run_lock:
                 running_task["output"] += f"\n--- 异常: {e} ---"
+                running_task["pid"] = None
                 running_task["active"] = False
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -1026,6 +1106,7 @@ def run_operator_scan_bg(config_dir=CONFIG_DIR):
             running_task["output"] += suffix
             if return_code is not None:
                 running_task["output"] += f"\n--- 结束 (exit={return_code}) ---"
+            running_task["pid"] = None
             running_task["active"] = False
 
     threading.Thread(target=worker, daemon=True).start()
@@ -1389,6 +1470,7 @@ def run_cultivation_bg(mode):
             suffix = f"\n\n--- {label}未完成：{error} ---"
         with run_lock:
             running_task["output"] += suffix
+            running_task["pid"] = None
             running_task["active"] = False
 
     try:
@@ -1396,6 +1478,7 @@ def run_cultivation_bg(mode):
     except Exception as error:
         with run_lock:
             running_task["output"] += f"\n\n--- {label}线程启动失败：{error} ---"
+            running_task["pid"] = None
             running_task["active"] = False
         return False
     return True
@@ -1422,10 +1505,12 @@ def startup_health_bg():
             proc.wait()
             with run_lock:
                 running_task["output"] += f"\n\n--- 结束 (exit={proc.returncode}) ---"
+                running_task["pid"] = None
                 running_task["active"] = False
         except Exception as e:
             with run_lock:
                 running_task["output"] += f"\n异常: {e}"
+                running_task["pid"] = None
                 running_task["active"] = False
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -1453,10 +1538,12 @@ def update_maa_bg():
             proc.wait()
             with run_lock:
                 running_task["output"] += f"\n\n--- 结束 (exit={proc.returncode}) ---"
+                running_task["pid"] = None
                 running_task["active"] = False
         except Exception as e:
             with run_lock:
                 running_task["output"] += f"\n异常: {e}"
+                running_task["pid"] = None
                 running_task["active"] = False
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -1487,10 +1574,12 @@ def update_apk_bg(force=False):
             proc.wait()
             with run_lock:
                 running_task["output"] += f"\n\n--- 结束 (exit={proc.returncode}) ---"
+                running_task["pid"] = None
                 running_task["active"] = False
         except Exception as e:
             with run_lock:
                 running_task["output"] += f"\n异常: {e}"
+                running_task["pid"] = None
                 running_task["active"] = False
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -5436,35 +5525,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p == "/api/kill":
             global running_task
             with run_lock:
-                pid = running_task.get("pid")
-                if pid:
-                    try:
-                        if hasattr(os, "killpg"):
-                            os.killpg(pid, signal.SIGTERM)
-                            for _ in range(20):
-                                time.sleep(0.1)
-                                try:
-                                    os.killpg(pid, 0)
-                                except OSError:
-                                    break
-                            else:
-                                os.killpg(pid, signal.SIGKILL)
-                        else:
-                            os.kill(pid, signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        pass
+                target_task = running_task
+                pid = target_task.get("pid")
+                target_task["pid"] = None
 
-                # 通过 ADB 兜底强退明日方舟（使用标准 ADB_ADDR）
-                try:
-                    subprocess.run(
-                        ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", "com.hypergryph.arknights"],
-                        env=get_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
-                    )
-                except Exception:
-                    pass
+            if pid:
+                kill_bg_session(pid)
 
-                running_task["active"] = False
-                running_task["output"] += "\n\n--- 挂机任务被用户手动停止 ---"
+            # 通过 ADB 兜底强退明日方舟（使用标准 ADB_ADDR）
+            try:
+                subprocess.run(
+                    ["adb", "-s", ADB_ADDR, "shell", "am", "force-stop", "com.hypergryph.arknights"],
+                    env=get_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+                )
+            except Exception:
+                pass
+
+            with run_lock:
+                target_task["pid"] = None
+                target_task["active"] = False
+                if "挂机任务被用户手动停止" not in target_task.get("output", ""):
+                    target_task["output"] += "\n\n--- 挂机任务被用户手动停止 ---"
             self._json(200, {"ok": True})
 
         elif p == "/api/game":

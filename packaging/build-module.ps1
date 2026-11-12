@@ -270,6 +270,16 @@ try {
     }
     [System.IO.File]::WriteAllText($propSource, (($propLines -join "`n") + "`n"), (New-Object "System.Text.UTF8Encoding" $false))
 
+    if ($Release) {
+        $webrootIndexStaged = Join-Path (Join-Path $stagingBase "webroot") "index.html"
+        if (Test-Path -LiteralPath $webrootIndexStaged -PathType Leaf) {
+            $htmlText = [System.IO.File]::ReadAllText($webrootIndexStaged, [System.Text.Encoding]::UTF8)
+            $htmlText = $htmlText.Replace("<title>MAA Phone Manager（预览）</title>", "<title>$BrandName 模块入口</title>")
+            $htmlText = $htmlText.Replace("<h1>MAA Phone Manager（本地预览入口）</h1>", "<h1>$BrandName 模块入口</h1>")
+            [System.IO.File]::WriteAllText($webrootIndexStaged, $htmlText, (New-Object "System.Text.UTF8Encoding" $false))
+        }
+    }
+
     $managerHash = (Get-FileHash -LiteralPath $ManagerBinary -Algorithm SHA256).Hash.ToLowerInvariant()
     $webuiAssetsState = "missing"
     if ($webuiIncluded) { $webuiAssetsState = "included" }

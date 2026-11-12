@@ -337,6 +337,9 @@ try {
     Check ($relProp -match "(?m)^name=MaaZero$") "-Release sets name=MaaZero in module.prop"
     Check ($relProp -match "(?m)^version=0\.1\.0$") "-Release sets version=0.1.0 in module.prop"
     Check ($relProp -match "(?m)^versionCode=100$") "-Release sets versionCode=100 in module.prop"
+    $relWebroot = Get-Text $relEntries["webroot/index.html"].Bytes
+    Check ($relWebroot -like "*<title>MaaZero 模块入口</title>*") "-Release rewrites webroot title to formal brand"
+    Check ($relWebroot -notlike "*本地预览入口*") "-Release removes local preview heading from webroot"
     $relMeta = (Get-Text $relEntries["module-metadata.json"].Bytes) | ConvertFrom-Json
     CheckEqual $relMeta.preview $false "-Release sets metadata.preview to false"
     Expect-Refusal { Invoke-Build @{ ManagerBinary = $goodBinary; Version = "0.1.0"; OutputDirectory = (Join-Path $tempRoot "out-rel-noconf"); WebuiDirectory = $webui; UserGuidePath = $UserGuidePath; Release = $true } } "-Release without ReleaseConfig is refused" "ReleaseConfig"

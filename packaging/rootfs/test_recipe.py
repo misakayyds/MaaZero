@@ -93,6 +93,7 @@ class RecipeTests(unittest.TestCase):
         hook = next(x for x in recipe.make_plan(self.config, Path("candidate"))["argv"]
                     if x.startswith("--customize-hook="))
         self.assertTrue(hook.endswith(' "$1"'))
+        self.assertIn("/usr/bin/id -u", hook)
 
     def test_namespace_uses_stdout_not_private_output_path(self):
         plan = recipe.make_plan(self.config, Path("private candidate"))

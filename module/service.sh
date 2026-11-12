@@ -121,6 +121,12 @@ nohup_exec_pending() {
   target_pid="$1"
   [ -r "/proc/$target_pid/cmdline" ] || return 1
   argv="$(tr "\0" "\n" < "/proc/$target_pid/cmdline" 2>/dev/null)"
+  if [ -z "$argv" ]; then
+    return 0
+  fi
+  if [ -n "$SELF_CMDLINE" ] && [ "$argv" = "$SELF_CMDLINE" ]; then
+    return 0
+  fi
   argv0="$(printf "%s\n" "$argv" | head -n 1)"
   argv1="$(printf "%s\n" "$argv" | head -n 2 | tail -n 1)"
   case "$argv0" in
@@ -158,6 +164,7 @@ fi
 
 # stdout 可能带 open-ui 的一次性会话 URL，不能进日志，也不能留在终端；
 # 只把 stderr（诊断）追加到 root 私有日志。
+SELF_CMDLINE="$(tr "\0" "\n" < "/proc/$$/cmdline" 2>/dev/null)"
 nohup "$BIN" serve --data-root "$DATA_ROOT" --listen "$LISTEN" --config "$CONFIG" --assets "$ASSETS" > /dev/null 2>> "$LOG" < /dev/null &
 pid=$!
 echo "$pid" > "$PIDFILE"

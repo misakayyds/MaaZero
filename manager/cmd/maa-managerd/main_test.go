@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"maa-phone-manager/manager/internal/api"
 )
 
 func TestVersionAndRejectedCommands(t *testing.T) {
@@ -112,5 +116,41 @@ func TestPrepareDataRootCreatesANewPrivateDirectory(t *testing.T) {
 	info, err := os.Stat(fresh)
 	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
 		t.Fatalf("new data root is not private: %v %v", info, err)
+	}
+}
+
+type noopBackend struct{}
+
+func (noopBackend) Status() any                    { return map[string]any{"ok": true} }
+func (noopBackend) Check(context.Context) error    { return nil }
+func (noopBackend) Apply(context.Context) error    { return nil }
+func (noopBackend) Rollback(context.Context) error { return nil }
+
+func TestControlStopWaitsForShutdownCompletion(t *testing.T) {
+	root := t.TempDir()
+	srv, err := api.New(api.Config{Host: "127.0.0.1:8088", Backend: noopBackend{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cleanedUp atomic.Bool
+	shutdownDone := make(chan struct{})
+	stopFn := func() {
+		go func() {
+			time.Sleep(120 * time.Millisecond)
+			cleanedUp.Store(true)
+			close(shutdownDone)
+		}()
+	}
+	l, err := listenControl(root, "127.0.0.1:8088", srv, stopFn, shutdownDone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	if err := command(root, "stop"); err != nil {
+		t.Fatalf("command(stop) failed: %v", err)
+	}
+	if !cleanedUp.Load() {
+		t.Fatal("command(stop) returned before shutdownDone completed")
 	}
 }
