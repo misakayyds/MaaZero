@@ -992,12 +992,28 @@ class Tier2ScriptsTest(E2ETestCase):
             self.assertEqual(saved_body["settings"]["client_type"], "Bilibili")
             self.assertTrue(saved_body["settings"]["notify"]["pushplus"]["has_token"])
 
-            # 2. APK update must return 409 when client != Official
-            st, _, raw = _req("/api/apk-update", method="POST", payload={})
-            self.assertEqual(st, 409)
-            self.assertFalse(json.loads(raw.decode("utf-8"))["ok"])
+            # 2. All-platform APK update & store jump routes accept Bilibili and reject invalid clients
+            apk_calls = []
+            webui_mod.update_apk_bg = lambda **kw: (apk_calls.append(kw) or True)
+            webui_mod.open_client_store_on_device = lambda ct: (True, f"store://{ct}")
 
-            # 3. Visual schedule save & status next_daily_for
+            st, _, raw = _req("/api/apk-update", method="POST", payload={})
+            self.assertEqual(st, 200)
+            apk_body = json.loads(raw.decode("utf-8"))
+            self.assertTrue(apk_body["ok"])
+            self.assertEqual(apk_body["client_type"], "Bilibili")
+            self.assertEqual(len(apk_calls), 1)
+
+            st_bad_cli, _, _ = _req("/api/apk-update", method="POST", payload={"client": "InvalidChannel"})
+            self.assertEqual(st_bad_cli, 400)
+
+            st_store, _, raw_store = _req("/api/apk-open-store", method="POST", payload={})
+            self.assertEqual(st_store, 200)
+            store_body = json.loads(raw_store.decode("utf-8"))
+            self.assertTrue(store_body["ok"])
+            self.assertEqual(store_body["opened"], "store://Bilibili")
+
+            # 3. Visual schedule save (including apk_update_enabled) & status next_daily_for
             st, _, raw = _req(
                 "/api/schedule/visual",
                 method="POST",
@@ -1006,11 +1022,15 @@ class Tier2ScriptsTest(E2ETestCase):
                     "daily_times": ["04:30", "16:30"],
                     "update_enabled": True,
                     "update_time": "03:30",
+                    "apk_update_enabled": True,
+                    "apk_update_time": "04:15",
                 },
             )
             self.assertEqual(st, 200)
             vis_body = json.loads(raw.decode("utf-8"))
             self.assertEqual(vis_body["daily_times"], ["04:30", "16:30"])
+            self.assertTrue(vis_body["apk_update_enabled"])
+            self.assertEqual(vis_body["apk_update_time"], "04:15")
             self.assertTrue(vis_body["next_daily_for"])
 
             st, _, raw = _req("/api/status")
@@ -1199,3 +1219,687 @@ class Tier2ScriptsTest(E2ETestCase):
             maa_schedule_control.load_runtime_settings(self.config_dir)["network"]["http_proxy"],
             "http://pxuser:pxcred@proxy.example.com:8080",
         )
+
+    def test_ux_09_all_platform_apk_update_and_xapk_unpack(self) -> None:
+        """Verify 5-server official version checks, Biligame API + Referer, and single/XAPK archive unpacking."""
+        import http.server
+        import io
+        import stat as _stat
+        import threading
+        import zipfile
+
+        # 1. Version tuple & dumpsys comparisons across CN and Overseas
+        inst_bili = maa_schedule_control.parse_dumpsys_package_output(
+            "  versionCode=208 minSdk=21 targetSdk=33\n  versionName=2.7.81\n"
+        )
+        self.assertEqual(inst_bili, {"installed": True, "version_name": "2.7.81", "version_code": 208})
+        self.assertTrue(maa_schedule_control.is_remote_version_newer("2.7.81", 208, "2.7.91", 210))
+        self.assertFalse(maa_schedule_control.is_remote_version_newer("2.7.91", 210, "2.7.91", 210))
+        self.assertTrue(maa_schedule_control.is_remote_version_newer("37.7.9", 2000400, "37.7.41", 0))
+        self.assertFalse(maa_schedule_control.is_remote_version_newer("37.7.41", 2000462, "37.7.41", 0))
+
+        # 2. Mock official network_config + Android/version + Biligame gameinfo HTTP server
+        seen_bili_referers: list[str] = []
+
+        class _MockOfficialHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                base = f"http://127.0.0.1:{self.server.server_port}"
+                if self.path == "/cn/network_config":
+                    inner = {"funcVer": "V056", "configs": {"V056": {"network": {"hv": f"{base}/cn/{{0}}/version"}}}}
+                    body = json.dumps({"content": json.dumps(inner)})
+                elif self.path == "/cn/Android/version":
+                    body = json.dumps({"resVersion": "26-11-06", "clientVersion": "2.7.91"})
+                elif self.path == "/overseas/network_config":
+                    inner = {"funcVer": "V041", "configs": {"V041": {"network": {"hv": f"{base}/overseas/{{0}}/version"}}}}
+                    body = json.dumps({"content": json.dumps(inner)})
+                elif self.path == "/overseas/Android/version":
+                    body = json.dumps({"resVersion": "26-11-02", "clientVersion": "37.7.41"})
+                elif self.path.startswith("/biligame/gameinfo"):
+                    seen_bili_referers.append(self.headers.get("Referer", ""))
+                    body = json.dumps(
+                        {
+                            "code": 0,
+                            "data": {
+                                "android_pkg_name": "com.hypergryph.arknights.bilibili",
+                                "android_pkg_ver": 210,
+                                "android_pkg_size": 1959715292,
+                                "android_download_link": f"{base}/dl/mrfz_2.7.91_20261023_112922_95acf.apk",
+                            },
+                        }
+                    )
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                raw = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockOfficialHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base_url = f"http://127.0.0.1:{port}"
+        old_allow = os.environ.get("MAA_ALLOW_HTTP_VERSION_API")
+        try:
+            # Without MAA_ALLOW_HTTP_VERSION_API, plain HTTP / loopback must be blocked (SSRF defense)
+            os.environ.pop("MAA_ALLOW_HTTP_VERSION_API", None)
+            with self.assertRaises(ValueError):
+                maa_schedule_control.fetch_client_remote_info(
+                    "YoStarEN", network_config_url_override=f"{base_url}/overseas/network_config"
+                )
+
+            os.environ["MAA_ALLOW_HTTP_VERSION_API"] = "1"
+            info_off = maa_schedule_control.fetch_client_remote_info(
+                "Official",
+                network_config_url_override=f"{base_url}/cn/network_config",
+                official_download_url_override=f"{base_url}/dl/arknights-hg-2791.apk",
+            )
+            self.assertEqual(info_off["strategy"], "official_cdn")
+            self.assertTrue(info_off["auto_install_supported"])
+            self.assertEqual(info_off["remote_version_name"], "2.7.91")
+
+            info_bili = maa_schedule_control.fetch_client_remote_info(
+                "Bilibili",
+                network_config_url_override=f"{base_url}/cn/network_config",
+                biligame_api_url_override=f"{base_url}/biligame/gameinfo?game_base_id=101772",
+            )
+            self.assertEqual(info_bili["strategy"], "bilibili_api")
+            self.assertTrue(info_bili["auto_install_supported"])
+            self.assertEqual(info_bili["remote_version_name"], "2.7.91")
+            self.assertEqual(info_bili["remote_version_code"], 210)
+            self.assertEqual(info_bili["referer"], "https://www.biligame.com/")
+            self.assertEqual(seen_bili_referers[-1], "https://www.biligame.com/")
+
+            for yostar_ct in ("YoStarEN", "YoStarJP", "YoStarKR"):
+                info_yo = maa_schedule_control.fetch_client_remote_info(
+                    yostar_ct,
+                    network_config_url_override=f"{base_url}/overseas/network_config",
+                )
+                self.assertEqual(info_yo["strategy"], "store_only")
+                self.assertFalse(info_yo["auto_install_supported"])
+                self.assertEqual(info_yo["remote_version_name"], "37.7.41")
+                self.assertIn("market://details?id=", str(info_yo["store_intent_uri"]))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            if old_allow is None:
+                os.environ.pop("MAA_ALLOW_HTTP_VERSION_API", None)
+            else:
+                os.environ["MAA_ALLOW_HTTP_VERSION_API"] = old_allow
+
+        # 3. Single APK vs Split XAPK (ARM64 ABI filtering + OBB + adversarial Zip-Slip/symlink/package mismatch)
+        def _make_apk_bytes(label: str = "base") -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("AndroidManifest.xml", f"<manifest split='{label}'/>")
+                zf.writestr("classes.dex", b"dex")
+            return buf.getvalue()
+
+        single_apk = self.sandbox_path / "official.apk"
+        single_apk.write_bytes(_make_apk_bytes("single"))
+        res_single = maa_schedule_control.inspect_and_unpack_apk_archive(
+            single_apk,
+            self.sandbox_path / "unpack_single",
+            expected_package="com.hypergryph.arknights",
+        )
+        self.assertEqual(res_single["kind"], "single_apk")
+        self.assertEqual(res_single["apks"], [str(single_apk)])
+
+        valid_xapk = self.sandbox_path / "yostar_en.xapk"
+        with zipfile.ZipFile(valid_xapk, "w") as zf:
+            zf.writestr(
+                "manifest.json",
+                json.dumps({"package_name": "com.YoStarEN.Arknights", "version_name": "37.7.41"}),
+            )
+            zf.writestr("config.x86_64.apk", _make_apk_bytes("x86_64"))
+            zf.writestr("config.arm64_v8a.apk", _make_apk_bytes("arm64"))
+            zf.writestr("com.YoStarEN.Arknights.apk", _make_apk_bytes("base"))
+            zf.writestr("config.en.apk", _make_apk_bytes("en"))
+            zf.writestr(
+                "Android/obb/com.YoStarEN.Arknights/main.200.com.YoStarEN.Arknights.obb",
+                b"OBB_PAYLOAD",
+            )
+
+        res_xapk = maa_schedule_control.inspect_and_unpack_apk_archive(
+            valid_xapk,
+            self.sandbox_path / "unpack_xapk",
+            expected_package="com.YoStarEN.Arknights",
+        )
+        self.assertEqual(res_xapk["kind"], "split_apks")
+        apk_names = [Path(p).name for p in res_xapk["apks"]]
+        self.assertEqual(len(apk_names), 3)
+        self.assertTrue(apk_names[0].endswith("com.YoStarEN.Arknights.apk"))
+        self.assertFalse(any("x86_64" in n for n in apk_names))
+        self.assertEqual(len(res_xapk["obbs"]), 1)
+        self.assertEqual(res_xapk["obbs"][0]["filename"], "main.200.com.YoStarEN.Arknights.obb")
+
+        # Package mismatch in manifest.json must be rejected
+        with self.assertRaises(ValueError):
+            maa_schedule_control.inspect_and_unpack_apk_archive(
+                valid_xapk,
+                self.sandbox_path / "unpack_mismatch",
+                expected_package="com.YoStarJP.Arknights",
+            )
+
+        # Zip-Slip path traversal must be rejected
+        slip_xapk = self.sandbox_path / "slip.xapk"
+        with zipfile.ZipFile(slip_xapk, "w") as zf:
+            zf.writestr("../../evil.apk", _make_apk_bytes("evil"))
+        with self.assertRaises(ValueError):
+            maa_schedule_control.inspect_and_unpack_apk_archive(
+                slip_xapk, self.sandbox_path / "unpack_slip", expected_package="com.YoStarEN.Arknights"
+            )
+
+        # Symlink member inside archive must be rejected
+        sym_xapk = self.sandbox_path / "sym.xapk"
+        with zipfile.ZipFile(sym_xapk, "w") as zf:
+            zi = zipfile.ZipInfo("link.apk")
+            zi.external_attr = (_stat.S_IFLNK | 0o777) << 16
+            zf.writestr(zi, "/etc/passwd")
+        with self.assertRaises(ValueError):
+            maa_schedule_control.inspect_and_unpack_apk_archive(
+                sym_xapk, self.sandbox_path / "unpack_sym", expected_package="com.YoStarEN.Arknights"
+            )
+
+        # 4. Presigned custom_package_url masking & redacted backup round-trip
+        presigned = "https://cdn.example.com/pkg/arknights-en.xapk?sig=presigned123"
+        rt_saved = maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {"client_type": "YoStarEN", "client_update": {"custom_package_url": presigned}},
+        )
+        self.assertEqual(
+            rt_saved["client_update"]["custom_package_url"],
+            "https://cdn.example.com/pkg/arknights-en.xapk?***",
+        )
+        self.assertTrue(rt_saved["client_update"]["auto_install_supported"])
+
+        redacted = maa_schedule_control.export_config_backup(self.config_dir, b"", include_secrets=False)
+        exp_rt = json.loads(redacted["files"]["runtime-settings.json"])
+        self.assertEqual(
+            exp_rt["client_update"]["custom_package_url"],
+            "https://cdn.example.com/pkg/arknights-en.xapk",
+        )
+        maa_schedule_control.import_config_backup(self.config_dir, redacted)
+        self.assertEqual(
+            maa_schedule_control.load_runtime_settings(self.config_dir)["client_update"]["custom_package_url"],
+            presigned,
+        )
+
+    def test_ux_10_apk_update_shell_and_security_regressions(self) -> None:
+        """Verify redirect SSRF block, APKM/x86/base ordering, Bilibili & quoting, and arknights-apk-update.sh E2E."""
+        import http.server
+        import io
+        import shutil
+        import threading
+        import urllib.request
+        import zipfile
+        from unittest import mock
+
+        def _make_apk_bytes(label: str = "base") -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("AndroidManifest.xml", f"<manifest split='{label}'/>")
+                zf.writestr("classes.dex", b"dex-payload")
+            return buf.getvalue()
+
+        # 1. Redirect handler blocks HTTPS -> HTTP loopback/file downgrade (C2-H2), URL redaction & stdin dumpsys
+        redir_handler = maa_schedule_control._SafeHttpsRedirectHandler(allow_http=False)
+        req_https = urllib.request.Request("https://example.com/start")
+        with self.assertRaises(ValueError):
+            redir_handler.redirect_request(
+                req_https, None, 302, "Found", {}, "http://127.0.0.1:8088/api/status"
+            )
+        with self.assertRaises(ValueError):
+            redir_handler.redirect_request(req_https, None, 302, "Found", {}, "file:///etc/passwd")
+
+        redacted_err = maa_schedule_control._redact_urls_in_text(
+            "urlopen failed for https://u:mysecret@cdn.example.com/a.xapk?token=xyz987."
+        )
+        self.assertNotIn("mysecret", redacted_err)
+        self.assertNotIn("xyz987", redacted_err)
+        self.assertIn("https://***:***@cdn.example.com/a.xapk?***.", redacted_err)
+
+        # Partial edit of masked *** URLs must be rejected (C2-L1)
+        maa_schedule_control.save_runtime_settings(
+            self.config_dir,
+            {
+                "network": {"http_proxy": "http://pxu:pxp@proxy.example.com:8080"},
+                "client_update": {"custom_package_url": "https://cdn.example.com/v1/ak.xapk?sig=real"},
+            },
+        )
+        with self.assertRaises(ValueError):
+            maa_schedule_control.save_runtime_settings(
+                self.config_dir,
+                {"client_update": {"custom_package_url": "https://cdn.example.com/v2/ak.xapk?***"}},
+            )
+        with self.assertRaises(ValueError):
+            maa_schedule_control.save_runtime_settings(
+                self.config_dir,
+                {"network": {"http_proxy": "http://***:***@proxy.example.com:9090"}},
+            )
+
+        # 2. Split archive validation: oversized manifest.json, APKM info.json mismatch, x86-only, base ordering, cleanup
+        oversized_xapk = self.sandbox_path / "oversized_manifest.xapk"
+        with zipfile.ZipFile(oversized_xapk, "w") as zf:
+            zf.writestr(
+                "manifest.json",
+                json.dumps({"package_name": "com.YoStarKR.Arknights", "pad": "A" * 300_000}),
+            )
+            zf.writestr("base.apk", _make_apk_bytes("base"))
+        with self.assertRaises(ValueError):
+            maa_schedule_control.inspect_and_unpack_apk_archive(
+                oversized_xapk,
+                self.sandbox_path / "unpack_oversized",
+                expected_package="com.YoStarEN.Arknights",
+            )
+
+        wrong_apkm = self.sandbox_path / "wrong_pkg.apkm"
+        with zipfile.ZipFile(wrong_apkm, "w") as zf:
+            zf.writestr("info.json", json.dumps({"pname": "com.YoStarKR.Arknights"}))
+            zf.writestr("base.apk", _make_apk_bytes("base"))
+        with self.assertRaises(ValueError):
+            maa_schedule_control.inspect_and_unpack_apk_archive(
+                wrong_apkm,
+                self.sandbox_path / "unpack_apkm",
+                expected_package="com.YoStarEN.Arknights",
+            )
+
+        x86_only_xapk = self.sandbox_path / "x86_only.xapk"
+        with zipfile.ZipFile(x86_only_xapk, "w") as zf:
+            zf.writestr("base.apk", _make_apk_bytes("base"))
+            zf.writestr("config.x86_64.apk", _make_apk_bytes("x86_64"))
+        with self.assertRaises(ValueError):
+            maa_schedule_control.inspect_and_unpack_apk_archive(
+                x86_only_xapk,
+                self.sandbox_path / "unpack_x86",
+                expected_package="com.YoStarEN.Arknights",
+            )
+
+        ordered_xapk = self.sandbox_path / "ordered.xapk"
+        with zipfile.ZipFile(ordered_xapk, "w") as zf:
+            zf.writestr("install_asset_pack.apk", _make_apk_bytes("asset"))
+            zf.writestr("config.arm64_v8a.apk", _make_apk_bytes("arm64"))
+            zf.writestr("base.apk", _make_apk_bytes("base"))
+        res_ord = maa_schedule_control.inspect_and_unpack_apk_archive(
+            ordered_xapk,
+            self.sandbox_path / "unpack_ord",
+            expected_package="com.YoStarEN.Arknights",
+        )
+        self.assertTrue(Path(res_ord["apks"][0]).name.endswith("-base.apk"))
+        self.assertTrue(Path(res_ord["apks"][1]).name.endswith("-install_asset_pack.apk"))
+
+        corrupt_inner = self.sandbox_path / "corrupt_inner.xapk"
+        with zipfile.ZipFile(corrupt_inner, "w") as zf:
+            zf.writestr("base.apk", _make_apk_bytes("base"))
+            zf.writestr("config.arm64_v8a.apk", b"NOT_A_ZIP")
+        corrupt_out = self.sandbox_path / "unpack_corrupt"
+        with self.assertRaises(ValueError):
+            maa_schedule_control.inspect_and_unpack_apk_archive(
+                corrupt_inner, corrupt_out, expected_package="com.YoStarEN.Arknights"
+            )
+        self.assertFalse(corrupt_out.exists())
+
+        # 3. WebUI open_client_store_on_device quotes '&' in Bilibili URI & checks web fallback errors (C2-H4)
+        spec_w = importlib.util.spec_from_file_location("maa_webui_c2_store", self.source_dir / "maa-webui.py")
+        assert spec_w is not None and spec_w.loader is not None
+        webui_mod = importlib.util.module_from_spec(spec_w)
+        spec_w.loader.exec_module(webui_mod)
+
+        adb_cmds: list[list[str]] = []
+
+        def _fake_adb_run(cmd, *a, **kw):
+            adb_cmds.append(list(cmd))
+            if cmd[-1] == "get-state":
+                return subprocess.CompletedProcess(cmd, 0, stdout="device\n", stderr="")
+            if "bilibili://" in cmd[-1]:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="Error: Activity not started, unable to resolve Intent\n", stderr=""
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="Starting: Intent\n", stderr="")
+
+        with mock.patch.object(webui_mod.subprocess, "run", side_effect=_fake_adb_run):
+            ok_st, opened_target = webui_mod.open_client_store_on_device("Bilibili")
+        self.assertTrue(ok_st)
+        self.assertEqual(opened_target, "https://www.biligame.com/detail/?id=101772")
+        self.assertIn(
+            "'bilibili://game_center/detail?id=101772&sourceFrom=2300030011'",
+            adb_cmds[2][-1],
+        )
+
+        # 4. End-to-end arknights-apk-update.sh execution with stubbed adb/curl/flock (C2-H1/H3/M1/M2/L2/L3)
+        bash_bin = (
+            Path(r"C:\Program Files\Git\bin\bash.exe")
+            if os.name == "nt" and Path(r"C:\Program Files\Git\bin\bash.exe").exists()
+            else Path(shutil.which("bash") or "")
+        )
+        if not bash_bin.is_file():
+            return
+
+        sh_root = self.sandbox_path / "sh_e2e"
+        sh_home = sh_root / "home"
+        sh_bin = sh_home / "bin"
+        sh_cfg = sh_root / "cfg"
+        sh_state = sh_root / "state"
+        sh_cache = sh_root / "cache"
+        sh_logs = sh_root / "logs"
+        for d in (sh_bin, sh_cfg, sh_state, sh_cache, sh_logs):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Build a valid split .xapk fixture to serve from stubbed curl
+        served_xapk = sh_root / "served_en.xapk"
+        with zipfile.ZipFile(served_xapk, "w") as zf:
+            zf.writestr("manifest.json", json.dumps({"package_name": "com.YoStarEN.Arknights"}))
+            zf.writestr("base.apk", _make_apk_bytes("base"))
+            zf.writestr("config.arm64_v8a.apk", _make_apk_bytes("arm64"))
+            zf.writestr(
+                "Android/obb/com.YoStarEN.Arknights/main.210.com.YoStarEN.Arknights.obb",
+                b"OBB_DATA_210",
+            )
+
+        def _to_msys_path(p: Path) -> str:
+            s = p.resolve().as_posix()
+            if len(s) >= 3 and s[1] == ":" and s[2] == "/":
+                return f"/{s[0].lower()}{s[2:]}"
+            return s
+
+        py_exe = _to_msys_path(Path(sys.executable))
+        (sh_bin / "python3").write_bytes(f'#!/bin/bash\nexec "{py_exe}" "$@"\n'.encode("utf-8"))
+        (sh_bin / "flock").write_bytes(
+            b'#!/bin/bash\nwhile [[ $# -gt 0 && "$1" == -* ]]; do\n'
+            b'  if [[ "$1" == "-E" || "$1" == "-o" ]]; then shift 2; else shift; fi\n'
+            b'done\nexec "$@"\n'
+        )
+        (sh_bin / "df").write_bytes(
+            b'#!/bin/bash\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted\\ndisk 20000000 1000000 19000000 5%% /\\n"\n'
+        )
+
+        adb_log = sh_root / "adb_calls.log"
+        dev_ver_file = sh_root / "device_ver.txt"
+        dev_ver_file.write_text("37.7.9\n2000400\n", encoding="utf-8")
+
+        adb_stub = f"""#!/bin/bash
+set -euo pipefail
+LOG="{adb_log.as_posix()}"
+VER_FILE="{dev_ver_file.as_posix()}"
+if [[ "${{1:-}}" == "-s" ]]; then shift 2; fi
+printf '%s\\n' "$*" >> "$LOG"
+case "${{1:-}}" in
+  connect) exit 0 ;;
+  get-state) echo "device"; exit 0 ;;
+  install-multiple) echo "Failure [INSTALL_FAILED_SESSION_REQUIRED]"; exit 1 ;;
+  push)
+    mkdir -p "$(dirname "{sh_root.as_posix()}/remote/$3")"
+    cp "$2" "{sh_root.as_posix()}/remote/$3"
+    exit 0
+    ;;
+  shell)
+    shift
+    cmd="$*"
+    if [[ "$cmd" == *"dumpsys package"* ]]; then
+      vn=$(sed -n '1p' "$VER_FILE")
+      vc=$(sed -n '2p' "$VER_FILE")
+      printf '  versionCode=%s minSdk=21\\n  versionName=%s\\n' "$vc" "$vn"
+      # Pad >140 KiB to verify --installed-dumpsys-stdin avoids E2BIG
+      head -c 145000 < /dev/zero | tr '\\0' 'x'
+      printf '\\n'
+      exit 0
+    fi
+    if [[ "$cmd" == *"pm install-create"* ]]; then
+      echo "Success: created install session [42]"
+      exit 0
+    fi
+    if [[ "$cmd" == *"pm install-write -S "* ]]; then
+      # Replace '/data/local/tmp/...' redirection path with local remote mirror
+      local_cmd="${{cmd//\\/data\\/local\\/tmp/{sh_root.as_posix()}\\/remote\\/data\\/local\\/tmp}}"
+      bytes_read=$(eval "cat $(echo "$local_cmd" | sed -n "s/.*< '\\([^']*\\)'.*/'\\1'/p")" | wc -c | tr -d '[:space:]')
+      expected_s=$(echo "$cmd" | awk '{{for(i=1;i<=NF;i++) if($i=="-S") print $(i+1)}}')
+      if [[ "$bytes_read" != "$expected_s" || -z "$expected_s" ]]; then
+        echo "Failure [SIZE_MISMATCH got=$bytes_read want=$expected_s]"
+        exit 1
+      fi
+      echo "Success: streamed $bytes_read bytes"
+      exit 0
+    fi
+    if [[ "$cmd" == *"pm install-commit 42"* ]]; then
+      printf '37.7.41\\n2000462\\n' > "$VER_FILE"
+      echo "Success"
+      exit 0
+    fi
+    echo "OK"
+    exit 0
+    ;;
+esac
+exit 0
+"""
+        (sh_bin / "adb").write_bytes(adb_stub.encode("utf-8"))
+
+        curl_log = sh_root / "curl_calls.log"
+        etag_file = sh_root / "etag.txt"
+        etag_file.write_text('"etag-v37741"', encoding="utf-8")
+
+        curl_stub = f"""#!/bin/bash
+set -euo pipefail
+printf 'ARGV:%s\\n' "$*" >> "{curl_log.as_posix()}"
+out=""
+dump_hdr=""
+is_range=0
+use_cfg=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -D) dump_hdr="$2"; shift 2 ;;
+    -r) is_range=1; shift 2 ;;
+    -w|--proto|--proto-redir|--max-redirs|--connect-timeout|--max-time|--retry|--retry-delay) shift 2 ;;
+    --config) use_cfg=1; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [[ "$use_cfg" -eq 1 ]]; then
+  cfg_in=$(cat)
+  url=$(printf '%s\\n' "$cfg_in" | sed -n 's/^url = "\\(.*\\)"$/\\1/p')
+else
+  url="missing-config"
+fi
+etag=$(cat "{etag_file.as_posix()}")
+if [[ -n "$dump_hdr" ]]; then
+  printf 'HTTP/2 206\\r\\netag: %s\\r\\ncontent-range: bytes 0-0/123456\\r\\n\\r\\n' "$etag" > "$dump_hdr"
+fi
+if [[ "$is_range" -eq 1 ]]; then
+  printf '%s\\n' "$url"
+  exit 0
+fi
+cp "{served_xapk.as_posix()}" "$out"
+"""
+        (sh_bin / "curl").write_bytes(curl_stub.encode("utf-8"))
+        for stub_f in ("python3", "flock", "df", "adb", "curl"):
+            os.chmod(sh_bin / stub_f, 0o755)
+
+        remote_ver_state = {"ver": "37.7.41"}
+        notified_messages: list[str] = []
+
+        class _ShellTestHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                b = f"http://127.0.0.1:{self.server.server_port}"
+                if self.path == "/overseas/network_config":
+                    inner = {"funcVer": "V1", "configs": {"V1": {"network": {"hv": f"{b}/overseas/{{0}}/version"}}}}
+                    payload = json.dumps({"content": json.dumps(inner)}).encode("utf-8")
+                elif self.path == "/overseas/Android/version":
+                    payload = json.dumps({"resVersion": "26-11-01", "clientVersion": remote_ver_state["ver"]}).encode(
+                        "utf-8"
+                    )
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                ln = int(self.headers.get("Content-Length") or 0)
+                body_obj = json.loads(self.rfile.read(ln).decode("utf-8"))
+                notified_messages.append(body_obj.get("content", ""))
+                resp = b'{"code":200}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ShellTestHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        # Create a thin wrapper of maa_schedule_control.py that overrides YoStarEN network_config URL & send_notifications
+        sc_wrapper = sh_home / "maa_schedule_control.py"
+        sc_wrapper.write_text(
+            f"""import importlib.util, json, urllib.request
+spec = importlib.util.spec_from_file_location("real_sc", r"{(self.source_dir / 'maa_schedule_control.py').as_posix()}")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.CLIENT_NETWORK_CONFIG_URLS["YoStarEN"] = "http://127.0.0.1:{port}/overseas/network_config"
+def _mock_notify(text, **kw):
+    req = urllib.request.Request(
+        "http://127.0.0.1:{port}/notify",
+        data=json.dumps({{"content": text}}).encode("utf-8"),
+        headers={{"Content-Type": "application/json"}},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=5).read()
+    return {{"attempted": 1, "succeeded": 1, "any_ok": True, "results": []}}
+mod.send_notifications = _mock_notify
+if __name__ == "__main__":
+    raise SystemExit(mod.main())
+""",
+            encoding="utf-8",
+        )
+
+        base_env = os.environ.copy()
+        base_env.update(
+            {
+                "MAA_HOME": _to_msys_path(sh_home),
+                "MAA_SCHEDULE_CONTROL_SCRIPT": sc_wrapper.as_posix(),
+                "MAA_CONFIG_DIR": sh_cfg.as_posix(),
+                "MAA_STATE_DIR": sh_state.as_posix(),
+                "MAA_CACHE_DIR": sh_cache.as_posix(),
+                "MAA_LOG_DIR": sh_logs.as_posix(),
+                "MAA_TASK_LOCK_FILE": (sh_root / "task.lock").as_posix(),
+                "MAA_ALLOW_HTTP_VERSION_API": "1",
+                "PYTHONUTF8": "1",
+                "TMPDIR": (sh_root / "tmp").as_posix(),
+            }
+        )
+        (sh_root / "tmp").mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Configure YoStarEN + PushPlus notifications (no custom URL yet -> store_only)
+            maa_schedule_control.save_runtime_settings(
+                sh_cfg,
+                {
+                    "client_type": "YoStarEN",
+                    "notify": {"enabled": True, "pushplus": {"enabled": True, "token": "pp-tok"}},
+                },
+            )
+
+            script_msys = _to_msys_path(self.source_dir / "arknights-apk-update.sh")
+            r1 = subprocess.run(
+                [str(bash_bin), script_msys, "--check", "--open-store"],
+                env=base_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            r1_logs = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in sh_logs.glob("*.log"))
+            self.assertEqual(r1.returncode, 0, msg=f"stdout={r1.stdout}\nstderr={r1.stderr}\nlogs={r1_logs}")
+            self.assertIn("APK_UPDATE_STORE_REQUIRED client=YoStarEN remote=37.7.41", r1.stdout)
+            self.assertEqual(len(notified_messages), 1)
+            self.assertIn("market://details?id=com.YoStarEN.Arknights", adb_log.read_text(encoding="utf-8"))
+
+            # Second store_only run deduplicates notification
+            r2 = subprocess.run(
+                [str(bash_bin), script_msys, "--check"],
+                env=base_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(r2.returncode, 0)
+            self.assertEqual(len(notified_messages), 1)
+
+            # Configure presigned custom_package_url -> triggers XAPK download, pm install-write -S fallback & OBB push
+            secret_pkg_url = (
+                "https://dluser:TOP_SECRET_CRED@cdn.example.com/pkg/yostar_en.xapk?X-Amz-Signature=PRESIGNED_TOK_777"
+            )
+            maa_schedule_control.save_runtime_settings(
+                sh_cfg,
+                {"client_update": {"custom_package_url": secret_pkg_url}},
+            )
+            r3 = subprocess.run(
+                [str(bash_bin), script_msys, "--check"],
+                env=base_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(r3.returncode, 0, msg=f"stdout={r3.stdout}\nstderr={r3.stderr}")
+            self.assertEqual(len(notified_messages), 2)
+            self.assertIn("已自动更新并安装成功", notified_messages[-1])
+
+            # Verify zero secret/token leakage in stdout, logs, meta, and curl argv (C2-H1)
+            all_logs = "\n".join(p.read_text(encoding="utf-8") for p in sh_logs.glob("*.log"))
+            meta_text = (sh_state / "arknights-apk-head-YoStarEN.meta").read_text(encoding="utf-8")
+            curl_argv_text = curl_log.read_text(encoding="utf-8")
+            for haystack in (r3.stdout, r3.stderr, all_logs, meta_text, curl_argv_text):
+                self.assertNotIn("TOP_SECRET_CRED", haystack)
+                self.assertNotIn("PRESIGNED_TOK_777", haystack)
+
+            # Verify OBB was pushed to /sdcard/Android/obb/com.YoStarEN.Arknights/
+            self.assertTrue(
+                (
+                    sh_root
+                    / "remote/sdcard/Android/obb/com.YoStarEN.Arknights/main.210.com.YoStarEN.Arknights.obb"
+                ).exists()
+            )
+
+            # Advance official network_config to 37.8.0 while custom_package_url ETag stays unchanged (C2-M1)
+            remote_ver_state["ver"] = "37.8.0"
+            curl_calls_before = len(curl_log.read_text(encoding="utf-8").splitlines())
+            r4 = subprocess.run(
+                [str(bash_bin), script_msys, "--check"],
+                env=base_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(r4.returncode, 0, msg=f"stdout={r4.stdout}\nstderr={r4.stderr}")
+            curl_calls_after = len(curl_log.read_text(encoding="utf-8").splitlines())
+            # Only 1 metadata range probe (-r 0-0), NO package download!
+            self.assertEqual(curl_calls_after - curl_calls_before, 1)
+            self.assertEqual(len(notified_messages), 3)
+            self.assertIn("跳过重复下载", notified_messages[-1])
+
+            # Next cron run with same unchanged custom URL neither downloads nor spams alert
+            r5 = subprocess.run(
+                [str(bash_bin), script_msys, "--check"],
+                env=base_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(r5.returncode, 0)
+            self.assertEqual(len(curl_log.read_text(encoding="utf-8").splitlines()) - curl_calls_after, 1)
+            self.assertEqual(len(notified_messages), 3)
+        finally:
+            srv.shutdown()
+            srv.server_close()

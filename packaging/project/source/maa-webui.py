@@ -11,6 +11,7 @@ import http.server
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -66,6 +67,7 @@ from maa_task_config import load_tasks, save_tasks
 from maa_activity_cache import get_activity
 from maa_schedule_control import (
     CLIENT_PACKAGE_MAP,
+    CLIENT_STORE_URLS,
     SECRET_UNCHANGED,
     apply_visual_crontab,
     arm_skip_next_daily,
@@ -1791,23 +1793,93 @@ def update_maa_bg():
     return True
 
 
-def update_apk_bg(force=False, force_official=False):
+def open_client_store_on_device(client_type):
+    if client_type not in CLIENT_STORE_URLS:
+        return False, f"不支持的客户端类型: {client_type}"
+    store_info = CLIENT_STORE_URLS[client_type]
+    intent_uri = store_info["intent_uri"]
+    web_url = store_info["web_url"]
+    env = get_env()
+    try:
+        subprocess.run(
+            ["adb", "connect", ADB_ADDR],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        state = subprocess.run(
+            ["adb", "-s", ADB_ADDR, "get-state"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if state.returncode != 0 or "device" not in (state.stdout or ""):
+            return False, "ADB 未连接就绪，无法在手机上打开商店页"
+        res = subprocess.run(
+            [
+                "adb",
+                "-s",
+                ADB_ADDR,
+                "shell",
+                f"am start -a android.intent.action.VIEW -d {shlex.quote(intent_uri)}",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        combined = f"{res.stdout or ''}\n{res.stderr or ''}"
+        if res.returncode != 0 or re.search(
+            r"Error:|Activity not started|unable to resolve", combined, re.IGNORECASE
+        ):
+            res_web = subprocess.run(
+                [
+                    "adb",
+                    "-s",
+                    ADB_ADDR,
+                    "shell",
+                    f"am start -a android.intent.action.VIEW -d {shlex.quote(web_url)}",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            combined_web = f"{res_web.stdout or ''}\n{res_web.stderr or ''}"
+            if res_web.returncode != 0 or re.search(
+                r"Error:|Activity not started|unable to resolve", combined_web, re.IGNORECASE
+            ):
+                return False, "手机端未能响应商店或浏览器跳转请求"
+            return True, web_url
+        return True, intent_uri
+    except Exception:
+        return False, "执行 ADB 商店跳转命令超时或异常"
+
+
+def update_apk_bg(force=False, force_official=False, open_store=False, client_type=""):
     global running_task
     with run_lock:
         if running_task["active"]: return False
+    target_client = "Official" if force_official else (client_type or resolve_active_client(CONFIG_DIR)[0])
     def worker():
         global running_task
         with run_lock:
-            running_task = {"active": True, "task": "更新明日方舟客户端",
+            running_task = {"active": True, "task": f"检查/更新明日方舟 ({target_client})",
                             "start_time": datetime.now().strftime("%H:%M:%S"),
-                            "pid": None, "output": "开始检查并更新明日方舟官服客户端 APK...\n"}
+                            "pid": None, "output": f"开始检查明日方舟客户端版本与更新 ({target_client})...\n"}
         try:
             env = get_env()
             cmd = ["/bin/bash", f"{SCRIPT_DIR}/arknights-apk-update.sh", "--check"]
-            if force:
-                cmd.append("--force")
             if force_official:
                 cmd.append("--force-official")
+            elif client_type in CLIENT_PACKAGE_MAP:
+                cmd.extend(["--client", client_type])
+            if force:
+                cmd.append("--force")
+            if open_store:
+                cmd.append("--open-store")
             proc = popen_bg(cmd, env=env)
             with run_lock: running_task["pid"] = proc.pid
             buf = []
@@ -2204,7 +2276,8 @@ let S = {
   rtSecretsCleared: {},
   visualCron: {
     loaded: false, infrast_managed: false, daily_enabled: false, daily_times: ['10:00'],
-    custom_daily_count: 0, update_enabled: false, update_time: '03:30', next_daily_for: ''
+    custom_daily_count: 0, update_enabled: false, update_time: '03:30',
+    apk_update_enabled: false, apk_update_time: '04:00', next_daily_for: ''
   },
   snapshots: [],
   selectedSnapshot: ''
@@ -2575,7 +2648,7 @@ function renderHome() {
   h += `<details class="advanced-panel"><summary>维护操作</summary><div class="advanced-body card"><div class="btn-row">
     <button class="btn btn-s" onclick="doStartupHealth()" ${st.active?'disabled':''}>启动健康检查</button>
     <button class="btn btn-s" onclick="doUpdate()" ${st.active?'disabled':''}>更新 MAA</button>
-    <button class="btn btn-s" onclick="doApkUpdate()" ${st.active?'disabled':''}>更新明日方舟</button>
+    <button class="btn btn-s" onclick="doApkUpdate()" ${st.active?'disabled':''}>检查/更新明日方舟</button>
     <button class="btn btn-s" onclick="doGame('start')" ${st.active?'disabled':''}>启动游戏</button>
     <button class="btn btn-s" onclick="doGame('stop')" ${st.active?'disabled':''}>关闭游戏</button>
     <button class="btn btn-s" onclick="doKill()" ${!st.active?'disabled':''} style="color:var(--rd);border-color:var(--rd)">停止任务</button>
@@ -2618,18 +2691,32 @@ async function doUpdate() {
   await api('update', {method:'POST'});
   await loadAll(); go('home');
 }
-async function doApkUpdate() {
-  const ct = (S.status && S.status.client_type) || (S.runtimeSettings && S.runtimeSettings.client_type) || 'Official';
-  if (ct !== 'Official') {
-    showMsg('err', '内置 APK 自动更新仅支持国服官服 (Official)；当前为 ' + clientLabel(ct) + '，请通过对应渠道更新。');
-    return;
-  }
-  const r = await api('apk-update', {method:'POST'});
+async function doApkUpdate(opts={}) {
+  const payload = {};
+  if (opts && opts.force) payload.force = true;
+  if (opts && opts.open_store) payload.open_store = true;
+  const r = await api('apk-update', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  });
   if (r && r.ok === false && r.error) {
     showMsg('err', r.error);
     return;
   }
   await loadAll(); go('home');
+}
+async function openClientStoreUI() {
+  const r = await api('apk-open-store', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:'{}'
+  });
+  if (r && r.ok) {
+    showMsg('ok', '已在手机端请求拉起对应商店详情页 ✓');
+  } else {
+    showMsg('err', '打开商店页失败: ' + ((r && r.error) || '请检查 ADB 连接'));
+  }
 }
 async function doStartupHealth() {
   await api('startup-health', {method:'POST'});
@@ -5139,11 +5226,15 @@ function renderCron() {
   dailyCard += `</div>`;
 
   const updTimeVal = vc.update_time === undefined ? '03:30' : vc.update_time;
-  const updateCard = `<div class="card"><h2>🔄 每日自动更新 MAA 资源</h2>
-    <div class="fg"><label style="min-width:140px">启用每日自动更新</label><input type="checkbox" ${vc.update_enabled?'checked':''} onchange="S.visualCron.update_enabled=this.checked;render()">
+  const apkUpdTimeVal = vc.apk_update_time === undefined ? '04:00' : vc.apk_update_time;
+  const updateCard = `<div class="card"><h2>🔄 每日自动更新（MAA 资源与客户端）</h2>
+    <div class="fg"><label style="min-width:155px">自动更新 MAA 资源</label><input type="checkbox" ${vc.update_enabled?'checked':''} onchange="S.visualCron.update_enabled=this.checked;render()">
       <label style="min-width:70px;margin-left:8px">更新时间</label><input type="time" value="${esc(updTimeVal)}" onchange="S.visualCron.update_time=this.value" ${!vc.update_enabled?'disabled':''} style="padding:5px 8px;border-radius:6px;border:1px solid var(--bd);background:var(--s3);color:var(--t1)">
     </div>
-    <div class="help" style="margin-bottom:10px">建议设在首次日常刷取前 30~60 分钟（默认 03:30），自动同步新活动关卡导航与公招词条数据。</div>
+    <div class="fg"><label style="min-width:155px">自动检查/更新游戏客户端</label><input type="checkbox" ${vc.apk_update_enabled?'checked':''} onchange="S.visualCron.apk_update_enabled=this.checked;render()">
+      <label style="min-width:70px;margin-left:8px">检查时间</label><input type="time" value="${esc(apkUpdTimeVal)}" onchange="S.visualCron.apk_update_time=this.value" ${!vc.apk_update_enabled?'disabled':''} style="padding:5px 8px;border-radius:6px;border:1px solid var(--bd);background:var(--s3);color:var(--t1)">
+    </div>
+    <div class="help" style="margin-bottom:10px">• MAA 资源建议设在首次日常前 30~60 分钟（默认 03:30）。<br>• 客户端检查：官服与 B 服检测到新包自动下载覆盖安装；国际服/日服/韩服自动比对官方版本并推送更新提醒（若设置页配置了自定义 APK/XAPK 直链亦可自动安装）。</div>
     <div class="btn-row"><button type="button" class="btn btn-p" onclick="saveVisualCron()">💾 保存定时设置</button></div>
   </div>`;
 
@@ -5196,6 +5287,8 @@ async function loadCron() {
       custom_daily_count: res.custom_daily_count || 0,
       update_enabled: !!res.update_enabled,
       update_time: res.update_time || '03:30',
+      apk_update_enabled: !!res.apk_update_enabled,
+      apk_update_time: res.apk_update_time || '04:00',
       next_daily_for: res.next_daily_for || ''
     };
     if (S.page === 'cron') {
@@ -5217,7 +5310,9 @@ async function saveVisualCron() {
     daily_enabled: lockDaily ? null : !!vc.daily_enabled,
     daily_times: vc.daily_times || [],
     update_enabled: !!vc.update_enabled,
-    update_time: vc.update_time === undefined ? '03:30' : String(vc.update_time)
+    update_time: vc.update_time === undefined ? '03:30' : String(vc.update_time),
+    apk_update_enabled: !!vc.apk_update_enabled,
+    apk_update_time: vc.apk_update_time === undefined ? '04:00' : String(vc.apk_update_time)
   };
   const r = await api('schedule/visual', {
     method: 'POST',
@@ -5283,6 +5378,7 @@ function renderConn() {
   };
   const dev = rt.device || {};
   const net = rt.network || {};
+  const cu = rt.client_update || {};
   const ntf = rt.notify || {};
   const tg = ntf.telegram || {};
   const pp = ntf.pushplus || {};
@@ -5300,6 +5396,13 @@ function renderConn() {
   const dozeBadge = diag.doze_whitelisted === true
     ? `<span class="rt-badge ok">✓ 游戏已加入省电白名单</span>`
     : (diag.doze_whitelisted === false ? `<span class="rt-badge warn">建议将游戏设为后台无限制</span>` : '');
+  const updModeDesc = cu.mode === 'custom_url'
+    ? '已启用自定义安装包直链全自动下载与 APK/XAPK 覆盖安装'
+    : (rt.client_type === 'Official'
+      ? '鹰角官方 CDN 全自动下载覆盖更新'
+      : (rt.client_type === 'Bilibili'
+        ? 'B 站游戏中心官方直链全自动下载覆盖更新'
+        : '官方版本强更检测 + 多渠道告警 + 一键拉起 Play 商店 / 自定义 APK·XAPK 分包安装'));
 
   let h = `<div class="card"><h2>📱 客户端版本与手机挂机策略</h2>
     <div class="fg"><label style="min-width:130px">明日方舟客户端</label>
@@ -5307,6 +5410,15 @@ function renderConn() {
         ${[['Official','官服 (Official)'],['Bilibili','B服 (Bilibili)'],['YoStarEN','国际服 (YoStarEN)'],['YoStarJP','日服 (YoStarJP)'],['YoStarKR','韩服 (YoStarKR)']].map(([v,n]) => `<option value="${v}" ${rt.client_type===v?'selected':''}>${esc(n)}</option>`).join('')}
       </select>
       ${pkgBadge}
+    </div>
+    <div class="fg"><label style="min-width:130px">客户端更新能力</label>
+      <span style="font-size:12px;color:var(--t2)">${esc(updModeDesc)}</span>
+      <button type="button" class="btn btn-s" style="padding:3px 9px;font-size:12px" onclick="doApkUpdate()">🔍 检查客户端更新</button>
+      <button type="button" class="btn btn-s" style="padding:3px 9px;font-size:12px" onclick="openClientStoreUI()">📲 在手机打开商店页</button>
+    </div>
+    <div class="fg"><label style="min-width:130px">自定义安装包直链</label>
+      <input type="text" id="rt_custom_pkg_url" value="${esc(cu.custom_package_url||'')}" placeholder="选填 https://... (.apk 或海外服 .xapk/.apkm)" style="width:280px">
+      <span style="font-size:12px;color:var(--t2)">官服/B服留空即用官方源；海外服配置自备直链后亦可全自动解包分包安装</span>
     </div>
     <div class="fg"><label style="min-width:130px">同步任务客户端</label>
       <input type="checkbox" id="rt_sync_tasks" ${S.rtSyncTasks!==false?'checked':''} onchange="S.rtSyncTasks=this.checked">
@@ -5427,6 +5539,9 @@ function collectRuntimeSettingsPayload() {
     network: {
       http_proxy: ((document.getElementById('rt_proxy') || {}).value || '').trim(),
       github_mirror: ((document.getElementById('rt_mirror') || {}).value || '').trim()
+    },
+    client_update: {
+      custom_package_url: ((document.getElementById('rt_custom_pkg_url') || {}).value || '').trim()
     },
     notify: {
       enabled: !!(document.getElementById('rt_notify_enabled') && document.getElementById('rt_notify_enabled').checked),
@@ -5611,6 +5726,8 @@ SENSITIVE_NO_CORS_PATHS = (
     "/api/notify/test",
     "/api/backup/export",
     "/api/backup/import",
+    "/api/apk-update",
+    "/api/apk-open-store",
 )
 
 
@@ -6445,8 +6562,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/api/schedule/visual":
             try:
                 body = self._strict_json_body(allow_empty=False)
-                if "daily_enabled" not in body and "update_enabled" not in body:
-                    raise ValueError("缺少 daily_enabled 或 update_enabled 字段")
+                if (
+                    "daily_enabled" not in body
+                    and "update_enabled" not in body
+                    and "apk_update_enabled" not in body
+                ):
+                    raise ValueError("缺少 daily_enabled、update_enabled 或 apk_update_enabled 字段")
                 daily_enabled = body.get("daily_enabled")
                 if daily_enabled is not None and not isinstance(daily_enabled, bool):
                     raise ValueError("daily_enabled 必须是布尔值或 null")
@@ -6454,6 +6575,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 update_enabled = bool(body.get("update_enabled", False))
                 raw_upd_time = body.get("update_time")
                 update_time = str(raw_upd_time) if raw_upd_time is not None else ("03:30" if not update_enabled else "")
+                apk_update_enabled = body.get("apk_update_enabled")
+                if apk_update_enabled is not None and not isinstance(apk_update_enabled, bool):
+                    raise ValueError("apk_update_enabled 必须是布尔值或 null")
+                raw_apk_time = body.get("apk_update_time")
+                apk_update_time = (
+                    str(raw_apk_time)
+                    if raw_apk_time is not None
+                    else ("04:00" if not apk_update_enabled else "")
+                )
                 with schedule_write_lock:
                     recover_schedule_or_raise(CONFIG_DIR)
                     current_raw = read_crontab_bytes()
@@ -6463,6 +6593,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         daily_times=daily_times if isinstance(daily_times, list) else [],
                         update_enabled=update_enabled,
                         update_time=update_time,
+                        apk_update_enabled=apk_update_enabled,
+                        apk_update_time=apk_update_time,
                     )
                     install_crontab_bytes(updated_raw)
                     visual = parse_visual_crontab(updated_raw)
@@ -6479,6 +6611,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": str(error)})
             except Exception:
                 self._json(500, {"ok": False, "error": "保存定时设置失败"})
+            return
+
+        if p == "/api/apk-update":
+            try:
+                body = self._strict_json_body(allow_empty=True)
+                req_client = str(body.get("client") or "").strip()
+                if req_client and req_client not in CLIENT_PACKAGE_MAP:
+                    self._json(400, {"ok": False, "error": f"不支持的客户端类型: {req_client}"})
+                    return
+                force_off = bool(body.get("force_official"))
+                active_client, _, _ = resolve_active_client(CONFIG_DIR)
+                target_client = "Official" if force_off else (req_client or active_client)
+                ok = update_apk_bg(
+                    force=bool(body.get("force")),
+                    force_official=force_off,
+                    open_store=bool(body.get("open_store")),
+                    client_type=req_client,
+                )
+                if not ok:
+                    self._json(409, {"ok": False, "error": "已有任务正在运行，请稍后再试"})
+                    return
+                self._json(200, {"ok": True, "client_type": target_client})
+            except _StrictBodyError as error:
+                self._json(error.status, {"ok": False, "error": error.message})
+            except Exception:
+                self._json(500, {"ok": False, "error": "启动客户端更新检查失败"})
+            return
+
+        if p == "/api/apk-open-store":
+            try:
+                body = self._strict_json_body(allow_empty=True)
+                req_client = str(body.get("client") or "").strip()
+                if req_client and req_client not in CLIENT_PACKAGE_MAP:
+                    self._json(400, {"ok": False, "error": f"不支持的客户端类型: {req_client}"})
+                    return
+                target_client = req_client or resolve_active_client(CONFIG_DIR)[0]
+                ok, detail = open_client_store_on_device(target_client)
+                if not ok:
+                    self._json(502, {"ok": False, "error": detail})
+                    return
+                self._json(200, {"ok": True, "client_type": target_client, "opened": detail})
+            except _StrictBodyError as error:
+                self._json(error.status, {"ok": False, "error": error.message})
+            except Exception:
+                self._json(500, {"ok": False, "error": "打开应用商店详情页失败"})
             return
 
         body = self._body()
@@ -6581,18 +6758,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif p == "/api/update":
             ok = update_maa_bg()
-            self._json(200, {"ok": ok})
-
-        elif p == "/api/apk-update":
-            active_client, _, _ = resolve_active_client(CONFIG_DIR)
-            force_off = bool(body.get("force_official"))
-            if active_client != "Official" and not force_off:
-                self._json(409, {
-                    "ok": False,
-                    "error": f"当前全局客户端为 {active_client}，内置 APK 自动更新仅适用于国服官服 (Official)",
-                })
-                return
-            ok = update_apk_bg(force=bool(body.get("force")), force_official=force_off)
             self._json(200, {"ok": ok})
 
         elif p == "/api/startup-health":

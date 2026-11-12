@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 
 
 SKIP_FILENAME = "skip-next-daily.json"
@@ -45,6 +48,43 @@ CLIENT_SERVER_MAP: dict[str, str] = {
     "YoStarKR": "KR",
 }
 
+CLIENT_NETWORK_CONFIG_URLS: dict[str, str] = {
+    "Official": "https://ak-conf.hypergryph.com/config/prod/official/network_config",
+    "Bilibili": "https://ak-conf.hypergryph.com/config/prod/b/network_config",
+    "YoStarEN": "https://ak-conf.arknights.global/config/prod/official/network_config",
+    "YoStarJP": "https://ak-conf.arknights.jp/config/prod/official/network_config",
+    "YoStarKR": "https://ak-conf.arknights.kr/config/prod/official/network_config",
+}
+
+OFFICIAL_APK_DOWNLOAD_URL = "https://ak.hypergryph.com/downloads/android_lastest"
+BILIGAME_DETAIL_API_URL = (
+    "https://line1-h5-pc-api.biligame.com/game/detail/gameinfo?game_base_id=101772"
+)
+BILIGAME_REFERER = "https://www.biligame.com/"
+
+CLIENT_STORE_URLS: dict[str, dict[str, str]] = {
+    "Official": {
+        "intent_uri": "https://ak.hypergryph.com/",
+        "web_url": "https://ak.hypergryph.com/",
+    },
+    "Bilibili": {
+        "intent_uri": "bilibili://game_center/detail?id=101772&sourceFrom=2300030011",
+        "web_url": "https://www.biligame.com/detail/?id=101772",
+    },
+    "YoStarEN": {
+        "intent_uri": "market://details?id=com.YoStarEN.Arknights",
+        "web_url": "https://play.google.com/store/apps/details?id=com.YoStarEN.Arknights",
+    },
+    "YoStarJP": {
+        "intent_uri": "market://details?id=com.YoStarJP.Arknights",
+        "web_url": "https://play.google.com/store/apps/details?id=com.YoStarJP.Arknights",
+    },
+    "YoStarKR": {
+        "intent_uri": "market://details?id=com.YoStarKR.Arknights",
+        "web_url": "https://play.google.com/store/apps/details?id=com.YoStarKR.Arknights",
+    },
+}
+
 SLEEP_MODES = ("off", "scheduled", "always")
 WEBHOOK_PROVIDERS = ("feishu", "dingtalk", "wecom", "generic")
 WEEKDAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -64,6 +104,11 @@ ANY_DAILY_RUN_RE = re.compile(
 AUTO_UPDATE_CRON_RE = re.compile(
     rb"^[ \t]*(\d{1,2})[ \t]+(\d{1,2})[ \t]+\*[ \t]+\*[ \t]+\*"
     rb"[ \t]+(?:\S*/)?maa-auto-update\.sh"
+    rb"(?:[ \t]+(?:>|>>)[ \t]*\S*cron\.log(?:[ \t]+2>&1)?)?[ \t]*$"
+)
+APK_UPDATE_CRON_RE = re.compile(
+    rb"^[ \t]*(\d{1,2})[ \t]+(\d{1,2})[ \t]+\*[ \t]+\*[ \t]+\*"
+    rb"[ \t]+(?:\S*/)?arknights-apk-update\.sh(?:[ \t]+--check)?"
     rb"(?:[ \t]+(?:>|>>)[ \t]*\S*cron\.log(?:[ \t]+2>&1)?)?[ \t]*$"
 )
 TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
@@ -343,6 +388,9 @@ def default_runtime_settings(default_client: str = "Official") -> dict:
             "http_proxy": "",
             "github_mirror": "",
         },
+        "client_update": {
+            "custom_package_url": "",
+        },
         "notify": {
             "enabled": False,
             "telegram": {
@@ -477,6 +525,50 @@ def _strip_proxy_credentials(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
+def _mask_url_secrets(url: str) -> tuple[str, bool]:
+    if not url:
+        return "", False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+        hostname = parsed.hostname
+    except ValueError:
+        return "", False
+    has_auth = username is not None or password is not None
+    has_query = bool(parsed.query or parsed.fragment)
+    if not has_auth and not has_query:
+        return url, False
+    hostport = _format_hostport(hostname, port)
+    netloc = f"***:***@{hostport}" if has_auth else hostport
+    query = "***" if has_query else ""
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, "")), True
+
+
+def _strip_url_secrets(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+        hostname = parsed.hostname
+    except ValueError:
+        return ""
+    netloc = _format_hostport(hostname, port)
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def client_update_mode(client_type: str, custom_package_url: str = "") -> str:
+    if custom_package_url:
+        return "custom_url"
+    if client_type == "Official":
+        return "official_cdn"
+    if client_type == "Bilibili":
+        return "bilibili_api"
+    return "store_only"
+
+
 def _validate_runtime_urls(rt: dict, *, strict: bool) -> dict:
     checks = (
         (
@@ -498,6 +590,18 @@ def _validate_runtime_urls(rt: dict, *, strict: bool) -> dict:
                 "allow_empty": True,
                 "allowed_schemes": ("http", "https"),
                 "require_https_unless_loopback": True,
+            },
+        ),
+        (
+            rt["client_update"],
+            "custom_package_url",
+            "",
+            {
+                "field_name": "自定义安装包地址",
+                "allow_empty": True,
+                "allowed_schemes": ("http", "https"),
+                "require_https_unless_loopback": True,
+                "disallow_loopback": True,
             },
         ),
         (
@@ -592,6 +696,12 @@ def _normalize_runtime_dict(raw: object, fallback_client: str = "Official") -> d
             val = net_in.get(key)
             if isinstance(val, str) and not any(c in val for c in ("\r", "\n", "\x00")):
                 base["network"][key] = val.strip()
+
+    cu_in = raw.get("client_update")
+    if isinstance(cu_in, dict):
+        pkg_url = cu_in.get("custom_package_url")
+        if isinstance(pkg_url, str) and not any(c in pkg_url for c in ("\r", "\n", "\x00")):
+            base["client_update"]["custom_package_url"] = pkg_url.strip()
 
     notify_in = raw.get("notify")
     if isinstance(notify_in, dict):
@@ -702,6 +812,17 @@ def public_runtime_settings(
     masked_proxy, has_proxy_auth = _mask_proxy_url(net.get("http_proxy", ""))
     net["http_proxy"] = masked_proxy
     net["has_proxy_auth"] = has_proxy_auth
+
+    cu = result["client_update"]
+    raw_custom_url = cu.get("custom_package_url", "")
+    masked_custom_url, has_custom_secret = _mask_url_secrets(raw_custom_url)
+    cu["custom_package_url"] = masked_custom_url
+    cu["has_custom_url_secret"] = has_custom_secret
+    cu["mode"] = client_update_mode(result["client_type"], raw_custom_url)
+    cu["auto_install_supported"] = cu["mode"] != "store_only"
+    store_info = CLIENT_STORE_URLS.get(result["client_type"], CLIENT_STORE_URLS["Official"])
+    cu["store_web_url"] = store_info["web_url"]
+    cu["store_intent_uri"] = store_info["intent_uri"]
 
     tg = result["notify"]["telegram"]
     tg["has_bot_token"] = bool(tg.get("bot_token"))
@@ -831,6 +952,8 @@ def save_runtime_settings(
                 proxy = _clean_single_line(raw_proxy, max_len=512)
                 if proxy and masked_cur_proxy and proxy == masked_cur_proxy:
                     proxy = cur_proxy
+                elif proxy and "://***:***@" in proxy:
+                    raise ValueError("HTTP 代理地址包含已脱敏占位符 (***)，修改地址时请重新填写完整凭据")
             current["network"]["http_proxy"] = _validate_url_field(
                 proxy,
                 "HTTP 代理地址",
@@ -845,6 +968,35 @@ def save_runtime_settings(
                 allow_empty=True,
                 allowed_schemes=("http", "https"),
                 require_https_unless_loopback=True,
+            )
+
+    if "client_update" in payload:
+        cu_in = payload.get("client_update")
+        if not isinstance(cu_in, dict):
+            raise ValueError("client_update 必须是对象")
+        if "custom_package_url" in cu_in:
+            raw_pkg_url = cu_in.get("custom_package_url")
+            cur_pkg_url = current["client_update"].get("custom_package_url", "")
+            masked_cur_pkg_url, _ = _mask_url_secrets(cur_pkg_url)
+            if raw_pkg_url == SECRET_UNCHANGED:
+                pkg_url = cur_pkg_url
+            else:
+                pkg_url = _clean_single_line(raw_pkg_url, max_len=1024)
+                if pkg_url and masked_cur_pkg_url and pkg_url == masked_cur_pkg_url:
+                    pkg_url = cur_pkg_url
+                elif pkg_url and (
+                    "://***:***@" in pkg_url
+                    or pkg_url.endswith("?***")
+                    or "?***#" in pkg_url
+                ):
+                    raise ValueError("自定义安装包地址包含已脱敏占位符 (***)，修改地址时请重新填写完整链接")
+            current["client_update"]["custom_package_url"] = _validate_url_field(
+                pkg_url,
+                "自定义安装包地址",
+                allow_empty=True,
+                allowed_schemes=("http", "https"),
+                require_https_unless_loopback=True,
+                disallow_loopback=True,
             )
 
     if "notify" in payload:
@@ -976,6 +1128,12 @@ def _default_auto_update_path() -> str:
     ).replace("\\", "/")
 
 
+def _default_apk_update_path() -> str:
+    return str(
+        Path(os.environ.get("MAA_HOME", "/root/maa-scripts")) / "arknights-apk-update.sh"
+    ).replace("\\", "/")
+
+
 def _default_cron_log_path() -> str:
     return str(
         Path(os.environ.get("MAA_LOG_DIR", "/var/log/maa")) / "cron.log"
@@ -1010,6 +1168,7 @@ def parse_visual_crontab(crontab_raw: bytes, now: datetime | None = None) -> dic
     daily_times: list[str] = []
     custom_daily_count = 0
     update_times: list[str] = []
+    apk_update_times: list[str] = []
 
     for idx, line in enumerate(logical):
         if idx in protected:
@@ -1035,9 +1194,18 @@ def parse_visual_crontab(crontab_raw: bytes, now: datetime | None = None) -> dic
                 hhmm = f"{hour:02d}:{minute:02d}"
                 if hhmm not in update_times:
                     update_times.append(hhmm)
+                continue
+        m_apk = APK_UPDATE_CRON_RE.match(line)
+        if m_apk:
+            minute, hour = int(m_apk.group(1)), int(m_apk.group(2))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                hhmm = f"{hour:02d}:{minute:02d}"
+                if hhmm not in apk_update_times:
+                    apk_update_times.append(hhmm)
 
     daily_times.sort()
     update_times.sort()
+    apk_update_times.sort()
     try:
         next_iso = next_daily_run(crontab_raw, now=now).isoformat(timespec="seconds")
     except ValueError:
@@ -1050,6 +1218,8 @@ def parse_visual_crontab(crontab_raw: bytes, now: datetime | None = None) -> dic
         "custom_daily_count": custom_daily_count,
         "update_enabled": bool(update_times),
         "update_time": update_times[0] if update_times else "03:30",
+        "apk_update_enabled": bool(apk_update_times),
+        "apk_update_time": apk_update_times[0] if apk_update_times else "04:00",
         "next_daily_for": next_iso,
     }
 
@@ -1072,6 +1242,8 @@ def apply_visual_crontab(
     daily_times: list[str] | None = None,
     update_enabled: bool = False,
     update_time: str = "03:30",
+    apk_update_enabled: bool | None = None,
+    apk_update_time: str = "04:00",
 ) -> bytes:
     if not isinstance(crontab_raw, bytes):
         raise ValueError("crontab 必须是字节串")
@@ -1101,6 +1273,14 @@ def apply_visual_crontab(
     else:
         upd_hour, upd_min = 3, 30
 
+    if apk_update_enabled is not None:
+        if apk_update_enabled or (isinstance(apk_update_time, str) and apk_update_time.strip()):
+            apk_hour, apk_min, _ = _normalize_hhmm(apk_update_time, "客户端更新检查时间")
+        else:
+            apk_hour, apk_min = 4, 0
+    else:
+        apk_hour, apk_min = 4, 0
+
     # Ensure we do not clobber custom non-standard daily cron lines when modifying daily schedule.
     if daily_enabled is not None:
         for idx, line in enumerate(logical):
@@ -1114,14 +1294,16 @@ def apply_visual_crontab(
 
     runner = _default_runner_path()
     updater = _default_auto_update_path()
+    apk_updater = _default_apk_update_path()
     cron_log = _default_cron_log_path()
-    for p in (runner, updater, cron_log):
+    for p in (runner, updater, apk_updater, cron_log):
         if not p or any(ch.isspace() or ch in ';&|`$()<>' for ch in p):
             raise ValueError("运行脚本或日志路径包含空白或控制字符，请在高级编辑器中设置 crontab")
 
     kept_lines: list[bytes] = []
     daily_insert_at: int | None = None
     update_insert_at: int | None = None
+    apk_insert_at: int | None = None
 
     for idx, line in enumerate(logical):
         if idx in protected:
@@ -1137,6 +1319,10 @@ def apply_visual_crontab(
                 if update_insert_at is None:
                     update_insert_at = len(kept_lines)
                 continue
+            if apk_update_enabled is not None and APK_UPDATE_CRON_RE.match(line):
+                if apk_insert_at is None:
+                    apk_insert_at = len(kept_lines)
+                continue
         kept_lines.append(line)
 
     new_daily_lines = [
@@ -1148,16 +1334,29 @@ def apply_visual_crontab(
         if update_enabled
         else []
     )
+    new_apk_lines = (
+        [f"{apk_min} {apk_hour} * * * {apk_updater} --check >> {cron_log} 2>&1".encode("utf-8")]
+        if apk_update_enabled
+        else []
+    )
 
     if daily_enabled is not None and new_daily_lines:
         pos = len(kept_lines) if daily_insert_at is None else daily_insert_at
         kept_lines[pos:pos] = new_daily_lines
         if update_insert_at is not None and update_insert_at >= pos:
             update_insert_at += len(new_daily_lines)
+        if apk_insert_at is not None and apk_insert_at >= pos:
+            apk_insert_at += len(new_daily_lines)
 
     if new_update_lines:
         pos = len(kept_lines) if update_insert_at is None else update_insert_at
         kept_lines[pos:pos] = new_update_lines
+        if apk_insert_at is not None and apk_insert_at >= pos:
+            apk_insert_at += len(new_update_lines)
+
+    if apk_update_enabled is not None and new_apk_lines:
+        pos = len(kept_lines) if apk_insert_at is None else apk_insert_at
+        kept_lines[pos:pos] = new_apk_lines
 
     while kept_lines and kept_lines[-1] == b"":
         kept_lines.pop()
@@ -1527,6 +1726,9 @@ def export_config_backup(
                 rt_payload["network"]["http_proxy"] = _strip_proxy_credentials(
                     rt_payload["network"].get("http_proxy", "")
                 )
+                rt_payload["client_update"]["custom_package_url"] = _strip_url_secrets(
+                    rt_payload["client_update"].get("custom_package_url", "")
+                )
                 rt_payload["notify"]["telegram"]["bot_token"] = ""
                 rt_payload["notify"]["pushplus"]["token"] = ""
                 rt_payload["notify"]["serverchan"]["sendkey"] = ""
@@ -1686,6 +1888,16 @@ def import_config_backup(
                         allowed_schemes=("http", "https"),
                         require_https_unless_loopback=True,
                     )
+            cu_raw = parsed_rt.get("client_update")
+            if isinstance(cu_raw, dict) and isinstance(cu_raw.get("custom_package_url"), str):
+                _validate_url_field(
+                    cu_raw["custom_package_url"].strip(),
+                    "自定义安装包地址",
+                    allow_empty=True,
+                    allowed_schemes=("http", "https"),
+                    require_https_unless_loopback=True,
+                    disallow_loopback=True,
+                )
             notify_raw = parsed_rt.get("notify")
             if isinstance(notify_raw, dict):
                 for ch_name, fld_name, label, allow_emp in (
@@ -1716,6 +1928,15 @@ def import_config_backup(
                     and inc_proxy == _strip_proxy_credentials(cur_proxy)
                 ):
                     normalized_rt["network"]["http_proxy"] = cur_proxy
+                inc_pkg_url = normalized_rt["client_update"].get("custom_package_url", "")
+                cur_pkg_url = existing_rt["client_update"].get("custom_package_url", "")
+                if (
+                    inc_pkg_url
+                    and not _mask_url_secrets(inc_pkg_url)[1]
+                    and _mask_url_secrets(cur_pkg_url)[1]
+                    and inc_pkg_url == _strip_url_secrets(cur_pkg_url)
+                ):
+                    normalized_rt["client_update"]["custom_package_url"] = cur_pkg_url
                 for ch, field in (
                     ("telegram", "bot_token"),
                     ("pushplus", "token"),
@@ -1825,6 +2046,502 @@ def import_config_backup(
 
 
 # ---------------------------------------------------------------------------
+# All-platform Arknights version probe & APK/XAPK archive unpacker
+# ---------------------------------------------------------------------------
+
+MAX_SPLIT_ARCHIVE_ENTRIES = 96
+MAX_SPLIT_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024  # 8 GiB
+MAX_MANIFEST_JSON_BYTES = 262_144
+OBB_ENTRY_RE = re.compile(r"^Android/obb/([A-Za-z0-9_.]+)/([A-Za-z0-9_.-]{1,128}\.obb)$")
+SAFE_APK_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+X86_ABI_SPLIT_RE = re.compile(r"(?:^|[._-])(?:x86[_-]64|x86)(?:[._-]|\.apk$)", re.IGNORECASE)
+ARM32_ABI_SPLIT_RE = re.compile(
+    r"(?:^|[._-])(?:armeabi[_-]v7a|armeabi)(?:[._-]|\.apk$)",
+    re.IGNORECASE,
+)
+ARM64_ABI_SPLIT_RE = re.compile(r"(?:^|[._-])arm64[_-]v8a(?:[._-]|\.apk$)", re.IGNORECASE)
+ANY_ABI_SPLIT_RE = re.compile(
+    r"(?:^|[._-])(?:arm64[_-]v8a|armeabi[_-]v7a|armeabi|x86[_-]64|x86)(?:[._-]|\.apk$)",
+    re.IGNORECASE,
+)
+URL_IN_TEXT_RE = re.compile(r"(?:https?|socks5h?)://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _redact_urls_in_text(text: str) -> str:
+    if not text:
+        return ""
+
+    def _replace(match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        trailing = ""
+        while raw_url and raw_url[-1] in ".,;:)]}":
+            trailing = raw_url[-1] + trailing
+            raw_url = raw_url[:-1]
+        masked, _ = _mask_url_secrets(raw_url)
+        if not masked:
+            masked = re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]+@", r"\1***:***@", raw_url)
+            masked = re.sub(r"\?[^#]*", "?***", masked)
+        return masked + trailing
+
+    return URL_IN_TEXT_RE.sub(_replace, text)
+
+
+def parse_version_tuple(version_str: str) -> tuple[int, ...]:
+    if not isinstance(version_str, str):
+        return ()
+    cleaned = version_str.strip().lstrip("vV")
+    match = re.match(r"^(\d+(?:\.\d+)*)", cleaned)
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def parse_dumpsys_package_output(dumpsys_text: str) -> dict[str, object]:
+    if not isinstance(dumpsys_text, str) or not dumpsys_text.strip():
+        return {"installed": False, "version_name": "", "version_code": 0}
+    ver_name_match = re.search(r"\bversionName=([^\s\r\n]+)", dumpsys_text)
+    ver_code_match = re.search(r"\bversionCode=(\d+)", dumpsys_text)
+    version_name = ver_name_match.group(1).strip() if ver_name_match else ""
+    version_code = int(ver_code_match.group(1)) if ver_code_match else 0
+    return {
+        "installed": bool(version_name or version_code > 0),
+        "version_name": version_name,
+        "version_code": version_code,
+    }
+
+
+def is_remote_version_newer(
+    installed_name: str,
+    installed_code: int,
+    remote_name: str,
+    remote_code: int = 0,
+) -> bool:
+    if not installed_name and installed_code <= 0:
+        return True
+    if remote_code > 0 and installed_code > 0 and remote_code != installed_code:
+        return remote_code > installed_code
+    inst_t = parse_version_tuple(installed_name)
+    rem_t = parse_version_tuple(remote_name)
+    if inst_t and rem_t:
+        width = max(len(inst_t), len(rem_t))
+        inst_pad = inst_t + (0,) * (width - len(inst_t))
+        rem_pad = rem_t + (0,) * (width - len(rem_t))
+        if rem_pad != inst_pad:
+            return rem_pad > inst_pad
+        return False
+    if remote_name and installed_name and remote_name != installed_name:
+        return True
+    return False
+
+
+class _SafeHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, *, allow_http: bool):
+        super().__init__()
+        self._allowed_schemes = ("http", "https") if allow_http else ("https",)
+        self._disallow_loopback = not allow_http
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved = urllib.parse.urljoin(req.full_url, newurl)
+        _validate_url_field(
+            resolved,
+            "更新重定向地址",
+            allow_empty=False,
+            allowed_schemes=self._allowed_schemes,
+            disallow_loopback=self._disallow_loopback,
+        )
+        return super().redirect_request(req, fp, code, msg, headers, resolved)
+
+
+def _http_get_text(
+    url: str,
+    *,
+    proxy_url: str = "",
+    referer: str = "",
+    timeout_s: int = 15,
+    max_bytes: int = 131_072,
+) -> str:
+    allow_http = os.environ.get("MAA_ALLOW_HTTP_VERSION_API") == "1"
+    allowed_schemes = ("http", "https") if allow_http else ("https",)
+    validated_url = _validate_url_field(
+        url,
+        "客户端版本接口地址",
+        allow_empty=False,
+        allowed_schemes=allowed_schemes,
+        disallow_loopback=not allow_http,
+    )
+    ua = "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Build/UQ1A.240205.002)"
+
+    if proxy_url and proxy_url.lower().startswith(("socks5://", "socks5h://")):
+        proto_rule = "=http,https" if allow_http else "=https"
+        cfg_lines = [
+            f'url = "{_curl_cfg_quote(validated_url)}"',
+            f'proxy = "{_curl_cfg_quote(proxy_url)}"',
+            f'user-agent = "{_curl_cfg_quote(ua)}"',
+            "connect-timeout = 10",
+            f"max-time = {max(5, int(timeout_s))}",
+        ]
+        if not allow_http:
+            cfg_lines.append('noproxy = ""')
+        if referer:
+            cfg_lines.append(f'referer = "{_curl_cfg_quote(referer)}"')
+        completed = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "--fail",
+                "--location",
+                "--max-redirs",
+                "5",
+                "--proto",
+                proto_rule,
+                "--proto-redir",
+                proto_rule,
+                "--max-filesize",
+                str(max_bytes),
+                "--config",
+                "-",
+            ],
+            input=("\n".join(cfg_lines) + "\n").encode("utf-8"),
+            capture_output=True,
+            timeout=timeout_s + 5,
+            check=False,
+        )
+        if completed.returncode != 0 or len(completed.stdout) > max_bytes:
+            raise RuntimeError(f"请求版本接口失败 (curl exit={completed.returncode})")
+        return completed.stdout.decode("utf-8")
+
+    headers = {"User-Agent": ua}
+    if referer:
+        headers["Referer"] = referer
+    handlers: list[urllib.request.BaseHandler] = [_SafeHttpsRedirectHandler(allow_http=allow_http)]
+    if proxy_url:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    opener = urllib.request.build_opener(*handlers)
+    request = urllib.request.Request(validated_url, headers=headers, method="GET")
+    with opener.open(request, timeout=timeout_s) as resp:
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise RuntimeError("版本接口响应体积超出安全上限")
+    return data.decode("utf-8")
+
+
+def fetch_client_remote_info(
+    client_type: str,
+    *,
+    proxy_url: str = "",
+    custom_package_url: str = "",
+    network_config_url_override: str = "",
+    biligame_api_url_override: str = "",
+    official_download_url_override: str = "",
+    timeout_s: int = 15,
+) -> dict[str, object]:
+    if client_type not in CLIENT_PACKAGE_MAP:
+        raise ValueError(f"不支持的客户端类型: {client_type}")
+
+    allow_http = os.environ.get("MAA_ALLOW_HTTP_VERSION_API") == "1"
+    allowed_schemes = ("http", "https") if allow_http else ("https",)
+
+    net_cfg_url = network_config_url_override or CLIENT_NETWORK_CONFIG_URLS[client_type]
+    client_version = ""
+    res_version = ""
+    net_cfg_error = ""
+
+    try:
+        raw_net_cfg = _http_get_text(net_cfg_url, proxy_url=proxy_url, timeout_s=timeout_s)
+        outer = json.loads(raw_net_cfg)
+        inner = json.loads(outer["content"]) if isinstance(outer.get("content"), str) else outer
+        func_ver = str(inner.get("funcVer") or "")
+        hv_tpl = str(inner["configs"][func_ver]["network"]["hv"])
+        ver_url = hv_tpl.replace("{0}", "Android")
+        raw_ver = _http_get_text(ver_url, proxy_url=proxy_url, timeout_s=timeout_s)
+        ver_obj = json.loads(raw_ver)
+        if isinstance(ver_obj, dict):
+            client_version = _clean_single_line(ver_obj.get("clientVersion") or "", max_len=64)
+            res_version = _clean_single_line(ver_obj.get("resVersion") or "", max_len=96)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        net_cfg_error = str(exc)
+    except ValueError:
+        raise
+    except Exception as exc:
+        net_cfg_error = str(exc)
+
+    remote_version_name = client_version
+    remote_version_code = 0
+    download_url = ""
+    referer = ""
+    package_size = 0
+
+    if custom_package_url:
+        strategy = "custom_url"
+        download_url = _validate_url_field(
+            custom_package_url,
+            "自定义安装包地址",
+            allow_empty=False,
+            allowed_schemes=allowed_schemes,
+            disallow_loopback=not allow_http,
+        )
+    elif client_type == "Official":
+        strategy = "official_cdn"
+        download_url = _validate_url_field(
+            official_download_url_override or OFFICIAL_APK_DOWNLOAD_URL,
+            "官服下载地址",
+            allow_empty=False,
+            allowed_schemes=allowed_schemes,
+            disallow_loopback=not allow_http,
+        )
+    elif client_type == "Bilibili":
+        strategy = "bilibili_api"
+        bili_api = biligame_api_url_override or BILIGAME_DETAIL_API_URL
+        raw_bili = _http_get_text(
+            bili_api,
+            proxy_url=proxy_url,
+            referer=BILIGAME_REFERER,
+            timeout_s=timeout_s,
+        )
+        bili_outer = json.loads(raw_bili)
+        if not isinstance(bili_outer, dict) or (
+            "code" in bili_outer and bili_outer.get("code") != 0
+        ):
+            raise RuntimeError("Bilibili 游戏中心接口返回异常状态")
+        bili_data = bili_outer.get("data")
+        if not isinstance(bili_data, dict):
+            raise RuntimeError("Bilibili 游戏中心接口缺少 data 字段")
+        pkg_name = str(bili_data.get("android_pkg_name") or "").strip()
+        if pkg_name and pkg_name != CLIENT_PACKAGE_MAP["Bilibili"]:
+            raise RuntimeError(f"Bilibili 接口包名不匹配: {pkg_name}")
+        raw_dl = _clean_single_line(bili_data.get("android_download_link") or "", max_len=1024)
+        download_url = _validate_url_field(
+            raw_dl,
+            "Bilibili APK 下载地址",
+            allow_empty=False,
+            allowed_schemes=allowed_schemes,
+            disallow_loopback=not allow_http,
+        )
+        referer = BILIGAME_REFERER
+        try:
+            remote_version_code = max(0, int(bili_data.get("android_pkg_ver") or 0))
+        except (TypeError, ValueError):
+            remote_version_code = 0
+        try:
+            package_size = max(0, int(bili_data.get("android_pkg_size") or 0))
+        except (TypeError, ValueError):
+            package_size = 0
+        fn_match = re.search(r"mrfz_(\d+(?:\.\d+)+)_", download_url)
+        if fn_match:
+            link_ver = fn_match.group(1)
+            if not remote_version_name or parse_version_tuple(link_ver) > parse_version_tuple(remote_version_name):
+                remote_version_name = link_ver
+        if not remote_version_name and remote_version_code <= 0:
+            raise RuntimeError("Bilibili 游戏中心接口未返回有效的版本号信息")
+    else:
+        strategy = "store_only"
+        if not remote_version_name:
+            raise RuntimeError(f"无法获取 {client_type} 官方版本信息: {net_cfg_error or 'empty clientVersion'}")
+
+    store_info = CLIENT_STORE_URLS[client_type]
+    return {
+        "client_type": client_type,
+        "package_name": CLIENT_PACKAGE_MAP[client_type],
+        "strategy": strategy,
+        "auto_install_supported": bool(download_url),
+        "remote_version_name": remote_version_name,
+        "remote_version_code": remote_version_code,
+        "res_version": res_version,
+        "download_url": download_url,
+        "referer": referer,
+        "package_size": package_size,
+        "store_intent_uri": store_info["intent_uri"],
+        "store_web_url": store_info["web_url"],
+    }
+
+
+def _read_zip_json_member(
+    zf: zipfile.ZipFile,
+    member_name: str,
+    label: str,
+    *,
+    max_bytes: int = MAX_MANIFEST_JSON_BYTES,
+) -> dict[str, object]:
+    with zf.open(member_name, "r") as fp:
+        raw = fp.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} 体积超出安全上限")
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} 格式无效") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"{label} 必须是 JSON 对象")
+    return obj
+
+
+def _stream_extract_member(
+    zf: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    dest: Path,
+    *,
+    budget_remaining: int,
+) -> int:
+    written = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with zf.open(info, "r") as src, open(dest, "wb") as out:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > budget_remaining:
+                raise ValueError("安装包解压总大小超出安全上限 (8 GiB)")
+            out.write(chunk)
+    os.chmod(dest, 0o600)
+    return written
+
+
+def inspect_and_unpack_apk_archive(
+    archive_path: str | Path,
+    extract_dir: str | Path,
+    *,
+    expected_package: str = "",
+) -> dict[str, object]:
+    arch_p = Path(archive_path)
+    if arch_p.is_symlink() or not arch_p.is_file():
+        raise ValueError("安装包文件不存在或非常规文件")
+    out_root = Path(extract_dir)
+    if out_root.exists() and out_root.is_symlink():
+        raise ValueError("解压目录不能是符号链接")
+
+    if expected_package and expected_package not in CLIENT_PACKAGE_MAP.values():
+        raise ValueError(f"不允许的目标客户端包名: {expected_package}")
+
+    try:
+        zf_ctx = zipfile.ZipFile(arch_p, "r")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("下载或指定的文件不是有效的 APK/XAPK 压缩包") from exc
+
+    with zf_ctx as zf:
+        infos = zf.infolist()
+        if not infos:
+            raise ValueError("安装包压缩文件为空")
+        for info in infos:
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise ValueError("拒绝包含符号链接的安装包归档")
+
+        names = {info.filename for info in infos}
+        if "AndroidManifest.xml" in names:
+            return {
+                "kind": "single_apk",
+                "apks": [str(arch_p)],
+                "obbs": [],
+            }
+
+        if len(infos) > MAX_SPLIT_ARCHIVE_ENTRIES:
+            raise ValueError(f"分包归档条目过多 (>{MAX_SPLIT_ARCHIVE_ENTRIES})")
+
+        if "manifest.json" in names:
+            manifest_obj = _read_zip_json_member(zf, "manifest.json", "XAPK manifest.json")
+            pkg_in_manifest = str(manifest_obj.get("package_name") or "").strip()
+            if expected_package and pkg_in_manifest and pkg_in_manifest != expected_package:
+                raise ValueError(
+                    f"XAPK 包名 ({pkg_in_manifest}) 与当前客户端 ({expected_package}) 不匹配"
+                )
+
+        if "info.json" in names:
+            info_obj = _read_zip_json_member(zf, "info.json", "APKM info.json")
+            pkg_in_info = str(info_obj.get("pname") or info_obj.get("package_name") or "").strip()
+            if expected_package and pkg_in_info and pkg_in_info != expected_package:
+                raise ValueError(
+                    f"APKM 包名 ({pkg_in_info}) 与当前客户端 ({expected_package}) 不匹配"
+                )
+
+        apk_infos: list[zipfile.ZipInfo] = []
+        obb_infos: list[tuple[zipfile.ZipInfo, str]] = []
+        for info in infos:
+            if info.is_dir():
+                continue
+            norm_name = info.filename.replace("\\", "/")
+            parts = [p for p in norm_name.split("/") if p]
+            if not parts or any(p in (".", "..") for p in parts) or norm_name.startswith("/"):
+                raise ValueError(f"归档内包含非法路径: {info.filename}")
+            lower_name = norm_name.lower()
+            if lower_name.endswith(".apk"):
+                apk_infos.append(info)
+            elif lower_name.endswith(".obb"):
+                m_obb = OBB_ENTRY_RE.fullmatch(norm_name)
+                if not m_obb:
+                    raise ValueError(f"OBB 路径不符合标准规范: {norm_name}")
+                obb_pkg, obb_fn = m_obb.group(1), m_obb.group(2)
+                if expected_package and obb_pkg != expected_package:
+                    raise ValueError(f"OBB 包名 ({obb_pkg}) 与目标客户端 ({expected_package}) 不匹配")
+                if obb_pkg not in CLIENT_PACKAGE_MAP.values():
+                    raise ValueError(f"OBB 包名不在允许列表: {obb_pkg}")
+                obb_infos.append((info, obb_fn))
+
+        had_abi_splits = any(ANY_ABI_SPLIT_RE.search(Path(i.filename).name) for i in apk_infos)
+        apk_infos = [
+            i for i in apk_infos if not X86_ABI_SPLIT_RE.search(Path(i.filename).name)
+        ]
+        has_arm64_split = any(ARM64_ABI_SPLIT_RE.search(Path(i.filename).name) for i in apk_infos)
+        has_arm32_split = any(ARM32_ABI_SPLIT_RE.search(Path(i.filename).name) for i in apk_infos)
+        if had_abi_splits and not has_arm64_split and not has_arm32_split:
+            raise ValueError("分包压缩包仅包含 x86 架构组件，不支持 ARM64 设备")
+        if has_arm64_split:
+            apk_infos = [
+                i for i in apk_infos if not ARM32_ABI_SPLIT_RE.search(Path(i.filename).name)
+            ]
+
+        if not apk_infos:
+            raise ValueError("分包压缩包内未找到可用的 APK 文件")
+
+        known_base_names = {"base.apk"} | {f"{p.lower()}.apk" for p in CLIENT_PACKAGE_MAP.values()}
+        if expected_package:
+            known_base_names.add(f"{expected_package.lower()}.apk")
+
+        out_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(out_root, 0o700)
+        try:
+            budget = MAX_SPLIT_UNCOMPRESSED_BYTES
+            primary_base_apks: list[Path] = []
+            feature_apks: list[Path] = []
+            config_apks: list[Path] = []
+
+            for idx, info in enumerate(apk_infos):
+                raw_base = SAFE_APK_NAME_RE.sub("_", Path(info.filename).name)
+                dest = out_root / f"split-{idx:02d}-{raw_base}"
+                used = _stream_extract_member(zf, info, dest, budget_remaining=budget)
+                budget -= used
+                try:
+                    with zipfile.ZipFile(dest, "r") as inner_zf:
+                        if "AndroidManifest.xml" not in inner_zf.namelist():
+                            raise ValueError(f"分包缺少 AndroidManifest.xml: {raw_base}")
+                except zipfile.BadZipFile as exc:
+                    raise ValueError(f"分包不是有效的 APK 文件: {raw_base}") from exc
+                low_base = raw_base.lower()
+                if low_base in known_base_names:
+                    primary_base_apks.append(dest)
+                elif low_base.startswith(("config.", "config_", "split_config.")):
+                    config_apks.append(dest)
+                else:
+                    feature_apks.append(dest)
+
+            ordered_apks = primary_base_apks + feature_apks + config_apks
+            extracted_obbs: list[dict[str, str]] = []
+            for idx, (info, obb_fn) in enumerate(obb_infos):
+                dest = out_root / f"obb-{idx:02d}-{obb_fn}"
+                used = _stream_extract_member(zf, info, dest, budget_remaining=budget)
+                budget -= used
+                extracted_obbs.append({"local": str(dest), "filename": obb_fn})
+        except Exception:
+            shutil.rmtree(out_root, ignore_errors=True)
+            raise
+
+        return {
+            "kind": "split_apks",
+            "apks": [str(p) for p in ordered_apks],
+            "obbs": extracted_obbs,
+        }
+
+
+# ---------------------------------------------------------------------------
 # CLI Entrypoints
 # ---------------------------------------------------------------------------
 
@@ -1836,6 +2553,7 @@ def _emit_shell_env(config_dir: str | Path) -> int:
     sleep_mode = settings["device"].get("sleep_after_run", "scheduled")
     proxy_url = settings["network"].get("http_proxy", "")
     mirror_url = settings["network"].get("github_mirror", "")
+    custom_pkg_url = settings["client_update"].get("custom_package_url", "")
     pairs = (
         ("MAA_RT_CLIENT_TYPE", client_type),
         ("MAA_RT_AK_PACKAGE", package_name),
@@ -1844,6 +2562,96 @@ def _emit_shell_env(config_dir: str | Path) -> int:
         ("MAA_RT_SLEEP_AFTER_RUN", sleep_mode),
         ("MAA_RT_HTTP_PROXY", proxy_url),
         ("MAA_RT_GITHUB_MIRROR", mirror_url),
+        ("MAA_RT_CUSTOM_PACKAGE_URL", custom_pkg_url),
+    )
+    for key, val in pairs:
+        print(f"{key}={shlex.quote(str(val))}")
+    return 0
+
+
+def _run_apk_check_cli(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings(args.config_dir)
+    active_client, _, _ = resolve_active_client(args.config_dir)
+    client_type = (args.client or active_client).strip()
+    if client_type not in CLIENT_PACKAGE_MAP:
+        print(f"不支持的客户端类型: {client_type}", file=sys.stderr)
+        return 2
+
+    proxy_url = settings.get("network", {}).get("http_proxy", "")
+    custom_url = (
+        args.custom_url.strip()
+        if args.custom_url is not None and args.custom_url.strip()
+        else (
+            settings.get("client_update", {}).get("custom_package_url", "")
+            if client_type == active_client and not args.ignore_saved_custom_url
+            else ""
+        )
+    )
+    try:
+        remote = fetch_client_remote_info(
+            client_type,
+            proxy_url=proxy_url,
+            custom_package_url=custom_url,
+            network_config_url_override=args.network_config_url or "",
+            biligame_api_url_override=args.biligame_api_url or "",
+            official_download_url_override=args.official_download_url or "",
+        )
+    except Exception as exc:
+        print(
+            f"获取 {client_type} 远端版本信息失败: {_redact_urls_in_text(str(exc))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    dumpsys_raw = (
+        sys.stdin.read(524_288)
+        if getattr(args, "installed_dumpsys_stdin", False)
+        else (args.installed_dumpsys or "")
+    )
+    inst = parse_dumpsys_package_output(dumpsys_raw)
+    needs_update = bool(
+        args.force
+        or is_remote_version_newer(
+            str(inst["version_name"]),
+            int(inst["version_code"]),
+            str(remote["remote_version_name"]),
+            int(remote["remote_version_code"]),
+        )
+    )
+    raw_dl_url = str(remote["download_url"] or "")
+    masked_dl_url, _ = _mask_url_secrets(raw_dl_url)
+    if raw_dl_url and not masked_dl_url:
+        masked_dl_url = _redact_urls_in_text(raw_dl_url)
+    payload = {
+        **remote,
+        "download_url_masked": masked_dl_url,
+        "installed": bool(inst["installed"]),
+        "installed_version_name": inst["version_name"],
+        "installed_version_code": inst["version_code"],
+        "needs_update": needs_update,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    pairs = (
+        ("APK_CLIENT_TYPE", payload["client_type"]),
+        ("APK_PKG", payload["package_name"]),
+        ("APK_STRATEGY", payload["strategy"]),
+        ("APK_AUTO_INSTALL", "1" if payload["auto_install_supported"] else "0"),
+        ("APK_INSTALLED", "1" if payload["installed"] else "0"),
+        ("APK_INST_VER_NAME", payload["installed_version_name"]),
+        ("APK_INST_VER_CODE", payload["installed_version_code"]),
+        ("APK_REM_VER_NAME", payload["remote_version_name"]),
+        ("APK_REM_VER_CODE", payload["remote_version_code"]),
+        ("APK_RES_VER", payload["res_version"]),
+        ("APK_NEEDS_UPDATE", "1" if payload["needs_update"] else "0"),
+        ("APK_DOWNLOAD_URL", payload["download_url"]),
+        ("APK_DOWNLOAD_URL_MASKED", payload["download_url_masked"]),
+        ("APK_REFERER", payload["referer"]),
+        ("APK_PKG_SIZE", payload["package_size"]),
+        ("APK_STORE_INTENT", payload["store_intent_uri"]),
+        ("APK_STORE_WEB", payload["store_web_url"]),
     )
     for key, val in pairs:
         print(f"{key}={shlex.quote(str(val))}")
@@ -1872,6 +2680,24 @@ def main(argv: list[str] | None = None) -> int:
     notify_cmd.add_argument("--title", default="[MaaZero] 运行通知")
     notify_cmd.add_argument("--message", default="")
 
+    apk_check_cmd = subparsers.add_parser("apk-check")
+    apk_check_cmd.add_argument("--config-dir", required=True)
+    apk_check_cmd.add_argument("--client", default="")
+    apk_check_cmd.add_argument("--installed-dumpsys", default="")
+    apk_check_cmd.add_argument("--installed-dumpsys-stdin", action="store_true")
+    apk_check_cmd.add_argument("--custom-url", default=None)
+    apk_check_cmd.add_argument("--ignore-saved-custom-url", action="store_true")
+    apk_check_cmd.add_argument("--network-config-url", default="")
+    apk_check_cmd.add_argument("--biligame-api-url", default="")
+    apk_check_cmd.add_argument("--official-download-url", default="")
+    apk_check_cmd.add_argument("--force", action="store_true")
+    apk_check_cmd.add_argument("--format", choices=("shell", "json"), default="shell")
+
+    unpack_cmd = subparsers.add_parser("unpack-apk")
+    unpack_cmd.add_argument("--archive", required=True)
+    unpack_cmd.add_argument("--extract-dir", required=True)
+    unpack_cmd.add_argument("--expected-package", default="")
+
     args = parser.parse_args(argv)
     if args.command == "consume":
         cron = is_cron_invocation(args.parent_pid, args.proc_root)
@@ -1898,6 +2724,20 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 0 if (res["attempted"] == 0 or res["any_ok"]) else 1
+    if args.command == "apk-check":
+        return _run_apk_check_cli(args)
+    if args.command == "unpack-apk":
+        try:
+            unpacked = inspect_and_unpack_apk_archive(
+                args.archive,
+                args.extract_dir,
+                expected_package=args.expected_package,
+            )
+        except Exception as exc:
+            print(f"{exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(unpacked, ensure_ascii=False))
+        return 0
     return 2
 
 
