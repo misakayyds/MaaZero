@@ -22,6 +22,9 @@ __pycache__/
 test/
 *.tmp.html
 
+# Local agent collaboration records (excluded from remote repository)
+/docs/agent/
+
 # Local secrets / private signing material (never commit)
 *.pem
 *.key
