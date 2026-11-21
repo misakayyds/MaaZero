@@ -109,7 +109,7 @@ func New(cfg Config, s *store.Store, driver Driver) (*Controller, error) {
 		cfg.Channel = "stable"
 	}
 	if cfg.Version == "" {
-		cfg.Version = "0.1.0"
+		cfg.Version = "0.1.1"
 	}
 	if cfg.Channel != "stable" && cfg.Channel != "beta" {
 		return nil, errors.New("invalid channel")

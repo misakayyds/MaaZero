@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "sequence": 1,
+  "sequence": 2,
   "channel": "beta",
-  "generated_at": "2026-11-12T01:10:32Z",
+  "generated_at": "2026-11-21T05:21:58Z",
   "minimum_bootstrap_version": "0.1.0",
   "notices": [],
   "blocked_versions": [],
@@ -10,7 +10,7 @@
     {
       "id": "maa-managerd",
       "kind": "manager",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "required": true,
       "install_mode": "replace-file",
       "compatibility": {
@@ -29,16 +29,16 @@
       },
       "artifacts": [
         {
-          "url": "https://github.com/misakayyds/MaaZero/releases/download/v0.1.0/maa-managerd",
+          "url": "https://github.com/misakayyds/MaaZero/releases/download/v0.1.1/maa-managerd",
           "mirrors": [],
-          "sha256": "1342e8c8bb0825e441b9ea653ca4a3018f2b4dbac60f826998413e8ab2027712",
-          "size": 7078050,
+          "sha256": "c96f899deb949070e0011406df03e4b89989f83ac596d2ecf96a39d01b1a256a",
+          "size": 7143586,
           "media_type": "application/octet-stream",
           "compression": "none",
           "provenance": {
             "publisher": "MaaZero",
-            "source_url": "https://github.com/misakayyds/MaaZero/tree/v0.1.0",
-            "license_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.0/LICENSE"
+            "source_url": "https://github.com/misakayyds/MaaZero/tree/v0.1.1",
+            "license_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.1/LICENSE"
           }
         }
       ],
@@ -49,7 +49,7 @@
     {
       "id": "maa-phone-project",
       "kind": "project",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "required": true,
       "install_mode": "extract-versioned",
       "compatibility": {
@@ -68,16 +68,16 @@
       },
       "artifacts": [
         {
-          "url": "https://github.com/misakayyds/MaaZero/releases/download/v0.1.0/maa-phone-project-0.1.0.tar.gz",
+          "url": "https://github.com/misakayyds/MaaZero/releases/download/v0.1.1/maa-phone-project-0.1.1.tar.gz",
           "mirrors": [],
-          "sha256": "83b7dfd20583bc91022156640e989011bb9921846445e5c9c0f15da06045df46",
-          "size": 327987,
+          "sha256": "51f32623b24943c9426383eeacf8043cae3ce84c7cd1b641d9da54dfff9b0f15",
+          "size": 406013,
           "media_type": "application/gzip",
           "compression": "tar.gz",
           "provenance": {
             "publisher": "MaaZero",
-            "source_url": "https://github.com/misakayyds/MaaZero/tree/v0.1.0",
-            "license_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.0/LICENSE"
+            "source_url": "https://github.com/misakayyds/MaaZero/tree/v0.1.1",
+            "license_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.1/LICENSE"
           }
         }
       ],
@@ -116,7 +116,7 @@
           "compression": "tar.gz",
           "provenance": {
             "publisher": "MaaZero from Debian Bookworm ARM64 packages",
-            "source_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.0/packaging/rootfs/recipe.json",
+            "source_url": "https://github.com/misakayyds/MaaZero/blob/v0.1.1/packaging/rootfs/recipe.json",
             "license_url": "https://www.debian.org/legal/licenses/"
           }
         }

@@ -15,9 +15,9 @@
 ## 核心特性
 
 - **真·手机端零门槛开箱**
-  刷入 `MaaZero-v0.1.0.zip` 重启后，直接通过 KernelSU / APatch 模块 WebUI 入口或 Magisk「操作」按钮进入面板，一键完成 Debian 运行时与业务脚本的签名校验与原子部署。
+  刷入 `MaaZero-v0.1.1.zip` 重启后，直接通过 KernelSU / APatch 模块 WebUI 入口或 Magisk「操作」按钮进入面板，一键完成 Debian 运行时与业务脚本的签名校验与原子部署。
 - **全功能自动化工作流**
-  内置完整的日常任务编排、每周关卡排程（周计划）、基建三班轮换（自动同步干员基建技能门槛）、理智药到期自动使用策略、干员盒识别扫描与培养材料缺口规划，以及官服《明日方舟》客户端在线检查与一键更新。
+  内置完整的 7 步默认日常流水线、可视化定时排程、每周关卡排程（周计划）、基建三班轮换（自动同步干员基建技能门槛）、培养目标周计划兜底与三段式零冲突理智/理智药瀑布流调度、干员盒识别与红票换芯片助剂 / 分阶段自动精英化（可选开启）、5 类通知推送渠道（PushPlus / Server酱 / Bark / 飞书钉钉企微 Webhook / Telegram）、代理与 GitHub 镜像、配置一键脱敏备份恢复，以及五服客户端版本检测、官服/B服自动更新与海外服商店跳转 / `.apk`/`.xapk` 分包安装。
 - **独立沙箱与严苛安全边界**
   - **零系统分区污染**：不修改 `/system`、`/vendor`、`/product`，不关闭系统 SELinux。
   - **纯本机回环通信**：守护进程 `maa-managerd`（`127.0.0.1:8088`）与内部 WebUI（`127.0.0.1:8089`）仅绑定本地回环地址；本机回环 ADB（`127.0.0.1:5555`）通过 `iptables` 强制限制在 `lo` 接口，局域网与公网均无法触达。
@@ -37,7 +37,7 @@
 | **Android 版本** | Android 11 – Android 16（API 30+；已完成 Android 16 + KernelSU 真机冷启动与任务验证） |
 | **Root 管理器** | **KernelSU**（推荐，原生内嵌 WebUI）、**APatch** 或 **Magisk**（v24+） |
 | **可用存储空间** | 建议 `/data` 分区剩余空间 **≥ 5 GB**（用于存放独立 Debian 运行时、MaaCore 资源及游戏更新包） |
-| **游戏客户端** | 已安装官服（`com.hypergryph.arknights`）或 B 服（`com.hypergryph.arknights.bilibili`），并已在游戏内手动登录过账号 |
+| **游戏客户端** | 已安装官服（`Official`）、B 服（`Bilibili`）或海外服（`YoStarEN` / `YoStarJP` / `YoStarKR`），并已在游戏内手动登录过账号 |
 
 > [!NOTE]
 > MaaZero 不托管、不保存你的游戏账号密码，也不会修改游戏客户端文件；游戏登录态由《明日方舟》客户端自身维护。
@@ -48,8 +48,8 @@
 
 ### 第 1 步：下载并刷入模块
 
-1. 前往 [GitHub Releases](https://github.com/misakayyds/MaaZero/releases) 下载最新正式版模块包 **`MaaZero-v0.1.0.zip`**（注意：请下载该模块 ZIP，**不要**下载 GitHub 自动生成的 `Source code` 压缩包）。
-2. 打开手机上的 **KernelSU / APatch / Magisk**，进入「模块」页面选择从本地安装 `MaaZero-v0.1.0.zip`，刷入完成后点击 **重启设备**。
+1. 前往 [GitHub Releases](https://github.com/misakayyds/MaaZero/releases) 下载最新正式版模块包 **`MaaZero-v0.1.1.zip`**（注意：请下载该模块 ZIP，**不要**下载 GitHub 自动生成的 `Source code` 压缩包）。
+2. 打开手机上的 **KernelSU / APatch / Magisk**，进入「模块」页面选择从本地安装 `MaaZero-v0.1.1.zip`，刷入完成后点击 **重启设备**。
 
 ### 第 2 步：一键部署运行沙箱
 
@@ -61,9 +61,9 @@
 
 ### 第 3 步：初始化资源并开始使用
 
-1. 环境启动完成后自动进入 MAA 管理主页，选择你的客户端类型（官服 / B 服）。
+1. 环境启动完成后自动进入 MAA 管理主页，在设置页选择你的全局客户端类型（官服 / B 服 / 国际服 / 日服 / 韩服）。
 2. 首次使用时点击面板中的 **更新 MAA 资源**（首次检测到未安装 `libMaaCore.so` 时将自动完成 `MaaCore` 与官方资源包初始化）。
-3. 如遇官服客户端大版本更新，可直接在面板点击 **更新客户端 APK** 完成下载安装；随后即可手动点击开始任务，或在「周计划」「基建」「培养」标签页配置全自动定时挂机。
+3. 如遇客户端大版本更新，官服与 B 服可直接点击 **更新客户端** 自动下载安装，海外服支持官方强更提醒、一键跳转商店与自定义 `.apk`/`.xapk` 分包安装；随后即可在「定时」「周计划」「基建」「培养」标签页配置全自动挂机。
 
 详细使用说明与常见问题排查请参阅模块内置的离线手册：[docs/user-guide.md](docs/user-guide.md)。
 
@@ -105,9 +105,9 @@ MaaZero 采用「静态签名清单（GitHub Pages）+ 不可变版本大文件�
 
 | 组件 / 文件 | 托管位置 | 用途说明 |
 | :--- | :--- | :--- |
-| `MaaZero-v0.1.0.zip` | GitHub Releases (`v0.1.0`) | 用户首次刷入的最小 Root 引导模块（含 `maa-managerd` 与 `release.json`） |
-| `maa-managerd` | GitHub Releases (`v0.1.0`) | 静态编译 ARM64 编排守护进程二进制 |
-| `maa-phone-project-0.1.0.tar.gz` | GitHub Releases (`v0.1.0`) | 28 个业务与 WebUI 脚本的确定性版本归档包 |
+| `MaaZero-v0.1.1.zip` | GitHub Releases (`v0.1.1`) | 用户首次刷入的最小 Root 引导模块（含 `maa-managerd` 与 `release.json`） |
+| `maa-managerd` | GitHub Releases (`v0.1.1`) | 静态编译 ARM64 编排守护进程二进制 |
+| `maa-phone-project-0.1.1.tar.gz` | GitHub Releases (`v0.1.1`) | 29 个业务与 WebUI 脚本的确定性版本归档包 |
 | `debian-rootfs-12.11.0-arm64.tar.gz` | GitHub Releases (`rootfs-12.11.0`) | 纯净构建的 Debian Bookworm ARM64 运行时归档（预置 `maa-cli` 与运行库） |
 | `channels/{stable,beta}.json{,.sig}` | GitHub Pages (`manifest/channels/`) | 经 Ed25519 私钥签名的通道版本清单与 64 字节原始签名 |
 
@@ -124,17 +124,17 @@ Pop-Location
 Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED
 
 # 2. 构建白名单业务脚本包与确定性归档
-pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/project/build-project.ps1 -Out dist/project -Version 0.1.0
-python -B packaging/package-project-archive.py --src dist/project/project --out dist/maa-phone-project-0.1.0.tar.gz
+pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/project/build-project.ps1 -Out dist/project -Version 0.1.1
+python -B packaging/package-project-archive.py --src dist/project/project --out dist/maa-phone-project-0.1.1.tar.gz
 
-# 3. 生成通道清单并使用仓库外 Ed25519 私钥签名
-python -B packaging/generate-manifests.py --version 0.1.0 --rootfs dist/debian-rootfs-12.11.0-arm64.tar.gz
+# 3. 生成通道清单并使用仓库外 Ed25519 私钥签名（每次发布须递增 --sequence）
+python -B packaging/generate-manifests.py --version 0.1.1 --sequence 2 --rootfs dist/debian-rootfs-12.11.0-arm64.tar.gz
 python -B packaging/sign-manifests.py --key-file "$HOME/.ssh/maa_phone_manager_release_ed25519"
 
 # 4. 打包正式版 Root 模块 ZIP
 pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/build-module.ps1 `
   -Release -ManagerBinary bin/maa-managerd -ReleaseConfig dist/release.json `
-  -Version 0.1.0 -VersionCode 100 -Force
+  -Version 0.1.1 -VersionCode 101 -Force
 
 # 5. 运行全套单元、打包与端到端回归测试
 Push-Location manager; go vet ./...; go test ./... -count=1; Pop-Location

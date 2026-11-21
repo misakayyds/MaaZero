@@ -19,7 +19,7 @@ func TestVersionAndRejectedCommands(t *testing.T) {
 	if err := run([]string{"version"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "0.1.0\n" {
+	if out.String() != "0.1.1\n" {
 		t.Fatal(out.String())
 	}
 	for _, args := range [][]string{{}, {"shell", "id"}, {"serve", "--listen", "0.0.0.0:8088"}} {

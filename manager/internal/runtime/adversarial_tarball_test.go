@@ -86,10 +86,13 @@ func buildCleanCheckoutProjectTarball(t *testing.T) string {
 }
 
 func TestProjectTarballFlawlessAndAdversarialMutations(t *testing.T) {
-	tarballPath := filepath.Join("..", "..", "..", "dist", "maa-phone-project-0.1.0.tar.gz")
+	tarballPath := filepath.Join("..", "..", "..", "dist", "maa-phone-project-0.1.1.tar.gz")
 	if _, err := os.Stat(tarballPath); os.IsNotExist(err) {
+		fallbackPath := filepath.Join("..", "..", "..", "dist", "maa-phone-project-0.1.0.tar.gz")
 		previewPath := filepath.Join("..", "..", "..", "dist", "maa-phone-project-0.1.0-preview.tar.gz")
-		if _, err2 := os.Stat(previewPath); err2 == nil {
+		if _, err1 := os.Stat(fallbackPath); err1 == nil {
+			tarballPath = fallbackPath
+		} else if _, err2 := os.Stat(previewPath); err2 == nil {
 			tarballPath = previewPath
 		} else {
 			tarballPath = buildCleanCheckoutProjectTarball(t)

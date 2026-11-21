@@ -33,7 +33,7 @@ import (
 	"maa-phone-manager/manager/internal/store"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 // daemonVersion is the single source for both the CLI answer and the version the
 // local API reports, so the WebUI card and the packaged module cannot drift.

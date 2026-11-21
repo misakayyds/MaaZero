@@ -23,7 +23,7 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
 
 DEFAULT_REPO = "misakayyds/MaaZero"
 DEFAULT_PUBLISHER = "MaaZero"
-DEFAULT_VERSION = "0.1.0"
+DEFAULT_VERSION = "0.1.1"
 DEFAULT_ROOTFS_VERSION = "12.11.0"
 
 
