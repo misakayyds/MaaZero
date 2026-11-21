@@ -1054,9 +1054,28 @@ sleep_screen_if_configured() {
     fi
 }
 
+dismiss_sim_plug_out_dialog() {
+    local attempt_num="${1:-1}"
+    local header width height tap_x=960 tap_y=657
+
+    header=$(probe_raw_screencap_header 2>/dev/null || true)
+    read -r width height _ <<< "$header"
+    if [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] && (( width > 0 && height > 0 )); then
+        tap_x=$(( width / 2 ))
+        tap_y=$(( height / 2 + 117 ))
+    fi
+
+    timeout --foreground 4s adb $ADB_DEVICE shell input tap "$tap_x" "$tap_y" >/dev/null 2>&1 || true
+    if (( attempt_num >= 2 )); then
+        sleep 1
+        timeout --foreground 4s adb $ADB_DEVICE shell input keyevent KEYCODE_ENTER >/dev/null 2>&1 || true
+        timeout --foreground 4s adb $ADB_DEVICE shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    fi
+}
+
 startup_overlay_watchdog_loop() {
     local label="${1:-startup}"
-    local resumed focus dismiss_count=0
+    local resumed focus current_focus_line win_id win_pkg dismiss_count=0
 
     info "启动系统遮挡 watcher: $label"
     while true; do
@@ -1065,16 +1084,39 @@ startup_overlay_watchdog_loop() {
             | head -n 8 || true)
 
         if printf '%s\n' "$resumed" | grep -q "$AK_PACKAGE"; then
-            focus=$(timeout --foreground 8s adb $ADB_DEVICE shell dumpsys window windows 2>/dev/null \
+            focus=$(timeout --foreground 8s adb $ADB_DEVICE shell dumpsys window displays 2>/dev/null \
                 | grep -E 'mCurrentFocus|mFocusedApp|mInputMethodTarget' \
                 | head -n 12 || true)
+            current_focus_line=$(printf '%s\n' "$focus" | grep 'mCurrentFocus=' | head -n 1 || true)
 
-            if printf '%s\n' "$focus" | grep -q 'com.android.systemui'; then
-                dismiss_count=$((dismiss_count + 1))
-                warn "检测到系统弹窗遮挡 StartUp，尝试关闭: label=$label count=$dismiss_count focus=$(printf '%s' "$focus" | tr '\r\n' ' ' | cut -c1-260)"
-                timeout --foreground 4s adb $ADB_DEVICE shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
-                sleep 3
-                continue
+            if [[ -n "$current_focus_line" ]] &&
+               ! printf '%s\n' "$current_focus_line" | grep -qE "$AK_PACKAGE|mCurrentFocus=null"; then
+                win_id=$(printf '%s\n' "$current_focus_line" | sed -n 's/.*Window{\([0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' | head -n 1)
+                win_pkg=""
+                if [[ -n "$win_id" ]]; then
+                    win_pkg=$(timeout --foreground 8s adb $ADB_DEVICE shell dumpsys window windows 2>/dev/null \
+                        | grep -A 6 "Window{$win_id " \
+                        | sed -n 's/.*package=\([^[:space:]]*\).*/\1/p' \
+                        | head -n 1 || true)
+                fi
+
+                if printf '%s\n' "$current_focus_line $win_pkg" | grep -qE '未安装 ?SIM ?卡|com\.android\.phone|com\.android\.simsettings|com\.android\.stk|SimPlugOut|CardUnusable|SimChanged'; then
+                    dismiss_count=$((dismiss_count + 1))
+                    warn "检测到 SIM/电话系统弹窗遮挡，尝试点击确定关闭: label=$label count=$dismiss_count pkg=${win_pkg:-unknown} focus=$(printf '%s' "$current_focus_line" | tr '\r\n' ' ' | cut -c1-200)"
+                    dismiss_sim_plug_out_dialog "$dismiss_count"
+                    sleep 3
+                    continue
+                fi
+
+                if printf '%s\n' "$focus $win_pkg" | grep -q 'com.android.systemui'; then
+                    dismiss_count=$((dismiss_count + 1))
+                    warn "检测到系统弹窗遮挡 StartUp，尝试关闭: label=$label count=$dismiss_count pkg=${win_pkg:-com.android.systemui} focus=$(printf '%s' "$focus" | tr '\r\n' ' ' | cut -c1-260)"
+                    timeout --foreground 4s adb $ADB_DEVICE shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+                    sleep 3
+                    continue
+                fi
+            else
+                dismiss_count=0
             fi
         fi
 
@@ -1591,6 +1633,10 @@ classify_startup_failure_reason() {
         return 0
     fi
 
+    if grep -qE '未安装 ?SIM ?卡|检测到 SIM/电话系统弹窗遮挡' "$maa_log" "$logcat_file" 2>/dev/null ||
+       { [[ -s "$asst_log" ]] && tail -n 600 "$asst_log" 2>/dev/null | grep -qE '未安装 ?SIM ?卡'; }; then
+        reason="${reason}_SIM_DIALOG"
+    fi
     if grep -qE 'USB用于|USB 用于|仅充电|传输文件|AndroidAuto|Android Auto' "$maa_log" "$logcat_file" 2>/dev/null; then
         reason="${reason}_USB_DIALOG"
     fi
@@ -1626,6 +1672,9 @@ record_startup_failure_state() {
     if [[ "$reason" == *SERVER_MAINTENANCE* ]]; then
         set_failure_reason "SERVER_MAINTENANCE"
         warn "启动失败分型命中服务器停机维护公告: reason=$reason screen=$screen"
+    elif [[ "$reason" == *SIM_DIALOG* ]]; then
+        set_failure_reason "SIM_DIALOG"
+        warn "启动失败分型命中 SIM 卡系统弹窗遮挡: reason=$reason screen=$screen"
     elif [[ "${KEYGUARD_STILL_LOCKED:-0}" -eq 1 ]]; then
         set_failure_reason "KEYGUARD_LOCKED"
         warn "启动失败分型命中安全锁屏遮挡: reason=$reason screen=$screen"
@@ -1640,6 +1689,7 @@ record_startup_failure_state() {
 }
 
 capture_task_startup_failure_state() {
+    local classify_ec="${1:-1}"
     local ts screen_file logcat_file logcat_since reason screen detail started_for_logcat
 
     ts=$(date +%Y%m%d-%H%M%S)
@@ -1667,7 +1717,7 @@ capture_task_startup_failure_state() {
     fi
 
     screen=$(classify_startup_screen "$screen_file")
-    reason=$(classify_startup_failure_reason "$LOG_FILE" "$logcat_file" 1)
+    reason=$(classify_startup_failure_reason "$LOG_FILE" "$logcat_file" "$classify_ec")
     detail="daily task startup phase failed; screenshot=$screen_file logcat=$logcat_file"
     record_startup_failure_state "$reason" "$screen" "$detail"
 }
@@ -2169,7 +2219,8 @@ run_maa_task() {
             fi
             info "CULTIVATION_RUN: 培养目标已启用，本轮由培养运行编排接管 task=${task} 文件=${cultivation_task_file}（失败不自动重跑）"
             timeout --foreground -k 30s "$TASK_TIMEOUT" python3 "$CULTIVATION_RUN_SCRIPT" --mode execute \
-                --task-file "$cultivation_task_file" --config-dir "$cultivation_config_dir" > "$fifo" 2>&1 &
+                --task-file "$cultivation_task_file" --config-dir "$cultivation_config_dir" \
+                --started-at "$medicine_started_at" > "$fifo" 2>&1 &
         else
             timeout --foreground -k 30s "$TASK_TIMEOUT" python3 "$RUN_SESSION_SCRIPT" exec \
                 --session "$MAA_RUN_SESSION" --config-dir "$(maa dir config)" \
@@ -2329,7 +2380,6 @@ run_maa_task() {
             set_failure_reason "RUNNER_OUTPUT_FAILED"
             error "RUNNER_OUTPUT_FAILED: stream_status=$output_stream_status"
         fi
-        stop_startup_overlay_watchdog
         cleanup_effective_task_config
         rm -f "$fifo"
 
@@ -2348,6 +2398,7 @@ run_maa_task() {
         if (( ec == 0 )) && (( cultivation_active == 0 )); then
             run_closing_scan "$task"
         fi
+        stop_startup_overlay_watchdog
 
         if (( SCHEDULED_MODE == 1 )); then
             if (( SCHEDULE_MARK_FAILED == 1 )); then
@@ -2450,6 +2501,9 @@ run_maa_task() {
             return 0
         else
             warn "任务失败 exit=$ec attempt=$attempt/$MAX_RETRIES"
+            if [[ "$STARTUP_HEALTH_STATUS" == "running" && "$aborted" -eq 0 ]]; then
+                capture_task_startup_failure_state "$ec"
+            fi
             if [[ "$ec" -eq 91 ]]; then
                 error "启动健康门失败，不继续盲目重试"
                 return "$ec"
@@ -2786,6 +2840,7 @@ collect_failure_snapshot() {
         echo "=== activity ==="
         adb $ADB_DEVICE shell dumpsys activity activities 2>/dev/null | grep -E 'mResumedActivity|topResumedActivity|ResumedActivity' | head -n 20 || true
         echo "=== window focus ==="
+        adb $ADB_DEVICE shell dumpsys window displays 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp|mInputMethodTarget' | head -n 20 || true
         adb $ADB_DEVICE shell dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp|mInputMethodTarget' | head -n 20 || true
         echo "=== game pids ==="
         adb $ADB_DEVICE shell pidof "$AK_PACKAGE" 2>/dev/null || true
@@ -3046,6 +3101,10 @@ def explain_failure_line(line):
         return "ADB 连接失败：控制链路没有连上 Android ADB，任务可能尚未稳定进入 MAA。"
     if "服务器停机维护公告" in text or "开启服务器停机维护" in text:
         return "服务器停机维护：检测到官方停机维护公告，维护期间无法登录游戏，本轮已安全停止。"
+    if "检测到 SIM/电话系统弹窗遮挡" in text or "启动失败分型命中 SIM 卡系统弹窗遮挡" in text:
+        return "系统弹窗遮挡：检测到 Android「未安装 SIM 卡」弹窗遮挡，已尝试自动点击确定关闭。"
+    if "检测到系统弹窗遮挡" in text:
+        return "系统弹窗遮挡：检测到 Android 系统界面抢占焦点，已尝试自动返回关闭。"
     if "KEYGUARD_LOCKED" in text or "仍处于锁屏界面" in text:
         return "锁屏未解锁：检测到密码/图案/生物识别锁屏遮挡，自动唤醒无法解锁，请将系统锁屏设为“无”或“滑动”。"
     if "StartUp Error" in text or "启动健康门失败" in text:
@@ -3391,6 +3450,13 @@ if exit_code != 0:
     if maintenance_detected:
         window_note = f"（{maintenance_window}）" if maintenance_window else ""
         interesting.append(f"服务器停机维护：检测到官方停机维护公告{window_note}，维护期间无法登录游戏，本轮已安全停止。")
+    sim_dialog_detected = (
+        failure_reason == "SIM_DIALOG"
+        or "SIM_DIALOG" in (startup_reason or "")
+        or any("未安装SIM卡" in line or "未安装 SIM 卡" in line for line in run_asst)
+    )
+    if sim_dialog_detected:
+        interesting.append("系统弹窗遮挡：检测到 Android「未安装 SIM 卡」系统弹窗阻断游戏交互，请检查 SIM 卡槽接触状态。")
     patterns = ("ERROR", "WARN", "FAILED", "任务失败", "失败现场", "启动健康", "ScreencapFailed", "截图故障诊断", "截图性能异常", "没有稳定的截图通道", "游戏掉线", "重新连接", "Reconnect", "Disconnect", "timeout when reading")
     for line in log_lines:
         if any(p in line for p in patterns):

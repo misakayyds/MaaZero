@@ -1903,3 +1903,366 @@ if __name__ == "__main__":
         finally:
             srv.shutdown()
             srv.server_close()
+
+    # ========================================================================
+    # Synced MAA Features + MaaZero Adaptation Regressions (Blocks 1-3)
+    # ========================================================================
+
+    def test_sync_01_cultivation_catalyst_auto_elite_and_multi_client(self) -> None:
+        """Verify red-ticket catalyst unblock, phased auto-elite gate, multi-client StartUp, and backup exclusion."""
+        import unittest.mock as mock
+        import maa_cultivation_service
+        import maa_cultivation_runtime
+
+        catalog_path = self.source_dir / "maa-cultivation-data.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        self.assertIn("4006", catalog["items"])
+        self.assertTrue(any(s.get("stage") == "AP-5" for s in catalog["stages"]))
+
+        # 1. Multi-client StartUp propagation in ensure_elite_task_file & ephemeral task exclusion from backup
+        maa_schedule_control.save_runtime_settings(self.config_dir, {"client_type": "Bilibili"})
+        oper_task = {
+            "name": "干员精英化",
+            "type": "OperProgress",
+            "params": {"plans": [{"role": "Sniper", "name": "能天使", "elite": 1}]},
+        }
+        elite_toml = maa_cultivation_runtime.ensure_elite_task_file(self.config_dir, oper_task)
+        elite_text = elite_toml.read_text(encoding="utf-8")
+        self.assertIn('client_type = "Bilibili"', elite_text)
+        self.assertNotIn('client_type = "Official"', elite_text)
+
+        maa_cultivation_runtime.ensure_scan_task_file(self.config_dir)
+        maa_cultivation_runtime.ensure_mastery_task_file(self.config_dir, oper_task)
+        backup = maa_schedule_control.export_config_backup(self.config_dir)
+        exported_paths = set((backup.get("files") or {}).keys())
+        for ephemeral in (
+            "tasks/cultivation-elite.toml",
+            "tasks/cultivation-scan.toml",
+            "tasks/cultivation-mastery.toml",
+        ):
+            self.assertNotIn(ephemeral, exported_paths)
+
+        # 2. Phased auto-elite readiness + red-ticket (4006) unblocking chip catalyst (32001)
+        now_iso = datetime.now(timezone(timedelta(hours=8))).isoformat()
+        box_ops = [
+            {
+                "id": "char_103_angel",
+                "name": "能天使",
+                "own": True,
+                "rarity": 6,
+                "elite": 0,
+                "level": 50,
+                "potential": 1,
+            }
+        ]
+        maa_operator_box.save_successful_scan(
+            self.config_dir / "operator-box.json",
+            self.config_dir / "operator-box-state.json",
+            {"what": "OperBoxInfo", "details": {"done": True, "all_opers": box_ops, "own_opers": box_ops}},
+            scanned_at=now_iso,
+            source_log="test",
+            core_version="v6.22.0",
+            resource_version="2026-11-15",
+        )
+        maa_cultivation_service.save_goal(
+            self.config_dir,
+            catalog_path,
+            {
+                "operator_id": "char_103_angel",
+                "current_elite": 0,
+                "current_level": 50,
+                "target_elite": 2,
+                "target_level": 1,
+            },
+        )
+        # Provide all E1 materials + LMD + red tickets for catalyst (32001), but intentionally omit E2 chips
+        maa_cultivation_service.save_inventory(
+            self.config_dir,
+            {
+                "4001": 500000,
+                "4006": 450,
+                "2004": 500,
+                "30012": 20,
+                "30052": 10,
+                "3241": 5,
+            },
+        )
+        maa_cultivation_service.update_settings(
+            self.config_dir, catalog_path, {"enabled": True, "auto_elite": True}
+        )
+        payload = maa_cultivation_service.get_payload(self.config_dir, catalog_path)
+        plan = payload["plan"]
+        blocked_ids = {row.get("item_id") for row in (plan.get("blocked") or [])}
+        self.assertNotIn("32001", blocked_ids)
+        exchange_targets = {row.get("item_id") for row in (plan.get("exchanges") or [])}
+        self.assertIn("32001", exchange_targets)
+        goal_row = plan["goals"][0]
+        self.assertEqual(goal_row["promotion"]["ready_elite"], 1)
+        self.assertEqual(goal_row["promotion"]["verified_ready_elite"], 1)
+
+        # 3. WebUI cultivation_elite_run_gate allows verified E1 promotion and rejects when stale/empty
+        spec = importlib.util.spec_from_file_location("maa_webui_sync_elite", self.source_dir / "maa-webui.py")
+        assert spec is not None and spec.loader is not None
+        webui = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(webui)
+        with (
+            mock.patch.object(webui, "CONFIG_DIR", str(self.config_dir)),
+            mock.patch.object(webui, "CULTIVATION_CATALOG_FILE", str(catalog_path)),
+        ):
+            self.assertIsNone(webui.cultivation_elite_run_gate())
+            maa_cultivation_service.mark_inventory_failed(self.config_dir, "stale for test")
+            blocked = webui.cultivation_elite_run_gate()
+            self.assertIsNotNone(blocked)
+            assert blocked is not None
+            self.assertEqual(blocked[0], 409)
+            self.assertEqual(blocked[1]["error"]["code"], "disabled")
+
+    def test_sync_02_waterfall_scheduling_and_medicine_coordination(self) -> None:
+        """Verify 3-stage waterfall validation, bidirectional medicine sync, multi-region activity, and blind deduction."""
+        import unittest.mock as mock
+        import maa_cultivation_service
+        import maa_cultivation_runtime
+        import maa_medicine_service
+
+        catalog_path = self.source_dir / "maa-cultivation-data.json"
+
+        # 1. activity_first + fallback_mode='stage' must reject with 400 invalid_settings
+        with self.assertRaises(maa_cultivation_service.InvalidSettingsError) as ctx:
+            maa_cultivation_service.update_settings(
+                self.config_dir,
+                catalog_path,
+                {"priority_mode": "activity_first", "fallback_mode": "stage"},
+            )
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.code, "invalid_settings")
+
+        # 2. Bidirectional sync between cultivation medicine_mode and medicine-plan.json
+        maa_cultivation_service.update_settings(
+            self.config_dir,
+            catalog_path,
+            {
+                "enabled": True,
+                "priority_mode": "cultivation_first",
+                "medicine_mode": "strict_none",
+                "fallback_mode": "weekly",
+            },
+        )
+        self.assertFalse(maa_medicine_service.settings(self.config_dir)["enabled"])
+        rev_before = maa_cultivation_service.load_state(self.config_dir)["revision"]
+
+        med_payload = maa_medicine_service.update_settings(
+            self.config_dir, {"enabled": True, "threshold": 95}
+        )
+        state_after = maa_cultivation_service.load_state(self.config_dir)
+        self.assertEqual(state_after["settings"]["medicine_mode"], "expire_only")
+        self.assertEqual(state_after["revision"], rev_before + 1)
+        self.assertTrue(med_payload["cultivation_coordination"]["active"])
+        self.assertEqual(med_payload["cultivation_coordination"]["medicine_mode"], "expire_only")
+
+        # 3. Multi-region StageActivityV2 lookup (YoStarEN vs Bilibili->Official fallback) + env-var path decoupling
+        act_file = self.sandbox_path / "custom_StageActivityV2.json"
+        item_file = self.sandbox_path / "custom_item_index.json"
+        act_data = {
+            "Official": {
+                "sideStoryStage": {
+                    "CN_ACT": {
+                        "Activity": {
+                            "StageName": "CN Event",
+                            "UtcStartTime": "2026/11/01 16:00:00",
+                            "UtcExpireTime": "2026/12/01 03:59:59",
+                            "TimeZone": 8,
+                        },
+                        "Stages": [{"Value": "CN-8", "Drop": "30013"}],
+                    }
+                }
+            },
+            "YoStarEN": {
+                "sideStoryStage": {
+                    "EN_ACT": {
+                        "Activity": {
+                            "StageName": "EN Event",
+                            "UtcStartTime": "2026/11/01 16:00:00",
+                            "UtcExpireTime": "2026/12/01 03:59:59",
+                            "TimeZone": 8,
+                        },
+                        "Stages": [{"Value": "EN-8", "Drop": "30013"}],
+                    }
+                }
+            },
+        }
+        act_file.write_text(json.dumps(act_data), encoding="utf-8")
+        item_file.write_text(json.dumps({"30013": {"name": "固源岩组"}}), encoding="utf-8")
+        (self.config_dir / "tasks" / "daily.toml").write_text(
+            '[[tasks]]\nname = "理智作战"\ntype = "Fight"\nparams = { stage = "EN-8" }\n',
+            encoding="utf-8",
+        )
+        maa_schedule_control.save_runtime_settings(self.config_dir, {"client_type": "YoStarEN"})
+        fixed_now = datetime(2026, 11, 15, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+        with (
+            mock.patch.object(maa_cultivation_service, "ACTIVITY_FILE", act_file),
+            mock.patch.object(maa_cultivation_service, "ITEM_FILE", item_file),
+            mock.patch.object(maa_cultivation_service, "_weekly_now", return_value=fixed_now),
+        ):
+            wctx = maa_cultivation_service.get_payload(self.config_dir, catalog_path)["weekly_context"]
+        self.assertTrue(wctx["is_activity_stage"])
+        self.assertEqual(wctx["effective_stage"], "EN-8")
+        self.assertEqual(wctx["activity_item_id"], "30013")
+
+        week = maa_medicine_service.load_week(self.config_dir)
+        rules_en = maa_medicine_service.activity_rules(
+            week, 80, act_file, item_file, config_dir=self.config_dir
+        )
+        self.assertEqual([r["stage"] for r in rules_en], ["EN-8"])
+
+        # Bilibili falls back cleanly to Official region
+        (self.config_dir / "tasks" / "daily.toml").write_text(
+            '[[tasks]]\nname = "理智作战"\ntype = "Fight"\nparams = { stage = "CN-8" }\n',
+            encoding="utf-8",
+        )
+        maa_schedule_control.save_runtime_settings(self.config_dir, {"client_type": "Bilibili"})
+        rules_bili = maa_medicine_service.activity_rules(
+            maa_medicine_service.load_week(self.config_dir),
+            80,
+            act_file,
+            item_file,
+            config_dir=self.config_dir,
+        )
+        self.assertEqual([r["stage"] for r in rules_bili], ["CN-8"])
+
+        # 4. claim_cultivation_drain + double finish() idempotent blind-use watermark + --started-at CLI arg
+        started_iso = "2026-11-15T02:05:00+08:00"
+        evidence_path = self.config_dir / "medicine-evidence.json"
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "accurate": True,
+                    "observed_at": "2026-11-14T16:00:00+08:00",
+                    "expires_at": "2026-11-15T20:00:00+08:00",
+                    "remaining_count": 3,
+                    "source": "trc",
+                    "batches": [
+                        {"remaining": 1, "expires_at": "2026-11-15T20:00:00+08:00"},
+                        {"remaining": 2, "expires_at": "2026-11-20T20:00:00+08:00"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        asst_log = self.sandbox_path / "blind_asst.log"
+        asst_log.write_text("", encoding="utf-8")
+        claim = maa_medicine_service.claim_cultivation_drain(
+            self.config_dir,
+            now=started_iso,
+            started_at=started_iso,
+            activity_file=act_file,
+            item_file=item_file,
+            log_file=asst_log,
+        )
+        self.assertEqual(claim["action"], "drain")
+        self.assertEqual(claim["expiring_count"], 1)
+
+        # Simulate blind UseMedicine callback (no init_count line) and double finish()
+        asst_log.write_text(
+            '[2026-11-15 02:10:00.000][INF][Px1][Tx1] Assistant::append_callback | SubTaskExtraInfo {"what":"UseMedicine","details":{"count":1}}\n',
+            encoding="utf-8",
+        )
+        maa_medicine_service.finish(self.config_dir, started_iso, 0, log_file=asst_log)
+        maa_medicine_service.finish(self.config_dir, started_iso, 0, log_file=asst_log)
+
+        ev_after = json.loads(evidence_path.read_text(encoding="utf-8"))
+        self.assertEqual(ev_after["remaining_count"], 2)
+        self.assertEqual(ev_after["blind_deducted_since"], started_iso)
+        self.assertEqual(ev_after["blind_deducted_used"], 1)
+        attempt_after = json.loads((self.config_dir / "medicine-attempt.json").read_text(encoding="utf-8"))
+        self.assertEqual(attempt_after["status"], "finished")
+        self.assertEqual(attempt_after["confirmed_used"], 1)
+
+        # Re-claiming in the same 02:00 window is blocked as already done
+        replay = maa_medicine_service.claim_cultivation_drain(
+            self.config_dir,
+            now="2026-11-15T02:20:00+08:00",
+            started_at="2026-11-15T02:20:00+08:00",
+            activity_file=act_file,
+            item_file=item_file,
+            log_file=asst_log,
+        )
+        self.assertEqual(replay["action"], "done")
+
+        parsed = maa_cultivation_runtime.build_parser().parse_args(
+            ["--mode", "execute", "--started-at", started_iso]
+        )
+        self.assertEqual(parsed.started_at, started_iso)
+
+    def test_sync_03_sim_dialog_recovery_gamestart_bound_and_timeout_redline(self) -> None:
+        """Verify StartUp@SimPlugOutDialog + GameStart bound compose with stop-at-login and enforce timeout --foreground."""
+        import maa_run_session
+
+        sample_tasks = {
+            "StartUp@CloseAnnos": {"next": ["CloseAnno", "TodaysSupplies"]},
+            "StartUpThemes": {"next": ["StartUp@CloseAnnos"]},
+            "GameStart": {"template": "GameStart.png", "maxTimes": 99},
+        }
+        patched = maa_run_session.with_mooncake_announcement(sample_tasks)
+        self.assertIn("StartUp@SimPlugOutDialog", patched)
+        self.assertEqual(patched["StartUp@CloseAnnos"]["next"][:2], ["StartUp@MooncakeTutorial", "StartUp@SimPlugOutDialog"])
+        self.assertEqual(patched["GameStart"]["maxTimes"], 15)
+        self.assertEqual(patched["GameStart"]["exceededNext"][0], "StartUp@SimPlugOutDialog")
+        self.assertEqual(patched["StartUp@SimPlugOutDialog"]["reduceOtherTimes"], ["StartUp@GameStart"])
+
+        # Must compose cleanly with MaaZero's with_stop_at_login
+        composed = maa_run_session.with_stop_at_login(patched)
+        self.assertEqual(composed["StartToWakeUp"]["action"], "Stop")
+        self.assertEqual(composed["GameStart"]["maxTimes"], 15)
+        self.assertIn("StartUp@SimPlugOutDialog", composed)
+
+        # Verify maa-run.sh hooks and universal timeout --foreground redline across all shell scripts
+        run_sh = (self.source_dir / "maa-run.sh").read_text(encoding="utf-8")
+        self.assertIn("dismiss_sim_plug_out_dialog()", run_sh)
+        self.assertIn("dumpsys window displays", run_sh)
+        self.assertIn('--started-at "$medicine_started_at"', run_sh)
+        self.assertIn('reason="${reason}_SIM_DIALOG"', run_sh)
+        self.assertIn('set_failure_reason "SIM_DIALOG"', run_sh)
+        self.assertIn("sim_dialog_detected =", run_sh)
+        self.assertIn(
+            '        if (( ec == 0 )) && (( cultivation_active == 0 )); then\n'
+            '            run_closing_scan "$task"\n'
+            '        fi\n'
+            '        stop_startup_overlay_watchdog',
+            run_sh,
+        )
+
+        # Static redline: no shell script under packaging/project/source/ may call timeout without --foreground
+        for sh_file in sorted(self.source_dir.glob("*.sh")):
+            for lineno, line in enumerate(sh_file.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("#") or '"124":' in stripped:
+                    continue
+                self.assertIsNone(
+                    re.search(r"(^|[;&|(\s])timeout\s+(?!--foreground\b)", line),
+                    msg=f"Bare timeout without --foreground at {sh_file.name}:{lineno}: {stripped}",
+                )
+
+    def test_sync_04_frontend_waterfall_and_auto_elite_js_syntax(self) -> None:
+        """Verify synced cultivation/weekly frontend JS syntax and WebUI route/CSS integration."""
+        node_bin = shutil.which("node")
+        self.assertIsNotNone(node_bin, "node is required to syntax-check frontend JS assets")
+        for js_name in ("maa-cultivation-ui.js", "maa-weekly-editor.js"):
+            js_path = self.source_dir / js_name
+            proc = subprocess.run(
+                [node_bin, "--check", str(js_path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"node --check failed for {js_name}: {proc.stderr}")
+
+        cult_js = (self.source_dir / "maa-cultivation-ui.js").read_text(encoding="utf-8")
+        weekly_js = (self.source_dir / "maa-weekly-editor.js").read_text(encoding="utf-8")
+        webui_py = (self.source_dir / "maa-webui.py").read_text(encoding="utf-8")
+
+        for token in ("cultivation/elite-run", "auto_elite", "priority_mode", "medicine_mode", "fallback_mode"):
+            self.assertIn(token, cult_js)
+        for token in ("syncCultivationAfterWeeklyChange", "cultivation_coordination"):
+            self.assertIn(token, weekly_js)
+        for token in ("def cultivation_elite_run_gate()", ".cult-sched-wrap", 'if p == "/api/cultivation/elite-run":'):
+            self.assertIn(token, webui_py)

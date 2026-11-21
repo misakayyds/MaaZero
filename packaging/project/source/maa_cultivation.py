@@ -398,10 +398,28 @@ def _item_entry(catalog: Mapping[str, Any], item_id: str) -> dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
+def _automatable_exchange(entry: Mapping[str, Any]) -> tuple[str, int] | None:
+    acquisition = entry.get("acquisition")
+    if not isinstance(acquisition, dict) or acquisition.get("automatable") is not True:
+        return None
+    currency_id = acquisition.get("currency")
+    price = acquisition.get("price")
+    if not isinstance(currency_id, str) or not currency_id:
+        return None
+    if type(price) is not int or price <= 0:
+        return None
+    return currency_id, price
+
+
 def _try_cover(
-    recipes: Mapping[str, Any], key: str, need: int, pools: dict[str, int], depth: int = 0
+    recipes: Mapping[str, Any],
+    key: str,
+    need: int,
+    pools: dict[str, int],
+    depth: int = 0,
+    items: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Can ``need`` of ``key`` be satisfied from ``pools`` using recipes only?
+    """Can ``need`` of ``key`` be satisfied from ``pools`` using recipes/exchanges?
 
     Used to decide whether an item that is *also* a conservative stage drop should
     be crafted right now (low tier materials already in stock) instead of being
@@ -421,21 +439,65 @@ def _try_cover(
     if need <= 0:
         return True
     recipe = recipes.get(key)
-    if not isinstance(recipe, dict):
-        return False
-    crafts = -(-need // recipe["output_count"])
-    for input_id, count in recipe["inputs"].items():
-        if not _try_cover(recipes, str(input_id), int(count) * crafts, pools, depth + 1):
-            return False
-    surplus = crafts * recipe["output_count"] - need
-    if surplus:
-        pools[key] = pools.get(key, 0) + surplus
-    return True
+    if isinstance(recipe, dict):
+        crafts = -(-need // recipe["output_count"])
+        for input_id, count in recipe["inputs"].items():
+            if not _try_cover(
+                recipes, str(input_id), int(count) * crafts, pools, depth + 1, items
+            ):
+                return False
+        surplus = crafts * recipe["output_count"] - need
+        if surplus:
+            pools[key] = pools.get(key, 0) + surplus
+        return True
+    if isinstance(items, Mapping):
+        entry = items.get(key)
+        if isinstance(entry, Mapping):
+            exchange = _automatable_exchange(entry)
+            if exchange is not None:
+                currency_id, price = exchange
+                return _try_cover(
+                    recipes, currency_id, need * price, pools, depth + 1, items
+                )
+    return False
 
 
 def _merge(add_to: dict[str, int], key: str, amount: int) -> None:
     if amount:
         add_to[key] = add_to.get(key, 0) + amount
+
+
+def _merge_exchange(
+    steps: dict[str, dict[str, Any]],
+    entry: Mapping[str, Any],
+    item_id: str,
+    count: int,
+    currency_id: str,
+    price: int,
+) -> None:
+    step = steps.get(item_id)
+    if step is None:
+        step = {
+            "item_id": item_id,
+            "name": entry.get("name") or item_id,
+            "quantity": 0,
+            "currency_id": currency_id,
+            "price": price,
+            "cost": 0,
+        }
+        steps[item_id] = step
+    step["quantity"] += count
+    step["cost"] += count * price
+
+
+def _merge_exchange_step(target: dict[str, dict[str, Any]], step: Mapping[str, Any]) -> None:
+    item_id = step["item_id"]
+    current = target.get(item_id)
+    if current is None:
+        target[item_id] = dict(step)
+        return
+    current["quantity"] += step["quantity"]
+    current["cost"] += step["cost"]
 
 
 def _merge_craft(steps: dict[str, dict[str, Any]], recipe: Mapping[str, Any], crafts: int) -> None:
@@ -481,7 +543,11 @@ def _plan_goal(
     pool: dict[str, int],
     books: dict[str, int],
     stages_by_code: Mapping[str, Mapping[str, Any]],
+    *,
+    compute_promotion: bool = True,
 ) -> dict[str, Any]:
+    start_pool = dict(pool) if compute_promotion else {}
+    start_books = dict(books) if compute_promotion else {}
     gold_key = catalog["currency"]["gold_item_id"]
     recipes = catalog["recipes"]
     leveling = catalog["leveling"]
@@ -566,6 +632,7 @@ def _plan_goal(
     blocked: list[dict[str, Any]] = []
     farm: list[dict[str, Any]] = []
     craft_steps: dict[str, dict[str, Any]] = {}
+    exchange_steps: dict[str, dict[str, Any]] = {}
     craft_surplus: dict[str, int] = {}
     # 合成余量只在当前目标内可用:原料还没拿到时不能凭“虚拟余量”让后续目标就绪。
     pending: dict[str, int] = {}
@@ -609,7 +676,7 @@ def _plan_goal(
                 snapshot = dict(pool)
                 for pending_key, pending_amount in pending.items():
                     snapshot[pending_key] = snapshot.get(pending_key, 0) + pending_amount
-                if not _try_cover(recipes, key, need, snapshot):
+                if not _try_cover(recipes, key, need, snapshot, 0, catalog["items"]):
                     recipe = None
             if source_kind == "stage_primary" and recipe is None:
                 _merge(missing, key, need)
@@ -633,6 +700,14 @@ def _plan_goal(
                     _merge(next_layer, str(input_id), total)
                     _merge(expanded, str(input_id), total)
                 continue
+            exchange = _automatable_exchange(entry)
+            if exchange is not None:
+                currency_id, price = exchange
+                total_cost = need * price
+                _merge_exchange(exchange_steps, entry, key, need, currency_id, price)
+                _merge(next_layer, currency_id, total_cost)
+                _merge(expanded, currency_id, total_cost)
+                continue
             if source_kind == "stage_bonus":
                 _merge(missing, key, need)
                 _record_farm(farm, entry, key, need, stages_by_code)
@@ -648,6 +723,42 @@ def _plan_goal(
         status = STATUS_MISSING
     else:
         status = STATUS_READY
+
+    promotion_phases: list[dict[str, Any]] = []
+    ready_elite = current_elite
+    if compute_promotion and target_elite > current_elite:
+        chain_ready = True
+        for cand_elite in range(current_elite + 1, target_elite + 1):
+            sub_goal = dict(goal)
+            sub_goal["target_elite"] = cand_elite
+            sub_goal["target_level"] = 1
+            sub_plan = _plan_goal(
+                catalog,
+                operator,
+                sub_goal,
+                dict(start_pool),
+                dict(start_books),
+                stages_by_code,
+                compute_promotion=False,
+            )
+            phase_ok = chain_ready and sub_plan["status"] == STATUS_READY
+            if phase_ok:
+                ready_elite = cand_elite
+            else:
+                chain_ready = False
+            promotion_phases.append(
+                {
+                    "elite": cand_elite,
+                    "status": sub_plan["status"],
+                    "ready": phase_ok,
+                    "lmd_total": sub_plan["lmd"]["total"],
+                    "missing": dict(sub_plan["missing"]),
+                    "blocked": list(sub_plan["blocked"]),
+                    "crafts": list(sub_plan["crafts"]),
+                    "exchanges": list(sub_plan["exchanges"]),
+                }
+            )
+
     return {
         "id": goal["id"],
         "operator_id": goal["operator_id"],
@@ -664,11 +775,18 @@ def _plan_goal(
         "expanded": expanded,
         "missing": missing,
         "crafts": list(craft_steps.values()),
+        "exchanges": list(exchange_steps.values()),
         "farm": farm,
         "blocked": blocked,
         "lmd": lmd,
         "exp": allocation,
         "craft_surplus": craft_surplus,
+        "promotion": {
+            "current_elite": current_elite,
+            "target_elite": target_elite,
+            "ready_elite": ready_elite,
+            "phases": promotion_phases,
+        },
     }
 
 
@@ -935,6 +1053,7 @@ def calculate_plan(catalog: Any, goals: Any, inventory: Any) -> dict[str, Any]:
     aggregate_requirements: dict[str, int] = {}
     aggregate_expanded: dict[str, int] = {}
     aggregate_crafts: dict[str, dict[str, Any]] = {}
+    aggregate_exchanges: dict[str, dict[str, Any]] = {}
     aggregate_farm: dict[str, dict[str, Any]] = {}
     aggregate_surplus: dict[str, int] = {}
     aggregate_blocked: list[dict[str, Any]] = []
@@ -962,11 +1081,18 @@ def calculate_plan(catalog: Any, goals: Any, inventory: Any) -> dict[str, Any]:
                     "expanded": {},
                     "missing": {},
                     "crafts": [],
+                    "exchanges": [],
                     "farm": [],
                     "blocked": [],
                     "lmd": {"elite": 0, "level": 0, "craft": 0, "total": 0},
                     "exp": _empty_exp(),
                     "craft_surplus": {},
+                    "promotion": {
+                        "current_elite": goal["current_elite"],
+                        "target_elite": goal["target_elite"],
+                        "ready_elite": goal["current_elite"],
+                        "phases": [],
+                    },
                 }
             )
             continue
@@ -990,6 +1116,8 @@ def calculate_plan(catalog: Any, goals: Any, inventory: Any) -> dict[str, Any]:
             _merge(aggregate_expanded, key, amount)
         for step in entry["crafts"]:
             _merge_step(aggregate_crafts, step)
+        for ex_step in entry.get("exchanges", []):
+            _merge_exchange_step(aggregate_exchanges, ex_step)
         for item in entry["farm"]:
             merged = aggregate_farm.get(item["item_id"])
             if merged is None:
@@ -1093,6 +1221,7 @@ def calculate_plan(catalog: Any, goals: Any, inventory: Any) -> dict[str, Any]:
         "requirements": aggregate_requirements,
         "expanded": aggregate_expanded,
         "crafts": list(aggregate_crafts.values()),
+        "exchanges": list(aggregate_exchanges.values()),
         "farm": list(aggregate_farm.values()),
         "blocked": aggregate_blocked,
         "invalid_goals": invalid_goals,
@@ -1129,11 +1258,18 @@ def _skip_result(
         "expanded": {},
         "missing": {},
         "crafts": [],
+        "exchanges": [],
         "farm": [],
         "blocked": [],
         "lmd": {"elite": 0, "level": 0, "craft": 0, "total": 0},
         "exp": _empty_exp(),
         "craft_surplus": {},
+        "promotion": {
+            "current_elite": goal["current_elite"],
+            "target_elite": goal["target_elite"],
+            "ready_elite": goal["current_elite"],
+            "phases": [],
+        },
     }
 
 

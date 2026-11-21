@@ -79,15 +79,55 @@ RUNNER_SCRIPT = Path(
 )
 SCAN_TASK_NAME = "cultivation-scan"
 MASTERY_TASK_NAME = "cultivation-mastery"
+ELITE_TASK_NAME = "cultivation-elite"
+PROFESSION_TO_OPER_ROLE = {
+    "PIONEER": "Pioneer",
+    "WARRIOR": "Warrior",
+    "TANK": "Tank",
+    "SNIPER": "Sniper",
+    "CASTER": "Caster",
+    "MEDIC": "Medic",
+    "SUPPORT": "Support",
+    "SPECIAL": "Special",
+}
 # MaaCore debug 日志：maa-cli 回调不全时从这里补取本轮最终 OperBox（与 maa-operator-scan.py 同源）。
 DEFAULT_ASST_LOG = Path(
     os.environ.get("MAA_ASST_LOG")
-    or (Path(os.environ.get("MAA_STATE_DIR") or (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "maa")) / "debug" / "asst.log")
+    or (
+        Path(
+            os.environ.get("MAA_STATE_DIR")
+            or (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "maa")
+        )
+        / "debug"
+        / "asst.log"
+    )
+)
+DEFAULT_ACTIVITY_FILE = Path(
+    os.environ.get("MAA_ACTIVITY_FILE")
+    or (
+        Path(
+            os.environ.get("MAA_CACHE_DIR")
+            or (Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "maa")
+        )
+        / "StageActivityV2.json"
+    )
+)
+DEFAULT_ITEM_FILE = Path(
+    os.environ.get("MAA_ITEM_FILE")
+    or (
+        Path(
+            os.environ.get("MAA_DATA_DIR")
+            or (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "maa")
+        )
+        / "resource"
+        / "item_index.json"
+    )
 )
 OPERATOR_SNAPSHOT_NAME = "operator-box.json"
 OPERATOR_STATE_NAME = "operator-box-state.json"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+USE_MEDICINE_RE = re.compile(r"(?:^|\s)Use\s+(\d+)\s+(?:expiring\s+)?medicine\b")
 DEPOT_MARKER = "Depot: "
 OPER_PROGRESS_MARKERS = (
     "Assistant::append_callback | SubTaskExtraInfo ",
@@ -207,6 +247,7 @@ class BatchOutcome:
     device_failure: bool = False
     sanity: tuple[int, int] | None = None
     lmd_amounts: tuple[int, ...] = ()
+    used_medicines: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +259,16 @@ def strip_ansi(text: str) -> str:
     """去掉日志中的 ANSI 转义，保留原始换行。"""
 
     return ANSI_RE.sub("", text)
+
+
+def used_medicines_from_output(text: str) -> int:
+    """累加 maa-cli UseMedicine 逐次回调（大写 Use，不含汇总小写 used）。"""
+
+    total = 0
+    for line in strip_ansi(text or "").splitlines():
+        for match in USE_MEDICINE_RE.finditer(line):
+            total += int(match.group(1))
+    return total
 
 
 def extract_messages(text: str, marker: str) -> list[dict[str, Any]]:
@@ -423,6 +474,92 @@ def oper_progress_task_from_state(
         "type": "OperProgress",
         "params": {"plans": task_plans},
     }
+
+
+def elite_plans_from_payload(
+    payload: Mapping[str, Any], *, require_auto_elite: bool = True
+) -> list[dict[str, Any]]:
+    """从 service.get_payload 提取已复核且齐料的干员精英化 OperProgress 子计划列表。"""
+
+    if not isinstance(payload, Mapping):
+        return []
+    settings = payload.get("settings")
+    if require_auto_elite:
+        if not isinstance(settings, Mapping):
+            return []
+        if settings.get("enabled") is not True or settings.get("auto_elite") is not True:
+            return []
+    snapshot_status = payload.get("snapshot_status")
+    inv_status = (
+        snapshot_status.get("inventory")
+        if isinstance(snapshot_status, Mapping)
+        else None
+    )
+    op_status = (
+        snapshot_status.get("operators")
+        if isinstance(snapshot_status, Mapping)
+        else None
+    )
+    if (
+        not isinstance(inv_status, Mapping)
+        or inv_status.get("available") is not True
+        or inv_status.get("stale") is True
+    ):
+        return []
+    if (
+        not isinstance(op_status, Mapping)
+        or op_status.get("available") is not True
+        or op_status.get("stale") is True
+    ):
+        return []
+    catalog = payload.get("catalog")
+    operators_meta = catalog.get("operators") if isinstance(catalog, Mapping) else None
+    if not isinstance(operators_meta, Mapping):
+        operators_meta = {}
+    plan = payload.get("plan")
+    plan_goals = plan.get("goals") if isinstance(plan, Mapping) else None
+    plan_rows_by_id: dict[str, Mapping[str, Any]] = {}
+    if isinstance(plan_goals, list):
+        for row in plan_goals:
+            if isinstance(row, Mapping) and row.get("id"):
+                plan_rows_by_id[str(row["id"])] = row
+    state_goals = payload.get("goals")
+    if not isinstance(state_goals, list):
+        return []
+    plans: list[dict[str, Any]] = []
+    seen_operators: set[tuple[str, str]] = set()
+    for goal in state_goals:
+        if not isinstance(goal, Mapping):
+            continue
+        if not goal.get("enabled", True) or goal.get("completed", False):
+            continue
+        row = plan_rows_by_id.get(str(goal.get("id") or ""))
+        if not isinstance(row, Mapping):
+            continue
+        promo = row.get("promotion")
+        if not isinstance(promo, Mapping):
+            continue
+        cur_elite = int(goal.get("current_elite", promo.get("current_elite", 0)) or 0)
+        ready_elite = int(promo.get("verified_ready_elite", 0) or 0)
+        if ready_elite <= cur_elite or ready_elite not in (1, 2):
+            continue
+        op_id = str(goal.get("operator_id") or row.get("operator_id") or "")
+        meta = operators_meta.get(op_id)
+        if not isinstance(meta, Mapping):
+            meta = {}
+        profession = str(meta.get("profession") or "").strip().upper()
+        role = PROFESSION_TO_OPER_ROLE.get(profession, "")
+        name = str(
+            meta.get("name")
+            or row.get("operator_name")
+            or goal.get("operator_name")
+            or ""
+        ).strip()
+        if not role or not name or (role, name) in seen_operators:
+            continue
+        seen_operators.add((role, name))
+        plans.append({"role": role, "name": name, "elite": ready_elite})
+    return plans
 
 
 def output_reports_startup_failure(text: str) -> bool:
@@ -933,13 +1070,18 @@ def fight_task(
     series: int = 1,
     name: str = "培养作战",
     drops: Mapping[str, int] | None = None,
+    medicine: int = 0,
+    medicine_expire_days: int = 0,
 ) -> dict[str, Any]:
-    """生成一个无药无石的小批量 Fight 任务。"""
+    """生成一个显式控制理智药参数且永不碎石的 Fight 任务。"""
 
     params: dict[str, Any] = {"stage": stage, "times": int(times), "series": int(series)}
     if drops:
         params["drops"] = {item: int(count) for item, count in drops.items() if count > 0}
     params.update(NO_CONSUMABLE_FIGHT_DEFAULTS)
+    params["medicine"] = max(0, int(medicine))
+    if int(medicine_expire_days) > 0:
+        params["medicine_expire_days"] = int(medicine_expire_days)
     return {"name": name, "type": "Fight", "params": params}
 
 
@@ -1008,16 +1150,33 @@ class ServiceAdapter:
         details_list: Sequence[Mapping[str, Any]],
         *,
         summary: Mapping[str, Any] | None = None,
+        submitted_plans: Sequence[Mapping[str, Any]] | None = None,
     ) -> bool:
         recorder = getattr(self._module, "record_mastery_results", None)
         if not callable(recorder):
             return False
-        recorder(
-            str(config_dir),
-            str(catalog_path),
-            [dict(item) for item in details_list],
-            summary=dict(summary) if isinstance(summary, Mapping) else None,
+        details_arg = [dict(item) for item in details_list]
+        summary_arg = dict(summary) if isinstance(summary, Mapping) else None
+        plans_arg = (
+            [dict(item) for item in submitted_plans if isinstance(item, Mapping)]
+            if isinstance(submitted_plans, Sequence)
+            else None
         )
+        try:
+            recorder(
+                str(config_dir),
+                str(catalog_path),
+                details_arg,
+                summary=summary_arg,
+                submitted_plans=plans_arg,
+            )
+        except TypeError:
+            recorder(
+                str(config_dir),
+                str(catalog_path),
+                details_arg,
+                summary=summary_arg,
+            )
         return True
 
     def pending_notifications(
@@ -1284,6 +1443,9 @@ class CultivationRuntime:
         maa_bin: str = "maa",
         env_extra: Mapping[str, str] | None = None,
         asst_log_path: Path | None = None,
+        activity_file: Path | None = None,
+        item_file: Path | None = None,
+        started_at: str | datetime | None = None,
     ) -> None:
         self.config_dir = Path(config_dir)
         # 真实索引与 WebUI/service 一样位于脚本目录（部署清单 /root/maa-scripts/maa-cultivation-data.json）；
@@ -1294,6 +1456,7 @@ class CultivationRuntime:
         self.limits = limits or Limits()
         self._log = log or self.default_log
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self.started_at = started_at
         self._process_holder: dict[str, int] = {}
         self._service_module = service_module
         self._service = ServiceAdapter(self.require_service())
@@ -1303,6 +1466,16 @@ class CultivationRuntime:
             asst_log_path
             or os.environ.get("MAA_ASST_LOG")
             or DEFAULT_ASST_LOG
+        )
+        self.activity_file = Path(
+            activity_file
+            or os.environ.get("MAA_ACTIVITY_FILE")
+            or DEFAULT_ACTIVITY_FILE
+        )
+        self.item_file = Path(
+            item_file
+            or os.environ.get("MAA_ITEM_FILE")
+            or DEFAULT_ITEM_FILE
         )
         self._maa_runner = maa_runner
         if self._maa_runner is None:
@@ -1541,7 +1714,7 @@ class CultivationRuntime:
             return EXIT_FAILED
         self._service.set_runtime(self.config_dir, "running", "培养运行已接管本轮日常")
         try:
-            return self._execute_tasks(document, tasks, settings)
+            return self._execute_tasks(document, tasks, settings, task_file=Path(task_file))
         except StartupFailure as error:
             self._log(f"StartUp 失败，立即停止且不重跑: {error}")
             self._service.set_runtime(self.config_dir, "failed", "startup_failed")
@@ -1557,6 +1730,8 @@ class CultivationRuntime:
         document: Mapping[str, Any],
         tasks: Sequence[Mapping[str, Any]],
         settings: Mapping[str, Any],
+        *,
+        task_file: Path | None = None,
     ) -> int:
         index = sanity_fight_index(tasks)
         catalog = self._payload().get("catalog") or {}
@@ -1577,6 +1752,7 @@ class CultivationRuntime:
             )
             return self._finish(result.exit_code, "未接管理智作战")
 
+        original_fight = dict(tasks[index])
         head = [dict(task) for task in tasks[:index]]
         tail = [dict(task) for task in tasks[index + 1:]]
         if not any(task.get("type") == "StartUp" for task in head):
@@ -1602,6 +1778,7 @@ class CultivationRuntime:
             return self._finish(result.exit_code, "未接管：前置段缺少 StartUp")
 
         phase1 = head + [dict(DEPOT_TASK), dict(OPERBOX_TASK)]
+        run_started_at = self.started_at or self._now_cn()
         self._invalidate_after_lmd_spending(phase1, "phase1", catalog)
         phase1_epoch = self._currency(self._payload()).get("confirmed_at")
         result = self._maa_runner.run(phase1, name_prefix="cultivation-scan", document=document)
@@ -1613,7 +1790,7 @@ class CultivationRuntime:
             catalog=catalog,
             confirmed_at=phase1_epoch,
         )
-        self._apply_infrast_phase_risk(phase1, result.output, failed=result.exit_code != 0)
+        self._apply_infrast_phase_risk(result.output, phase1, failed=result.exit_code != 0)
         if result.exit_code != 0:
             return self._finish(result.exit_code, "前置日常失败")
         inventory = complete_depot(result)
@@ -1646,23 +1823,488 @@ class CultivationRuntime:
         # 复核可能把目标标记为已完成：先发本轮新达标/齐料提醒，再进入刷取或兜底。
         self._deliver_notifications()
 
-        farming = self._farm(document, inventory)
-        fallback = self._fallback_task(settings, farming)
-        self._log(f"培养刷取结束: {farming['reason']}（批次={farming['batches']} 作战额度={farming['battles']}，不含备用本；实际结算见各阶段记录）")
-        return self._run_tail(
-            document,
-            tail,
-            fallback=fallback,
-            force_failure=bool(farming.get("degraded")),
-        )
+        latest_payload = self._payload()
+        settings = dict(latest_payload.get("settings") or settings)
+        priority_mode = str(settings.get("priority_mode") or "cultivation_first")
+        medicine_mode = str(settings.get("medicine_mode") or "expire_only")
+        fallback_mode = str(settings.get("fallback_mode") or "weekly")
+        if priority_mode == "activity_first":
+            fallback_mode = "weekly"
+            settings["fallback_mode"] = "weekly"
 
-    def _farm(self, document: Mapping[str, Any], inventory: dict[str, int]) -> dict[str, Any]:
+        weekly_ctx = self._resolve_weekly_fight(
+            original_fight, latest_payload.get("catalog") or {}, task_file=task_file
+        )
+        expiring_quota = 0
+        claimed_drain_started_at: str | datetime | None = None
+        if medicine_mode == "expire_only":
+            drain = self._claim_medicine_drain(
+                priority_mode=priority_mode,
+                fresh_inventory=inventory,
+                started_at=run_started_at,
+            )
+            if drain.get("action") == "drain":
+                expiring_quota = max(0, int(drain.get("expiring_count") or 0))
+                claimed_drain_started_at = run_started_at
+                self._log(
+                    f"检测到临期清药场次：可用临期理智药额度={expiring_quota}（{drain.get('reason', '')}）"
+                )
+
+        final_exit_code = EXIT_FAILED
+        try:
+            pre_state = self._run_pre_activity_if_needed(
+                document,
+                inventory,
+                priority_mode=priority_mode,
+                medicine_mode=medicine_mode,
+                expiring_quota=expiring_quota,
+                weekly_ctx=weekly_ctx,
+            )
+            expiring_quota = pre_state["remaining_expiring_quota"]
+            if pre_state.get("degraded"):
+                final_exit_code = self._run_tail(document, tail, fallback=None, force_failure=True)
+                return final_exit_code
+            if pre_state.get("stop_after_pre"):
+                stop_reason = str(pre_state.get("reason") or "")
+                pre_fallback = None
+                if (
+                    stop_reason == "threshold_incomplete_sanity_exhausted"
+                    and medicine_mode != "strict_none"
+                ):
+                    refreshed_settings = dict((self._payload().get("settings") or settings))
+                    pre_fallback = self._fallback_task(
+                        refreshed_settings,
+                        {
+                            "reason": "no_farmable_gap",
+                            "batches": 1,
+                            "battles": int(pre_state.get("battles") or 0),
+                            "max_battles": self.limits.max_total_battles,
+                            "blocked": pre_state.get("blocked") or [],
+                            "disabled": False,
+                            "degraded": False,
+                            "remaining_expiring_quota": expiring_quota,
+                        },
+                        weekly_ctx=weekly_ctx,
+                    )
+                stop_note = (
+                    "已达本轮作战场次上限"
+                    if stop_reason == "pre_activity_battle_cap"
+                    else "本轮自然理智已耗尽"
+                )
+                self._log(
+                    f"限时活动保底阶段结束（{stop_reason}），{stop_note}，直接进入收尾"
+                )
+                final_exit_code = self._run_tail(
+                    document, tail, fallback=pre_fallback, force_failure=False
+                )
+                return final_exit_code
+
+            farming = self._farm(
+                document,
+                inventory,
+                medicine_mode=medicine_mode,
+                expiring_quota=expiring_quota,
+                initial_blocked=pre_state.get("blocked") or [],
+                initial_battles=int(pre_state.get("battles") or 0),
+            )
+            refreshed_settings = dict((self._payload().get("settings") or settings))
+            fallback = self._fallback_task(
+                refreshed_settings, farming, weekly_ctx=weekly_ctx
+            )
+            self._log(f"培养刷取结束: {farming['reason']}（批次={farming['batches']} 作战额度={farming['battles']}，不含备用本；实际结算见各阶段记录）")
+            final_exit_code = self._run_tail(
+                document,
+                tail,
+                fallback=fallback,
+                force_failure=bool(farming.get("degraded")),
+            )
+            return final_exit_code
+        finally:
+            if claimed_drain_started_at is not None:
+                self._finish_medicine_drain(claimed_drain_started_at, final_exit_code)
+
+    def _now_cn(self) -> datetime:
+        cn_tz = timezone(timedelta(hours=GAME_DAY_OFFSET_HOURS))
+        cur = self._now()
+        return cur.replace(tzinfo=cn_tz) if cur.tzinfo is None else cur.astimezone(cn_tz)
+
+    def _side_story_map(self, catalog: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        item_map: dict[str, Any] = dict((catalog or {}).get("items") or {})
+        try:
+            if self.item_file.is_file():
+                ext_items = json.loads(self.item_file.read_text(encoding="utf-8-sig"))
+                if isinstance(ext_items, dict):
+                    for key, val in ext_items.items():
+                        if key not in item_map and isinstance(val, dict):
+                            item_map[key] = val
+        except Exception:
+            pass
+        activity_data: dict[str, Any] = {}
+        try:
+            if self.activity_file.is_file():
+                loaded = json.loads(self.activity_file.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    activity_data = loaded
+            elif self.activity_file == DEFAULT_ACTIVITY_FILE:
+                cache_mod = load_sibling("maa_activity_cache")
+                try:
+                    loaded = cache_mod.get_activity(
+                        self.activity_file, config_dir=self.config_dir
+                    )[0]
+                except TypeError:
+                    loaded = cache_mod.get_activity(self.activity_file)[0]
+                if isinstance(loaded, dict):
+                    activity_data = loaded
+        except Exception:
+            activity_data = {}
+        client_type = "Official"
+        try:
+            ctrl = load_sibling("maa_schedule_control")
+            resolved = ctrl.resolve_active_client(self.config_dir)
+            if isinstance(resolved, tuple) and resolved and isinstance(resolved[0], str):
+                client_type = resolved[0]
+        except Exception:
+            client_type = "Official"
+        parser = getattr(self._service_module, "_parse_side_story_stages", None)
+        if callable(parser):
+            try:
+                try:
+                    parsed = parser(activity_data, item_map, client_type=client_type)
+                except TypeError:
+                    parsed = parser(activity_data, item_map)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return {}
+
+    def _resolve_weekly_fight(
+        self,
+        original_fight: Mapping[str, Any],
+        catalog: Mapping[str, Any],
+        *,
+        task_file: Path | None = None,
+    ) -> dict[str, Any]:
+        now_cn = self._now_cn()
+        weekday_key = game_weekday_key(now_cn)
+        fight_source: Mapping[str, Any] = original_fight
+        if task_file is not None and task_file.name == "daily.toml":
+            try:
+                weekly_cfg_path = self.config_dir / "weekly-plan.json"
+                if weekly_cfg_path.is_file():
+                    weekly_cfg = json.loads(weekly_cfg_path.read_text(encoding="utf-8-sig"))
+                    if isinstance(weekly_cfg, dict) and weekly_cfg.get("enabled") is True:
+                        day_toml = self.config_dir / "tasks" / f"daily-{weekday_key}.toml"
+                        if day_toml.is_file():
+                            day_doc = read_task_document(day_toml)
+                            day_tasks = day_doc.get("tasks") or []
+                            day_idx = sanity_fight_index(day_tasks)
+                            if day_idx is not None:
+                                fight_source = dict(day_tasks[day_idx])
+            except Exception:
+                fight_source = original_fight
+
+        side_story_map = self._side_story_map(catalog)
+        matcher = getattr(self._service_module, "_condition_matches", None)
+        base_params = dict(fight_source.get("params") or {})
+        base_stage = str(base_params.get("stage") or "").strip()
+        eff_params = dict(base_params)
+        variants = fight_source.get("variants") or []
+        if isinstance(variants, list) and variants and callable(matcher):
+            matched = False
+            strategy = str(fight_source.get("strategy") or "first")
+            for variant in variants:
+                if not isinstance(variant, Mapping):
+                    continue
+                v_params = variant.get("params") if isinstance(variant.get("params"), Mapping) else {}
+                v_stage = str(v_params.get("stage") or "").strip()
+                if matcher(variant.get("condition"), now_cn, side_story_map, v_stage):
+                    eff_params.update(v_params)
+                    matched = True
+                    if strategy != "merge":
+                        break
+            if not matched and not base_stage:
+                eff_params = {}
+        eff_stage = str(eff_params.get("stage") or "").strip()
+        meta = side_story_map.get(eff_stage)
+        is_open_act = bool(meta and meta["start"] <= now_cn < meta["end"])
+        if meta and not is_open_act:
+            if base_stage and base_stage != eff_stage:
+                eff_stage = base_stage
+                meta = side_story_map.get(eff_stage)
+                is_open_act = bool(meta and meta["start"] <= now_cn < meta["end"])
+                if meta and not is_open_act:
+                    eff_stage = ""
+                    base_stage = ""
+            else:
+                eff_stage = ""
+                if base_stage in side_story_map:
+                    base_stage = ""
+
+        threshold = 80
+        try:
+            med_cfg_path = self.config_dir / "medicine-plan.json"
+            if med_cfg_path.is_file():
+                med_cfg = json.loads(med_cfg_path.read_text(encoding="utf-8-sig"))
+                if (
+                    isinstance(med_cfg, dict)
+                    and type(med_cfg.get("threshold")) is int
+                    and 0 <= med_cfg["threshold"] <= 9999
+                ):
+                    threshold = med_cfg["threshold"]
+        except Exception:
+            threshold = 80
+
+        return {
+            "effective_stage": eff_stage or base_stage,
+            "base_stage": base_stage or eff_stage,
+            "is_activity_stage": is_open_act,
+            "activity_item_id": str(meta["item_id"]) if is_open_act and meta else "",
+            "activity_item_name": str(meta["item_name"]) if is_open_act and meta else "",
+            "activity_threshold": threshold,
+            "side_story_map": side_story_map,
+        }
+
+    def _claim_medicine_drain(
+        self,
+        *,
+        priority_mode: str,
+        fresh_inventory: Mapping[str, int],
+        started_at: str | datetime | None = None,
+    ) -> dict[str, Any]:
+        try:
+            med_service = load_sibling("maa_medicine_service")
+        except Exception as error:
+            self._log(f"WARN 无法加载 maa_medicine_service，跳过临期清药判定: {type(error).__name__}")
+            return {"action": "disabled", "expiring_count": 0}
+        claimer = getattr(med_service, "claim_cultivation_drain", None)
+        if not callable(claimer):
+            return {"action": "disabled", "expiring_count": 0}
+        try:
+            call_kwargs: dict[str, Any] = {
+                "now": self._now_cn(),
+                "priority_mode": priority_mode,
+                "fresh_inventory": dict(fresh_inventory),
+                "activity_file": self.activity_file,
+                "item_file": self.item_file,
+                "log_file": self.asst_log_path,
+            }
+            if started_at is not None:
+                call_kwargs["started_at"] = (
+                    started_at.isoformat() if isinstance(started_at, datetime) else str(started_at)
+                )
+            try:
+                result = claimer(str(self.config_dir), **call_kwargs)
+            except TypeError:
+                call_kwargs.pop("started_at", None)
+                result = claimer(str(self.config_dir), **call_kwargs)
+            return dict(result) if isinstance(result, Mapping) else {"action": "disabled", "expiring_count": 0}
+        except Exception as error:
+            self._log(f"WARN 临期清药判定失败，本轮仅用自然理智: {type(error).__name__}: {error}")
+            return {"action": "blocked", "expiring_count": 0}
+
+    def _finish_medicine_drain(
+        self, started_at: str | datetime, exit_code: int
+    ) -> None:
+        try:
+            med_service = load_sibling("maa_medicine_service")
+            finisher = getattr(med_service, "finish", None)
+            if not callable(finisher):
+                return
+            started_str = (
+                started_at.isoformat() if isinstance(started_at, datetime) else str(started_at)
+            )
+            finisher(
+                str(self.config_dir),
+                started_str,
+                int(exit_code),
+                log_file=self.asst_log_path,
+            )
+        except Exception as error:
+            self._log(f"WARN 临期清药账本内部收尾失败: {type(error).__name__}")
+
+    def _run_pre_activity_if_needed(
+        self,
+        document: Mapping[str, Any],
+        inventory: dict[str, int],
+        *,
+        priority_mode: str,
+        medicine_mode: str,
+        expiring_quota: int,
+        weekly_ctx: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        remaining_exp = max(0, int(expiring_quota))
+        if (
+            priority_mode != "activity_first"
+            or not weekly_ctx.get("is_activity_stage")
+            or not weekly_ctx.get("activity_item_id")
+            or not weekly_ctx.get("effective_stage")
+        ):
+            return {
+                "remaining_expiring_quota": remaining_exp,
+                "blocked": [],
+                "battles": 0,
+                "degraded": False,
+                "stop_after_pre": False,
+                "reason": "not_needed",
+            }
+        act_stage = str(weekly_ctx["effective_stage"])
+        act_item = str(weekly_ctx["activity_item_id"])
+        threshold = max(0, int(weekly_ctx.get("activity_threshold", 80)))
+        current_stock = int(inventory.get(act_item, 0) or 0)
+        if current_stock >= threshold:
+            self._log(
+                f"限时活动优先：{act_stage} 材料 {act_item} 库存 {current_stock} >= {threshold}，直接进入培养刷取"
+            )
+            return {
+                "remaining_expiring_quota": remaining_exp,
+                "blocked": [],
+                "battles": 0,
+                "degraded": False,
+                "stop_after_pre": False,
+                "reason": "threshold_already_met",
+            }
+        need = threshold - current_stock
+        pre_med = (
+            999
+            if medicine_mode == "cultivation_all"
+            else (remaining_exp if medicine_mode == "expire_only" else 0)
+        )
+        pre_exp_days = 1 if medicine_mode == "expire_only" and pre_med > 0 else 0
+        pre_times = max(
+            self.limits.max_total_battles,
+            remaining_exp * 25 if pre_med > 0 and medicine_mode == "expire_only" else 0,
+            150 if pre_med > 0 else 0,
+        )
+        payload = self._payload()
+        catalog = payload.get("catalog") or {}
+        confirmed_at = self._currency(payload).get("confirmed_at")
+        self._log(
+            f"限时活动优先：先刷 {act_stage} 补足 {act_item} 缺口 {need}（当前 {current_stock}/{threshold}，medicine={pre_med}，expire_days={pre_exp_days}）"
+        )
+        task = fight_task(
+            act_stage,
+            times=pre_times,
+            series=self.limits.series,
+            name="活动保底作战",
+            drops={act_item: need},
+            medicine=pre_med,
+            medicine_expire_days=pre_exp_days,
+        )
+        result = self._maa_runner.run(
+            [task, dict(DEPOT_TASK)], name_prefix="cultivation-pre-activity", document=document
+        )
+        settled = settlement_count(result.output)
+        used_med = used_medicines_from_output(result.output)
+        if remaining_exp > 0 and used_med > 0:
+            remaining_exp = max(0, remaining_exp - used_med)
+        self._log(
+            f"活动保底结算记录={settled} 用药={used_med} stage={act_stage} exit={result.exit_code}"
+        )
+        self._record_lmd_from_output(
+            result.output,
+            run_name=result.name,
+            catalog=catalog,
+            confirmed_at=confirmed_at,
+        )
+        if output_reports_startup_failure(result.output):
+            raise StartupFailure(f"活动保底阶段检测到 StartUp 失败（{act_stage}）")
+        fight_err = output_reports_fight_error(result.output)
+        if output_reports_device_failure(result.output) or (
+            result.exit_code != 0 and not fight_err
+        ):
+            raise StartupFailure(f"活动保底阶段疑似设备/连接失败 exit={result.exit_code}（{act_stage}）")
+        if fight_err:
+            self._log(f"WARN 活动保底关卡 {act_stage} 战斗失败，熔断该关卡并转入培养阶段")
+            return {
+                "remaining_expiring_quota": remaining_exp,
+                "blocked": [act_stage],
+                "battles": max(1, settled),
+                "degraded": False,
+                "stop_after_pre": False,
+                "reason": "activity_fight_error",
+            }
+        items = complete_depot(result)
+        if items is None:
+            self._log(f"WARN 活动保底阶段 {act_stage} 未取得完整 Depot 快照，本轮停止后续刷取")
+            self._mark_inventory_failed("活动保底 Depot 扫描不完整，保留上一次库存")
+            return {
+                "remaining_expiring_quota": remaining_exp,
+                "blocked": [],
+                "battles": max(1, settled),
+                "degraded": True,
+                "stop_after_pre": True,
+                "reason": "depot_incomplete",
+            }
+        inventory.clear()
+        inventory.update(items)
+        self._service.save_inventory(self.config_dir, inventory)
+        after_stock = int(inventory.get(act_item, 0) or 0)
+        sanity_pair = last_sanity(result.output)
+        no_sanity_left = (
+            sanity_pair is not None
+            and sanity_pair[0] <= 0
+            and remaining_exp <= 0
+            and medicine_mode != "cultivation_all"
+        )
+        hit_battle_cap = settled >= pre_times
+        if after_stock < threshold:
+            return {
+                "remaining_expiring_quota": remaining_exp,
+                "blocked": [],
+                "battles": max(1, settled),
+                "degraded": False,
+                "stop_after_pre": True,
+                "reason": (
+                    "pre_activity_battle_cap"
+                    if hit_battle_cap and not no_sanity_left
+                    else "threshold_incomplete_sanity_exhausted"
+                ),
+            }
+        if no_sanity_left:
+            return {
+                "remaining_expiring_quota": remaining_exp,
+                "blocked": [],
+                "battles": max(1, settled),
+                "degraded": False,
+                "stop_after_pre": True,
+                "reason": "sanity_exhausted",
+            }
+        self._log(
+            f"限时活动保底已达标：{act_item} 库存 {after_stock}/{threshold}，剩余理智转入培养缺口"
+        )
+        return {
+            "remaining_expiring_quota": remaining_exp,
+            "blocked": [],
+            "battles": max(1, settled),
+            "degraded": False,
+            "stop_after_pre": False,
+            "reason": "threshold_reached",
+        }
+
+    def _farm(
+        self,
+        document: Mapping[str, Any],
+        inventory: dict[str, int],
+        *,
+        medicine_mode: str = "expire_only",
+        expiring_quota: int = 0,
+        initial_blocked: Sequence[str] = (),
+        initial_battles: int = 0,
+    ) -> dict[str, Any]:
         payload = self._payload()
         catalog = payload.get("catalog") or {}
         plan = payload.get("plan") or {}
-        blocked: list[str] = []
+        blocked: list[str] = [str(s) for s in initial_blocked if s]
         batches = 0
-        battles = 0
+        battles = max(0, int(initial_battles))
+        remaining_expiring_quota = max(0, int(expiring_quota))
+        max_battles_used = (
+            max(self.limits.max_total_battles, 150)
+            if (remaining_expiring_quota > 0 or medicine_mode == "cultivation_all")
+            and self.limits == Limits()
+            else self.limits.max_total_battles
+        )
         no_gain_streak = 0
         consecutive_failures = 0
         disabled = False
@@ -1675,19 +2317,43 @@ class CultivationRuntime:
             catalog = payload.get("catalog") or {}
             plan = payload.get("plan") or {}
             currency = self._currency(payload)
-            if (payload.get("settings") or {}).get("enabled") is not True:
+            cur_settings = payload.get("settings") or {}
+            if cur_settings.get("enabled") is not True:
                 disabled = True
                 reason = "disabled_mid_run"
                 break
+            cur_med_mode = str(cur_settings.get("medicine_mode") or medicine_mode)
+            if cur_med_mode == "strict_none":
+                remaining_expiring_quota = 0
+            batch_med = (
+                999
+                if cur_med_mode == "cultivation_all"
+                else (remaining_expiring_quota if cur_med_mode == "expire_only" else 0)
+            )
+            batch_exp_days = (
+                1 if cur_med_mode == "expire_only" and batch_med > 0 else 0
+            )
             if plan.get("ready") is True:
                 reason = "goals_ready"
                 # 齐料/新达标提醒必须在兜底开始前发出（服务端按 key 幂等去重）。
                 self._deliver_notifications()
                 break
-            if batches >= self.limits.max_batches:
+            effective_max_batches = (
+                max(self.limits.max_batches, 30)
+                if batch_med > 0 and self.limits == Limits()
+                else self.limits.max_batches
+            )
+            effective_max_battles = (
+                max(self.limits.max_total_battles, 150)
+                if batch_med > 0 and self.limits == Limits()
+                else max_battles_used
+            )
+            if effective_max_battles > max_battles_used:
+                max_battles_used = effective_max_battles
+            if batches >= effective_max_batches:
                 reason = "batch_cap"
                 break
-            if battles + self.limits.batch_times > self.limits.max_total_battles:
+            if battles + self.limits.batch_times > effective_max_battles:
                 reason = "battle_cap"
                 break
             target = pick_farm_target(plan, catalog, game_weekday_key(self._now()), blocked)
@@ -1700,7 +2366,9 @@ class CultivationRuntime:
             gold_id, _gold_name = self._gold_item(catalog)
             is_money = bool(gold_id) and item_id == gold_id
             confirmed_at = currency.get("confirmed_at")
-            self._log(f"培养批次 {batches + 1}: {stage}（缺 {item_id} × {gap}）")
+            self._log(
+                f"培养批次 {batches + 1}: {stage}（缺 {item_id} × {gap}，medicine={batch_med}）"
+            )
             outcome = self._run_batch(
                 document,
                 stage,
@@ -1708,9 +2376,13 @@ class CultivationRuntime:
                 gap=gap,
                 catalog=catalog,
                 confirmed_at=confirmed_at,
+                medicine=batch_med,
+                medicine_expire_days=batch_exp_days,
             )
             batches += 1
             battles += self.limits.batch_times
+            if remaining_expiring_quota > 0 and outcome.used_medicines > 0:
+                remaining_expiring_quota = max(0, remaining_expiring_quota - outcome.used_medicines)
             if outcome.startup_failed:
                 raise StartupFailure(f"培养批次检测到 StartUp 失败（{stage}）")
             if outcome.device_failure or (outcome.exit_code != 0 and not outcome.fight_error):
@@ -1783,10 +2455,12 @@ class CultivationRuntime:
             "reason": reason,
             "batches": batches,
             "battles": battles,
+            "max_battles": max_battles_used,
             "plan": plan,
             "blocked": blocked,
             "disabled": disabled,
             "degraded": degraded,
+            "remaining_expiring_quota": remaining_expiring_quota,
         }
 
     def _sanity_exhausted(
@@ -1810,15 +2484,25 @@ class CultivationRuntime:
         gap: int = 0,
         catalog: Mapping[str, Any] | None = None,
         confirmed_at: Any = None,
+        medicine: int = 0,
+        medicine_expire_days: int = 0,
     ) -> BatchOutcome:
         drops = {item_id: int(gap)} if item_id and gap > 0 else None
         task = fight_task(
-            stage, times=self.limits.batch_times, series=self.limits.series, drops=drops
+            stage,
+            times=self.limits.batch_times,
+            series=self.limits.series,
+            drops=drops,
+            medicine=medicine,
+            medicine_expire_days=medicine_expire_days,
         )
         result = self._maa_runner.run(
             [task, dict(DEPOT_TASK)], name_prefix="cultivation-batch", document=document
         )
-        self._log(f"培养批次结算记录={settlement_count(result.output)} stage={stage} exit={result.exit_code}")
+        used_med = used_medicines_from_output(result.output)
+        self._log(
+            f"培养批次结算记录={settlement_count(result.output)} 用药={used_med} stage={stage} exit={result.exit_code}"
+        )
         lmd_amounts = self._record_lmd_from_output(
             result.output,
             run_name=result.name,
@@ -1834,12 +2518,49 @@ class CultivationRuntime:
             device_failure=output_reports_device_failure(result.output),
             sanity=last_sanity(result.output),
             lmd_amounts=lmd_amounts,
+            used_medicines=used_med,
         )
 
+    def _resolve_usable_weekly_stage(
+        self,
+        catalog: Mapping[str, Any],
+        weekly_ctx: Mapping[str, Any] | None,
+        blocked: Sequence[str],
+    ) -> str | None:
+        if not isinstance(weekly_ctx, Mapping):
+            return None
+        now_cn = self._now_cn()
+        weekday_key = game_weekday_key(now_cn)
+        blocked_set = {str(s) for s in blocked if s}
+        side_story_map = weekly_ctx.get("side_story_map")
+        if not isinstance(side_story_map, Mapping):
+            side_story_map = self._side_story_map(catalog)
+
+        candidates: list[str] = []
+        for key in ("effective_stage", "base_stage"):
+            val = str(weekly_ctx.get(key) or "").strip()
+            if val and val not in candidates:
+                candidates.append(val)
+        for cand in candidates:
+            if cand in blocked_set:
+                continue
+            meta = side_story_map.get(cand)
+            if isinstance(meta, Mapping):
+                if meta["start"] <= now_cn < meta["end"]:
+                    return cand
+                continue
+            if usable_stage(catalog, cand, weekday_key, blocked) is not None:
+                return cand
+        return None
+
     def _fallback_task(
-        self, settings: Mapping[str, Any], farming: Mapping[str, Any]
+        self,
+        settings: Mapping[str, Any],
+        farming: Mapping[str, Any],
+        *,
+        weekly_ctx: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """只在目标已齐料、无开放可刷缺口或关卡全部熔断时使用 settings.fallback_stage。"""
+        """只在目标已齐料、无开放可刷缺口或关卡全部熔断时按 fallback_mode 选择兜底关卡。"""
 
         if farming.get("disabled"):
             self._log("培养已中途关闭，不再使用备用关卡")
@@ -1847,34 +2568,124 @@ class CultivationRuntime:
         reason = farming.get("reason")
         if reason not in ("goals_ready", "no_farmable_gap", "stage_failures"):
             return None
-        stage = settings.get("fallback_stage")
-        if not isinstance(stage, str) or not stage.strip():
-            return None
-        stage = stage.strip()
+
         payload = self._payload()
         catalog = payload.get("catalog") or {}
-        # 与培养批次共用同一套判定：索引内、可导航、游戏日开放、本轮未熔断。
-        if usable_stage(
-            catalog, stage, game_weekday_key(self._now()), farming.get("blocked") or []
-        ) is None:
-            self._log(f"WARN 备用关卡 {stage} 今日不可用或本轮已熔断，跳过")
-            return None
-        # 用户显式选的兜底关卡照刷（含龙门币本）：未知余额只影响 service 的缺口计算，
-        # 绝不当成 0 参与缺口，也不因此禁止用户的兜底意图；复核失败才禁止兜底。
-        remaining = self.limits.max_total_battles - int(farming.get("battles") or 0)
+        blocked = farming.get("blocked") or []
+        priority_mode = str(settings.get("priority_mode") or "cultivation_first")
+        fallback_mode = str(settings.get("fallback_mode") or "weekly")
+        if priority_mode == "activity_first":
+            fallback_mode = "weekly"
+
+        stage: str | None = None
+        weekday_key = game_weekday_key(self._now())
+        if fallback_mode == "weekly":
+            stage = self._resolve_usable_weekly_stage(catalog, weekly_ctx, blocked)
+            if not stage:
+                fb_cand = str(settings.get("fallback_stage") or "1-7").strip()
+                if fb_cand and usable_stage(catalog, fb_cand, weekday_key, blocked) is not None:
+                    self._log(
+                        f"当日周计划兜底关卡不可用或已熔断，自动回退备用常驻关卡 {fb_cand}"
+                    )
+                    stage = fb_cand
+                else:
+                    self._log("WARN 当日周计划与备用常驻兜底关卡均不可用或已熔断，跳过兜底")
+                    return None
+        else:
+            raw_stage = settings.get("fallback_stage")
+            if not isinstance(raw_stage, str) or not raw_stage.strip():
+                return None
+            cand = raw_stage.strip()
+            if usable_stage(catalog, cand, weekday_key, blocked) is None:
+                self._log(f"WARN 备用关卡 {cand} 今日不可用或本轮已熔断，跳过")
+                return None
+            stage = cand
+
+        medicine_mode = str(settings.get("medicine_mode") or "expire_only")
+        rem_expiring = max(0, int(farming.get("remaining_expiring_quota") or 0))
+        if medicine_mode == "strict_none":
+            fallback_med = 0
+            fallback_exp_days = 0
+        elif medicine_mode == "expire_only" and rem_expiring > 0:
+            fallback_med = rem_expiring
+            fallback_exp_days = 1
+        else:
+            fallback_med = 0
+            fallback_exp_days = 1
+
+        effective_cap = int(farming.get("max_battles") or self.limits.max_total_battles)
+        base_remaining = effective_cap - int(farming.get("battles") or 0)
+        remaining = (
+            max(base_remaining, fallback_med * 25)
+            if fallback_med > 0
+            else base_remaining
+        )
         if remaining <= 0:
             return None
-        self._log(f"使用备用关卡 {stage}（上限 {remaining} 次，无药无石）")
-        return fight_task(stage, times=remaining, series=self.limits.series, name="备用作战")
+        mode_desc = "周计划兜底" if fallback_mode == "weekly" else "固定备用关卡"
+        self._log(
+            f"使用{mode_desc} {stage}（上限 {remaining} 次，medicine={fallback_med}，expire_days={fallback_exp_days}，无石）"
+        )
+        return fight_task(
+            stage,
+            times=remaining,
+            series=self.limits.series,
+            name="备用作战",
+            medicine=fallback_med,
+            medicine_expire_days=fallback_exp_days,
+        )
 
-    def _oper_progress_task(self, *, require_enabled: bool = True) -> dict[str, Any] | None:
-        try:
-            state = self._service.load_state(self.config_dir)
-        except Exception:
+    def _oper_progress_task(
+        self,
+        *,
+        require_enabled: bool = True,
+        include_elite: bool = True,
+        include_mastery: bool = True,
+    ) -> dict[str, Any] | None:
+        combined_plans: list[dict[str, Any]] = []
+        if include_elite:
+            try:
+                payload = self._payload()
+            except Exception:
+                payload = {}
+            combined_plans.extend(
+                elite_plans_from_payload(payload, require_auto_elite=require_enabled)
+            )
+        if include_mastery:
+            try:
+                state = self._service.load_state(self.config_dir)
+            except Exception:
+                state = {}
+            mastery_task = oper_progress_task_from_state(
+                state, require_enabled=require_enabled
+            )
+            if mastery_task is not None:
+                combined_plans.extend(
+                    (mastery_task.get("params") or {}).get("plans") or []
+                )
+        if not combined_plans:
             return None
-        return oper_progress_task_from_state(state, require_enabled=require_enabled)
+        has_elite = any("elite" in item for item in combined_plans)
+        has_mastery = any("skill_mastery" in item for item in combined_plans)
+        if has_elite and has_mastery:
+            task_name = "干员精英化与专精"
+        elif has_elite:
+            task_name = "干员精英化"
+        else:
+            task_name = "技能专精"
+        return {
+            "name": task_name,
+            "type": "OperProgress",
+            "params": {"plans": combined_plans},
+        }
 
-    def _record_oper_progress(self, output: str, *, started_ns: int = 0) -> bool:
+    def _record_oper_progress(
+        self,
+        output: str,
+        *,
+        started_ns: int = 0,
+        submitted_plans: Sequence[Mapping[str, Any]] | None = None,
+    ) -> bool:
         try:
             core_log = self._read_fresh_core_log(started_ns)
             details_list, summary = extract_oper_progress_callbacks(output, core_log)
@@ -1885,6 +2696,7 @@ class CultivationRuntime:
                 self.catalog_path,
                 details_list,
                 summary=summary,
+                submitted_plans=submitted_plans,
             )
             if recorded:
                 self._log(
@@ -1936,14 +2748,18 @@ class CultivationRuntime:
         if output_reports_startup_failure(result.output):
             raise StartupFailure("后续日常检测到 StartUp 失败")
         if oper_task is not None:
-            self._record_oper_progress(result.output, started_ns=result.started_ns)
+            self._record_oper_progress(
+                result.output,
+                started_ns=result.started_ns,
+                submitted_plans=(oper_task.get("params") or {}).get("plans"),
+            )
         self._record_lmd_from_output(
             result.output,
             run_name=result.name,
             catalog=tail_catalog,
             confirmed_at=tail_epoch,
         )
-        self._apply_infrast_phase_risk(phase, result.output, failed=result.exit_code != 0)
+        self._apply_infrast_phase_risk(result.output, phase, failed=result.exit_code != 0)
         items = complete_depot(result)
         if items is not None:
             self._service.save_inventory(self.config_dir, items)
@@ -2190,7 +3006,11 @@ class CultivationRuntime:
         return result.exit_code
 
     def run_mastery(self) -> int:
-        oper_task = self._oper_progress_task(require_enabled=False)
+        oper_task = self._oper_progress_task(
+            require_enabled=False,
+            include_elite=False,
+            include_mastery=True,
+        )
         if oper_task is None:
             self._log("没有待执行的技能专精计划")
             self._service.set_mastery_runtime(
@@ -2215,12 +3035,18 @@ class CultivationRuntime:
             )
             return result.exit_code or EXIT_STARTUP_FAILED
         recorded = self._record_oper_progress(
-            result.output, started_ns=result.started_ns
+            result.output,
+            started_ns=result.started_ns,
+            submitted_plans=(oper_task.get("params") or {}).get("plans"),
         )
         items = complete_depot(result)
         if items is not None:
             self._service.save_inventory(self.config_dir, items)
             self._log(f"专精后库存快照已更新: {len(items)} 种物品")
+        else:
+            self._log("WARN 专精后 Depot 扫描不完整，保留旧库存并标记过期")
+            self._mark_inventory_failed("专精执行后 Depot 扫描不完整，保留上一次库存")
+            self._invalidate_balance_best_effort("mastery_depot_incomplete")
         if self._persist_operbox(
             result.output, started_ns=result.started_ns, mark_stale_on_failure=False
         ):
@@ -2240,6 +3066,75 @@ class CultivationRuntime:
             )
         return EXIT_OK
 
+    def run_elite(self) -> int:
+        oper_task = self._oper_progress_task(
+            require_enabled=False,
+            include_elite=True,
+            include_mastery=False,
+        )
+        if oper_task is None:
+            self._log("没有已就绪可自动晋升的精英化目标")
+            self._service.set_runtime(
+                self.config_dir, "idle", "没有已就绪可自动晋升的精英化目标"
+            )
+            return EXIT_DISABLED
+        ensure_elite_task_file(self.config_dir, oper_task)
+        self._service.set_runtime(
+            self.config_dir,
+            "running",
+            "正在执行干员精英化（含红票买助剂/制造站双芯片/加工站合成）",
+        )
+        result = self._runner_script.run(ELITE_TASK_NAME, ["--debug"])
+        if result.exit_code == LOCK_BUSY_EXIT:
+            self._log("任务锁被其他 MAA 任务占用（exit=75），本次精英化未执行")
+            self._service.set_runtime(
+                self.config_dir, "idle", "任务锁忙（其他 MAA 任务运行中），稍后重试"
+            )
+            return LOCK_BUSY_EXIT
+        if output_reports_startup_failure(result.output):
+            self._log("WARN 干员精英化期间检测到 StartUp 失败")
+            self._service.set_runtime(
+                self.config_dir, "failed", "StartUp 启动失败，未进入精英化流程"
+            )
+            return result.exit_code or EXIT_STARTUP_FAILED
+        recorded = self._record_oper_progress(
+            result.output,
+            started_ns=result.started_ns,
+            submitted_plans=(oper_task.get("params") or {}).get("plans"),
+        )
+        items = complete_depot(result)
+        if items is not None:
+            self._service.save_inventory(self.config_dir, items)
+            self._log(f"精英化后库存快照已更新: {len(items)} 种物品")
+        else:
+            self._log("WARN 精英化后 Depot 扫描不完整，保留旧库存并标记过期")
+            self._mark_inventory_failed("精英化执行后 Depot 扫描不完整，保留上一次库存")
+            self._invalidate_balance_best_effort("elite_depot_incomplete")
+            self._mark_operator_stale("elite_depot_incomplete", result.output)
+        reconciled = False
+        if self._persist_operbox(
+            result.output, started_ns=result.started_ns, mark_stale_on_failure=True
+        ):
+            reconciled = self._reconcile_snapshot(strict=False, fresh_inventory=items)
+        self._deliver_notifications(
+            include_goals=bool(items is not None and reconciled),
+            include_uncompleted_goals=self.enabled(),
+        )
+        if result.exit_code != 0:
+            self._service.set_runtime(
+                self.config_dir,
+                "failed",
+                f"干员精英化任务执行失败（exit={result.exit_code}）",
+            )
+            return result.exit_code
+        message = (
+            "干员精英化已执行并刷新仓库与干员快照"
+            if recorded
+            else "干员精英化任务已执行（未收到进度变更回调）"
+        )
+        self._service.set_runtime(self.config_dir, "idle", message)
+        return EXIT_OK
+
     # -- 每轮收尾扫描 ------------------------------------------------------
 
     def closing_scan(self, task_file: Path) -> int:
@@ -2257,12 +3152,12 @@ class CultivationRuntime:
         tasks = document.get("tasks")
         if not isinstance(tasks, list) or not tasks:
             return EXIT_OK
-        if Path(task_file).stem.startswith(MASTERY_TASK_NAME) or any(
+        if Path(task_file).stem.startswith((MASTERY_TASK_NAME, ELITE_TASK_NAME)) or any(
             str(t.get("type") or "") == "OperProgress"
             for t in tasks
             if isinstance(t, Mapping)
         ):
-            self._log("跳过收尾扫描：当前任务本身已包含技能专精与收尾扫描")
+            self._log("跳过收尾扫描：当前任务本身已包含 OperProgress 与收尾扫描")
             return EXIT_OK
         oper_task = self._oper_progress_task(require_enabled=True)
         # 只扫一遍收尾（StartUp 负责把游戏带回主界面，游戏若仍在前台则直接续接）；
@@ -2275,7 +3170,7 @@ class CultivationRuntime:
                 dict(DEPOT_TASK),
                 dict(OPERBOX_TASK),
             ]
-            self._log("收尾扫描: StartUp + OperProgress + Depot + OperBox（随日常收尾自动推进专精）")
+            self._log("收尾扫描: StartUp + OperProgress + Depot + OperBox（随日常收尾自动推进精英化/专精）")
         else:
             phase = [startup_item, dict(DEPOT_TASK), dict(OPERBOX_TASK)]
             self._log("收尾扫描: StartUp + Depot + OperBox（每轮一次，不重跑整轮）")
@@ -2288,7 +3183,11 @@ class CultivationRuntime:
             self._mark_operator_stale("closing_startup_failed", result.output)
             return EXIT_OK
         if oper_task is not None:
-            self._record_oper_progress(result.output, started_ns=result.started_ns)
+            self._record_oper_progress(
+                result.output,
+                started_ns=result.started_ns,
+                submitted_plans=(oper_task.get("params") or {}).get("plans"),
+            )
         items = complete_depot(result)
         if items is not None:
             self._service.save_inventory(self.config_dir, items)
@@ -2318,7 +3217,9 @@ def ensure_scan_task_file(config_dir: Path) -> Path:
     """写入 StartUp + Depot + OperBox 扫描任务文件（内容一致则不重写）。"""
 
     path = Path(config_dir) / "tasks" / f"{SCAN_TASK_NAME}.toml"
-    text = dump_document({"tasks": [startup_task_for_config(config_dir), dict(DEPOT_TASK), dict(OPERBOX_TASK)]})
+    text = dump_document(
+        {"tasks": [startup_task_for_config(Path(config_dir)), dict(DEPOT_TASK), dict(OPERBOX_TASK)]}
+    )
     try:
         if path.read_text(encoding="utf-8") == text:
             return path
@@ -2335,7 +3236,30 @@ def ensure_mastery_task_file(config_dir: Path, oper_task: Mapping[str, Any]) -> 
     text = dump_document(
         {
             "tasks": [
-                startup_task_for_config(config_dir),
+                startup_task_for_config(Path(config_dir)),
+                dict(oper_task),
+                dict(DEPOT_TASK),
+                dict(OPERBOX_TASK),
+            ]
+        }
+    )
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return path
+    except OSError:
+        pass
+    write_text_atomic(path, text)
+    return path
+
+
+def ensure_elite_task_file(config_dir: Path, oper_task: Mapping[str, Any]) -> Path:
+    """写入 StartUp + OperProgress + Depot + OperBox 干员精英化任务文件。"""
+
+    path = Path(config_dir) / "tasks" / f"{ELITE_TASK_NAME}.toml"
+    text = dump_document(
+        {
+            "tasks": [
+                startup_task_for_config(Path(config_dir)),
                 dict(oper_task),
                 dict(DEPOT_TASK),
                 dict(OPERBOX_TASK),
@@ -2389,12 +3313,14 @@ def build_parser() -> argparse.ArgumentParser:
             "scan",
             "run",
             "mastery",
+            "elite",
             "invalidate-for-task",
             "closing-scan",
         ),
         help=(
             "check=是否启用；execute=runner 接管执行；scan=扫描库存；run=立即运行日常；"
             "mastery=立即执行技能专精与加工站合成；"
+            "elite=立即执行已齐料干员精英化（含红票买助剂/制造站双芯片/加工站合成）；"
             "invalidate-for-task=未接管路径运行前保守失效龙门币余额；"
             "closing-scan=每轮游戏任务收尾刷新干员与库存快照"
         ),
@@ -2404,6 +3330,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--catalog-path",
         help="培养索引 JSON（默认脚本目录下的 maa-cultivation-data.json）",
+    )
+    parser.add_argument(
+        "--started-at",
+        help="本轮任务启动时刻 ISO-8601（避免 phase1 耗时超 30m 错过 02:00 临期清药窗口）",
     )
     parser.add_argument("--debug", action="store_true", help="以 debug 级别运行 MAA")
     return parser
@@ -2417,6 +3347,8 @@ def main(argv: Sequence[str] | None = None, **overrides: Any) -> int:
     options: dict[str, Any] = {"config_dir": config_dir}
     if args.catalog_path:
         options["catalog_path"] = args.catalog_path
+    if args.started_at:
+        options["started_at"] = args.started_at
     if args.debug:
         options["env_extra"] = {"MAA_LOG": "debug"}
     options.update(overrides)
@@ -2453,6 +3385,8 @@ def main(argv: Sequence[str] | None = None, **overrides: Any) -> int:
             return runtime.scan()
         if args.mode == "mastery":
             return runtime.run_mastery()
+        if args.mode == "elite":
+            return runtime.run_elite()
         if args.mode == "closing-scan":
             if not args.task_file:
                 return EXIT_USAGE

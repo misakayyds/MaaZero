@@ -111,11 +111,11 @@ def download_one(url: str, local: str, target: Path, *, sleep=time.sleep) -> Non
 
 
 def with_mooncake_announcement(tasks: dict, base_tasks: dict | None = None) -> dict:
-    """Close the observed CN tutorial only after its unique heading is recognized.
+    """Close observed CN blocking popups and bound GameStart retries per snapshot.
 
     Patch the per-run snapshot, never the installed resources. Keep the existing
     announcement routes, including upstream additions. Coordinates use MaaCore's
-    1280x720 reference frame; the click is confined to the top-right close icon.
+    1280x720 reference frame.
     """
     result = copy.deepcopy(tasks)
     base = base_tasks or {}
@@ -128,14 +128,35 @@ def with_mooncake_announcement(tasks: dict, base_tasks: dict | None = None) -> d
     if not isinstance(original, list) or any(not isinstance(x, str) for x in original):
         raise SessionError('invalid announcement routes')
     popup = 'StartUp@MooncakeTutorial'
+    sim_popup = 'StartUp@SimPlugOutDialog'
     routes = [x if '@' in x or x.startswith('#') else 'StartUp@' + x for x in original]
-    route['next'] = [popup, *[x for x in routes if x != popup]]
+    route['next'] = [popup, sim_popup, *[x for x in routes if x not in (popup, sim_popup)]]
     result[popup] = {
         'algorithm': 'OcrDetect', 'text': ['月饼烘焙小教程'],
         'roi': [460, 145, 360, 70], 'action': 'ClickRect',
         'specificRect': [1157, 80, 22, 24], 'postDelay': 1000,
         'maxTimes': 2, 'next': ['StartUp', 'StartUp@CloseAnnos#next'],
     }
+    has_startup_themes = 'StartUpThemes' in result or 'StartUpThemes' in base
+    has_game_start = 'GameStart' in result or 'GameStart' in base
+    sim_rule = {
+        'algorithm': 'OcrDetect', 'text': ['未安装SIM卡', '未安装 SIM 卡'],
+        'roi': [480, 290, 320, 90], 'action': 'ClickRect',
+        'specificRect': [605, 418, 68, 38], 'postDelay': 1000,
+        'maxTimes': 5,
+        'next': ['StartUp@StartUpThemes#next'] if has_startup_themes else ['StartUp', 'StartUp@CloseAnnos#next'],
+    }
+    if has_game_start:
+        sim_rule['reduceOtherTimes'] = ['StartUp@GameStart']
+        game_start = copy.deepcopy(result.get('GameStart', base.get('GameStart', {})))
+        if isinstance(game_start, dict) and game_start:
+            game_start.setdefault('template', 'GameStart.png')
+            existing_max = game_start.get('maxTimes')
+            game_start['maxTimes'] = min(existing_max, 15) if isinstance(existing_max, int) and existing_max > 0 else 15
+            if not game_start.get('exceededNext'):
+                game_start['exceededNext'] = [sim_popup, 'StartUp@CloseAnnos#next']
+            result['GameStart'] = game_start
+    result[sim_popup] = sim_rule
     return result
 
 

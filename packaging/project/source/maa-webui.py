@@ -1675,12 +1675,68 @@ def cultivation_mastery_run_gate():
     return None
 
 
+def cultivation_elite_run_gate():
+    """Return (status, payload) when elite run mode has no verified ready promotions, else None."""
+    try:
+        service = cultivation_service()
+    except Exception:
+        return 503, {
+            "ok": False,
+            "error": {
+                "code": "service_unavailable",
+                "message": "干员精英化服务尚未部署",
+            },
+        }
+    try:
+        payload = service.get_payload(CONFIG_DIR, CULTIVATION_CATALOG_FILE)
+    except ValueError as error:
+        status = cultivation_error_status(error)
+        return status, cultivation_error_payload(error, status)
+    except Exception:
+        return 500, {
+            "ok": False,
+            "error": {"code": "server_error", "message": "培养服务暂时不可用"},
+        }
+    state_goals = (payload or {}).get("goals") or []
+    plan_rows = ((payload or {}).get("plan") or {}).get("goals") or []
+    rows_by_id = {
+        str(row.get("id")): row
+        for row in plan_rows
+        if isinstance(row, dict) and row.get("id")
+    }
+    ready_goals = []
+    for goal in state_goals:
+        if not isinstance(goal, dict) or not goal.get("enabled", True) or goal.get("completed", False):
+            continue
+        row = rows_by_id.get(str(goal.get("id") or "")) or {}
+        promo = row.get("promotion") or {}
+        cur_elite = int(goal.get("current_elite", promo.get("current_elite", 0)) or 0)
+        verified_ready = int(promo.get("verified_ready_elite", 0) or 0)
+        if verified_ready > cur_elite and verified_ready in (1, 2):
+            ready_goals.append(goal)
+    if not ready_goals:
+        return 409, {
+            "ok": False,
+            "error": {
+                "code": "disabled",
+                "message": "没有已复核且齐料可自动晋升的精英化目标（请先识别仓库与干员，或补齐缺口材料/红票/龙门币）",
+            },
+        }
+    return None
+
+
 def run_cultivation_bg(mode):
     """Start the cultivation runner through the shared WebUI task lock."""
     global running_task
-    if mode not in ("scan", "run", "mastery"):
+    if mode not in ("scan", "run", "mastery", "elite"):
         return False
-    label = "库存识别" if mode == "scan" else ("技能专精" if mode == "mastery" else "培养刷取")
+    label_map = {
+        "scan": "库存识别",
+        "mastery": "技能专精",
+        "elite": "干员精英化",
+        "run": "培养刷取",
+    }
+    label = label_map[mode]
     # Claim the slot inside the same lock that guards the check so two
     # concurrent requests cannot both start a worker.
     with run_lock:
@@ -2166,6 +2222,23 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .cult-mat-item-sub{font-size:11.5px;color:var(--text-muted);line-height:1.45}
 .cult-mat-item-lack{font-size:11.5px;color:#ff6b6b;font-weight:700;line-height:1.45}
 .cult-step-bar{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);align-items:center}
+.cult-sched-wrap{margin-top:12px;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--surface-raised)}
+.cult-sched-wrap.is-off{opacity:.58}
+.cult-sched-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.cult-sched-title{font-size:13px;font-weight:700;color:var(--text)}
+.cult-sched-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px}
+.cult-sched-step{padding:11px 12px;border-radius:9px;border:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;gap:8px}
+.cult-sched-step-title{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700}
+.cult-sched-num{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:999px;background:rgba(56,189,248,.18);color:#38bdf8;font-size:11.5px;font-weight:800}
+.cult-sched-opt{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface-raised);cursor:pointer;font-size:12px;line-height:1.5;transition:border-color .15s,background .15s}
+.cult-sched-opt input[type="radio"]{margin-top:3px;flex-shrink:0}
+.cult-sched-opt.is-active{border-color:#38bdf8;background:rgba(56,189,248,.08)}
+.cult-sched-opt.is-disabled{opacity:.48;cursor:not-allowed}
+.cult-sched-opt-body{flex:1;min-width:0}
+.cult-sched-opt-title{font-weight:650;color:var(--text);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.cult-sched-opt-sub{font-size:11.5px;color:var(--text-muted);margin-top:2px;line-height:1.45}
+.cult-sched-preview{margin-top:6px;padding:7px 9px;border-radius:7px;border:1px dashed var(--border);background:var(--surface);font-size:11.5px;line-height:1.5}
+.cult-sched-flow{margin-top:10px;padding:8px 11px;border-radius:8px;border:1px solid rgba(56,189,248,.35);background:rgba(56,189,248,.06);font-size:12px;line-height:1.55}
 @media(max-width:900px){.cult-grid{grid-template-columns:1fr}}
 @media(max-width:1100px){.week-strip{grid-template-columns:repeat(4,1fr)}.week-day:nth-child(4){border-right:0}.week-day:nth-child(-n+4){border-bottom:1px solid var(--border)}.isched-overview,.dashboard-grid{grid-template-columns:1fr}}
 @media(max-width:900px){.app-shell{display:block}.sidebar{position:sticky;height:auto}.brand{height:60px;padding:0 20px}.nav{flex-direction:row;padding:8px 12px;overflow-x:auto;border-top:1px solid var(--border)}.nav a{padding:9px 13px}.sidebar-foot{display:none}.topbar{min-height:72px;padding:14px 20px}.wrap{padding:22px 20px 40px}}
@@ -5899,6 +5972,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status, payload = blocked
                     self._json(status, payload)
                     return
+            elif mode == "elite":
+                blocked = cultivation_elite_run_gate()
+                if blocked is not None:
+                    status, payload = blocked
+                    self._json(status, payload)
+                    return
             ok = run_cultivation_bg(mode)
             if ok:
                 self._json(200, {"ok": True, "mode": mode})
@@ -6250,6 +6329,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if p == "/api/cultivation/mastery-run":
             self._cultivation_post(mode="mastery")
+            return
+
+        if p == "/api/cultivation/elite-run":
+            self._cultivation_post(mode="elite")
             return
 
         if p in ("/api/cultivation/scan", "/api/cultivation/run"):

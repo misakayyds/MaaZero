@@ -6,6 +6,8 @@
     --mode execute  由 maa-run.sh 在 run_maa_task 中调用，读取 effective TOML 接管本轮日常
     --mode scan     经既有 runner 执行 StartUp+Depot+OperBox 扫描并保存真实库存
     --mode run      经既有 runner 立即运行日常；未启用时拒绝执行
+    --mode mastery  经既有 runner 立即执行技能专精与加工站合成
+    --mode elite    经既有 runner 立即执行已齐料干员精英化（含红票买助剂/制造站双芯片/加工站合成）
 
 退出码：0 成功；2 用法/配置错误；3 未启用；91 StartUp 或设备级失败；其余透传 MAA/runner。
     """

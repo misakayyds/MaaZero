@@ -119,7 +119,7 @@ OPBOX_MANAGED_BEGIN = b"# BEGIN MAA_WEBUI_OPERATOR_SCAN"
 OPBOX_MANAGED_END = b"# END MAA_WEBUI_OPERATOR_SCAN"
 
 EPHEMERAL_TASK_STEM_RE = re.compile(
-    r"^_|^operator-scan$|-(?:effective|activity|takeover|medicine)-\d+|^cultivation-(?:phase|closing)-"
+    r"^_|^operator-scan$|-(?:effective|activity|takeover|medicine)-\d+|^cultivation-(?:phase|closing)-|^cultivation-(?:scan|mastery|elite)$"
 )
 BACKUP_ALLOWED_PATH_RE = re.compile(
     r"^(?:"

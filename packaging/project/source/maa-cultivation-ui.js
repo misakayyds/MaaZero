@@ -1,5 +1,5 @@
-// Cultivation goals: searchable operator picker, training levels, material gap
-// estimate and manual craft hints. This file never upgrades or crafts anything.
+// Cultivation goals: searchable operator picker, phase-aware auto-elite readiness,
+// red-ticket catalyst conversion, material gap estimate, and OperProgress mastery.
 
 var CULTIVATION_DEFAULT_MAX_LEVELS = {
   6: [50, 80, 90],
@@ -18,8 +18,12 @@ var CULTIVATION_RUNTIME_LABELS = {
   error: '异常',
 };
 
-// Virtual plan keys are game concepts, not depot items.
-var CULTIVATION_VIRTUAL_ITEM_NAMES = {EXP: '经验值'};
+// Virtual plan keys and fallback display names so raw item ids never leak.
+var CULTIVATION_VIRTUAL_ITEM_NAMES = {
+  EXP: '经验值',
+  '4006': '采购凭证',
+  '32001': '芯片助剂',
+};
 
 function cultivationState() {
   if (!S.cultivation) S.cultivation = {};
@@ -52,12 +56,88 @@ function cultivationMastery() {
   };
 }
 
+var CULTIVATION_PRIORITY_MODES = ['cultivation_first', 'activity_first'];
+var CULTIVATION_MEDICINE_MODES = ['expire_only', 'cultivation_all', 'strict_none'];
+var CULTIVATION_FALLBACK_MODES = ['weekly', 'stage'];
+
+function cultivationWeeklyContext() {
+  var ctx = cultivationData().weekly_context;
+  return (ctx && typeof ctx === 'object') ? ctx : {};
+}
+
+function cultivationNormalizeSettingsDraft(raw, patch) {
+  var base = (raw && typeof raw === 'object') ? raw : {};
+  var merged = Object.assign({}, base, patch || {});
+  var wctx = cultivationWeeklyContext();
+  var defaultThreshold = Number.isInteger(wctx.activity_threshold) ? wctx.activity_threshold : 80;
+  var priorityMode = String(merged.priority_mode || 'cultivation_first');
+  if (CULTIVATION_PRIORITY_MODES.indexOf(priorityMode) < 0) priorityMode = 'cultivation_first';
+  var medicineMode = String(merged.medicine_mode || 'expire_only');
+  if (CULTIVATION_MEDICINE_MODES.indexOf(medicineMode) < 0) medicineMode = 'expire_only';
+  var fallbackMode = String(merged.fallback_mode || '');
+  if (patch && Object.prototype.hasOwnProperty.call(patch, 'fallback_stage') &&
+      !Object.prototype.hasOwnProperty.call(patch, 'fallback_mode') &&
+      priorityMode !== 'activity_first') {
+    fallbackMode = 'stage';
+  }
+  if (CULTIVATION_FALLBACK_MODES.indexOf(fallbackMode) < 0) {
+    fallbackMode = 'weekly';
+  }
+  // Zero-conflict invariant: activity_first locks fallback_mode to weekly.
+  if (priorityMode === 'activity_first') {
+    fallbackMode = 'weekly';
+  }
+  var parsedThreshold = parseInt(merged.activity_threshold, 10);
+  var threshold = (Number.isInteger(parsedThreshold) && parsedThreshold >= 0 && parsedThreshold <= 9999)
+    ? parsedThreshold
+    : defaultThreshold;
+  return {
+    enabled: !!merged.enabled,
+    auto_elite: !!merged.auto_elite,
+    priority_mode: priorityMode,
+    medicine_mode: medicineMode,
+    fallback_mode: fallbackMode,
+    fallback_stage: String(merged.fallback_stage || '1-7'),
+    activity_threshold: threshold,
+  };
+}
+
 function cultivationSettings() {
   var settings = cultivationData().settings || {};
-  return {
+  var wctx = cultivationWeeklyContext();
+  return cultivationNormalizeSettingsDraft({
     enabled: !!settings.enabled,
+    auto_elite: !!settings.auto_elite,
+    priority_mode: settings.priority_mode,
+    medicine_mode: settings.medicine_mode,
+    fallback_mode: settings.fallback_mode,
     fallback_stage: String(settings.fallback_stage || '1-7'),
+    activity_threshold: Number.isInteger(wctx.activity_threshold) ? wctx.activity_threshold : 80,
+  });
+}
+
+function cultivationRedTicket() {
+  var rt = cultivationData().red_ticket;
+  if (!rt || typeof rt !== 'object') return null;
+  return {
+    available: !!rt.available,
+    balance: Number(rt.balance) || 0,
+    source: String(rt.source || 'unknown'),
+    scanned_at: String(rt.scanned_at || ''),
   };
+}
+
+function cultivationReadyEliteGoals() {
+  var goals = cultivationData().goals || [];
+  return goals.filter(function(goal) {
+    if (!goal || goal.completed || goal.enabled === false) return false;
+    var entry = cultivationPlanGoalEntry(goal.id);
+    var promo = entry && entry.promotion;
+    if (!promo) return false;
+    var cur = Number(goal.current_elite);
+    var ready = Number(promo.verified_ready_elite) || 0;
+    return ready > cur && (ready === 1 || ready === 2);
+  });
 }
 
 function cultivationRuntime() {
@@ -223,9 +303,12 @@ function cultivationSetDraft(draft) {
 function cultivationSetSettings(patch) {
   var state = cultivationState();
   var base = state.settingsDraft || cultivationSettings();
-  state.settingsDraft = Object.assign({}, base, patch || {});
+  if (patch && Object.prototype.hasOwnProperty.call(patch, 'activity_threshold')) {
+    state.thresholdRaw = String(patch.activity_threshold === undefined || patch.activity_threshold === null ? '' : patch.activity_threshold);
+  }
+  state.settingsDraft = cultivationNormalizeSettingsDraft(base, patch || {});
   state.settingsDirty = true;
-  // Update the unsaved hint in place: a full repaint would drop input focus.
+  // Update the unsaved hint and waterfall controls in place: a full repaint would drop input focus.
   if (!cultivationSyncSettingsChrome()) cultivationRenderIfVisible();
   return state.settingsDraft;
 }
@@ -244,15 +327,209 @@ function cultivationSettingsChrome(state) {
   };
 }
 
+function cultivationScheduleFlowHtml(settings) {
+  var cfg = cultivationNormalizeSettingsDraft(settings);
+  var wctx = cultivationWeeklyContext();
+  var rawActName = String(wctx.activity_item_name || '').trim();
+  var actItemName = (rawActName && !/^[0-9]+$/.test(rawActName) && rawActName !== 'EXP')
+    ? rawActName
+    : '活动材料';
+  var weeklyStage = String(wctx.effective_stage || '').trim();
+  var weeklyLabel = weeklyStage
+    ? ('当日周计划关卡 ' + weeklyStage)
+    : '当日周计划关卡';
+  if (!cfg.enabled) {
+    return '<b>当前实际执行链路：</b>培养刷取总开关未启用 ➔ 日常直接按「周计划（' + esc(weeklyLabel) + '）+ 理智药策略」运行。';
+  }
+  var fallbackTarget = cfg.fallback_mode === 'stage'
+    ? ('固定常驻关卡 ' + cfg.fallback_stage)
+    : weeklyLabel;
+  var medDesc = cfg.medicine_mode === 'cultivation_all'
+    ? '理智药档位：吃全部可用理智药速刷开放缺口（转入兜底后停吃非临期药）'
+    : (cfg.medicine_mode === 'strict_none'
+      ? '理智药档位：全程严格禁药（仅消耗自然理智）'
+      : '理智药档位：平时仅自然理智；02:00 临期场次自然理智不够刷培养时用临期药补齐，余下临期药转刷兜底');
+  if (cfg.priority_mode === 'activity_first') {
+    var actStage = wctx.is_activity_stage && weeklyStage ? weeklyStage : '当日周计划限时活动关';
+    return '<b>当前实际执行链路：</b>① 先刷 ' + esc(actStage) + ' 保底凑满 ' + esc(actItemName) + ' 阈值（' +
+      cfg.activity_threshold + '） ➔ ② 再刷当日开放的培养缺口 ➔ ③ 剩余理智与临期药回落 ' +
+      esc(weeklyLabel) + '（' + esc(medDesc) + '）。';
+  }
+  return '<b>当前实际执行链路：</b>① 优先刷当日开放的培养缺口 ➔ ② 目标齐备或本未开放时，剩余理智与余下临期药刷「' +
+    esc(fallbackTarget) + '」（' + esc(medDesc) + '）。';
+}
+
+function renderCultivationScheduleWaterfall(rawSettings) {
+  var settings = cultivationNormalizeSettingsDraft(rawSettings || cultivationSettings());
+  var enabled = !!settings.enabled;
+  var isActFirst = settings.priority_mode === 'activity_first';
+  var wctx = cultivationWeeklyContext();
+  var rawActName = String(wctx.activity_item_name || '').trim();
+  var actItemName = (rawActName && !/^[0-9]+$/.test(rawActName) && rawActName !== 'EXP')
+    ? rawActName
+    : '活动材料';
+  var disAll = enabled ? '' : ' disabled';
+  var disStageOpt = (!enabled || isActFirst) ? ' disabled' : '';
+  var disStageSelect = (!enabled || isActFirst || settings.fallback_mode !== 'stage') ? ' disabled' : '';
+  var disThreshold = (!enabled || !isActFirst) ? ' disabled' : '';
+
+  var stockNote = '';
+  if (wctx.is_activity_stage && wctx.effective_stage) {
+    var invText = (typeof wctx.activity_inventory === 'number')
+      ? ('当前库存 ' + wctx.activity_inventory + ' / ' + settings.activity_threshold)
+      : '库存待识别仓库后确认';
+    stockNote = '<span class="cult-tag is-craft" style="margin-left:6px">' +
+      esc(wctx.effective_stage + ' · ' + actItemName + '（' + invText + '）') + '</span>';
+  } else {
+    stockNote = '<span class="cult-tag" style="margin-left:6px">当日周计划暂无开放限时活动关（自动跳过前置保底）</span>';
+  }
+
+  var weeklyPreview = '';
+  if (wctx.available && wctx.effective_stage) {
+    var dayPrefix = wctx.weekday_label ? (wctx.weekday_label + ' · ') : '';
+    var actTag = wctx.is_activity_stage
+      ? ('限时活动 · ' + actItemName +
+         (typeof wctx.activity_inventory === 'number' ? (' ' + wctx.activity_inventory + '/' + settings.activity_threshold) : '') +
+         (wctx.base_stage && wctx.base_stage !== wctx.effective_stage ? (' · 活动结束后回落 ' + wctx.base_stage) : ''))
+      : '常驻关卡';
+    weeklyPreview = '当日解析：<b>' + esc(dayPrefix + wctx.effective_stage) + '</b>（' + esc(actTag) + '）';
+  } else {
+    weeklyPreview = '当日解析：<b>自动跟随周计划配置</b>（未匹配关卡时安全回落 ' + esc(settings.fallback_stage || '1-7') + '）';
+  }
+
+  var expCount = Number(wctx.expiring_medicine_count) || 0;
+  var totalMedCount = Number(wctx.total_medicine_count) || 0;
+  var expHint = expCount > 0
+    ? '<span class="cult-tag is-craft">监测到 ' + expCount + ' 瓶临期理智药（下一 02:00 场次自动清药）</span>'
+    : (totalMedCount > 0
+      ? '<span class="cult-tag">已记录 ' + totalMedCount + ' 瓶理智药（尚未进入临期窗口）</span>'
+      : '');
+
+  return '<div class="cult-sched-wrap' + (enabled ? '' : ' is-off') + '">' +
+    '<div class="cult-sched-head">' +
+      '<div class="cult-sched-title">刷取调度与备用关卡策略（三段无冲突流水线 · 互斥项前端自动锁定）</div>' +
+      '<span class="cult-tag' + (enabled ? ' is-ready' : '') + '">' +
+        (enabled ? '培养接管已开启' : '未开启培养刷取（子开关已锁定，按周计划执行）') +
+      '</span>' +
+    '</div>' +
+    '<div class="cult-sched-grid">' +
+      '<div class="cult-sched-step">' +
+        '<div class="cult-sched-step-title"><span class="cult-sched-num">1</span>主线刷取优先级</div>' +
+        '<label class="cult-sched-opt' + (settings.priority_mode === 'cultivation_first' ? ' is-active' : '') +
+          (!enabled ? ' is-disabled' : '') + '">' +
+          '<input type="radio" id="cultPriorityCult" name="cultPriorityMode" value="cultivation_first"' +
+            (settings.priority_mode === 'cultivation_first' ? ' checked' : '') + disAll +
+            ' onchange="cultivationSetSettings({priority_mode:\'cultivation_first\'})">' +
+          '<div class="cult-sched-opt-body">' +
+            '<div class="cult-sched-opt-title">培养缺口优先（默认推荐）</div>' +
+            '<div class="cult-sched-opt-sub">先刷当日开放的培养材料/芯片/红票/经验金币；全齐或未开放时转入第 3 步兜底关卡。</div>' +
+          '</div>' +
+        '</label>' +
+        '<label class="cult-sched-opt' + (isActFirst ? ' is-active' : '') +
+          (!enabled ? ' is-disabled' : '') + '">' +
+          '<input type="radio" id="cultPriorityAct" name="cultPriorityMode" value="activity_first"' +
+            (isActFirst ? ' checked' : '') + disAll +
+            ' onchange="cultivationSetSettings({priority_mode:\'activity_first\'})">' +
+          '<div class="cult-sched-opt-body">' +
+            '<div class="cult-sched-opt-title">限时活动优先 · 保上限</div>' +
+            '<div class="cult-sched-opt-sub">当日周计划活动材料未达上限时先刷满上限，再刷培养缺口；兜底自动锁定跟随周计划。</div>' +
+            '<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">' +
+              '<span>活动保底上限：</span>' +
+              '<input id="cultThreshold" type="number" min="0" max="9999" step="1" style="width:76px;padding:3px 6px" value="' +
+                esc(String(settings.activity_threshold)) + '"' + disThreshold +
+                ' oninput="cultivationSetSettings({activity_threshold:this.value})"' +
+                ' onchange="cultivationSetSettings({activity_threshold:this.value})">' +
+              stockNote +
+            '</div>' +
+          '</div>' +
+        '</label>' +
+      '</div>' +
+
+      '<div class="cult-sched-step">' +
+        '<div class="cult-sched-step-title"><span class="cult-sched-num">2</span>理智药使用策略（永不碎源石）</div>' +
+        '<label class="cult-sched-opt' + (settings.medicine_mode === 'expire_only' ? ' is-active' : '') +
+          (!enabled ? ' is-disabled' : '') + '">' +
+          '<input type="radio" id="cultMedExpire" name="cultMedicineMode" value="expire_only"' +
+            (settings.medicine_mode === 'expire_only' ? ' checked' : '') + disAll +
+            ' onchange="cultivationSetSettings({medicine_mode:\'expire_only\'})">' +
+          '<div class="cult-sched-opt-body">' +
+            '<div class="cult-sched-opt-title">仅临期清药 · 平时自然理智 ' + expHint + '</div>' +
+            '<div class="cult-sched-opt-sub">无药快过期时只花自然理智；临期场次培养先耗尽自然理智，不够用临期药补刷，够了余下临期药转刷兜底关卡。</div>' +
+          '</div>' +
+        '</label>' +
+        '<label class="cult-sched-opt' + (settings.medicine_mode === 'cultivation_all' ? ' is-active' : '') +
+          (!enabled ? ' is-disabled' : '') + '">' +
+          '<input type="radio" id="cultMedAll" name="cultMedicineMode" value="cultivation_all"' +
+            (settings.medicine_mode === 'cultivation_all' ? ' checked' : '') + disAll +
+            ' onchange="cultivationSetSettings({medicine_mode:\'cultivation_all\'})">' +
+          '<div class="cult-sched-opt-body">' +
+            '<div class="cult-sched-opt-title">速刷培养：吃全部可用理智药</div>' +
+            '<div class="cult-sched-opt-sub">吃库存全部可用理智药加速刷齐开放缺口；当开放缺口刷齐转入兜底后自动停吃非临期药。</div>' +
+          '</div>' +
+        '</label>' +
+        '<label class="cult-sched-opt' + (settings.medicine_mode === 'strict_none' ? ' is-active' : '') +
+          (!enabled ? ' is-disabled' : '') + '">' +
+          '<input type="radio" id="cultMedNone" name="cultMedicineMode" value="strict_none"' +
+            (settings.medicine_mode === 'strict_none' ? ' checked' : '') + disAll +
+            ' onchange="cultivationSetSettings({medicine_mode:\'strict_none\'})">' +
+          '<div class="cult-sched-opt-body">' +
+            '<div class="cult-sched-opt-title">严格禁药：全程仅自然理智</div>' +
+            '<div class="cult-sched-opt-sub">培养与兜底全程禁用理智药，并双向同步关闭「周计划」页理智药开关。</div>' +
+          '</div>' +
+        '</label>' +
+      '</div>' +
+
+      '<div class="cult-sched-step">' +
+        '<div class="cult-sched-step-title"><span class="cult-sched-num">3</span>备用关卡与剩余理智兜底去向</div>' +
+        '<label class="cult-sched-opt' + (settings.fallback_mode === 'weekly' ? ' is-active' : '') +
+          (!enabled ? ' is-disabled' : '') + '">' +
+          '<input type="radio" id="cultFallbackWeekly" name="cultFallbackMode" value="weekly"' +
+            (settings.fallback_mode === 'weekly' ? ' checked' : '') + disAll +
+            ' onchange="cultivationSetSettings({fallback_mode:\'weekly\'})">' +
+          '<div class="cult-sched-opt-body">' +
+            '<div class="cult-sched-opt-title">跟随当日周计划 / 日常配置（默认推荐）</div>' +
+            '<div class="cult-sched-opt-sub">目标关卡未开放或目标已齐备时，自动落回你配置的当日周计划关卡（含限时活动关）。</div>' +
+            '<div class="cult-sched-preview">' + weeklyPreview +
+              ' <button type="button" class="btn" style="padding:2px 8px;font-size:11px;margin-left:4px" onclick="if(typeof go===\'function\')go(\'weekly\')">去周计划编辑</button>' +
+            '</div>' +
+          '</div>' +
+        '</label>' +
+        '<div class="cult-sched-opt' + (settings.fallback_mode === 'stage' ? ' is-active' : '') +
+          ((!enabled || isActFirst) ? ' is-disabled' : '') + '">' +
+          '<input type="radio" id="cultFallbackStage" name="cultFallbackMode" value="stage"' +
+            (settings.fallback_mode === 'stage' ? ' checked' : '') + disStageOpt +
+            ' onchange="cultivationSetSettings({fallback_mode:\'stage\'})">' +
+          '<div class="cult-sched-opt-body">' +
+            '<div class="cult-sched-opt-title">' +
+              '<span>指定固定常驻备用关卡</span>' +
+              (isActFirst ? '<span class="cult-tag">已由「限时活动优先」自动锁定为跟随周计划</span>' : '') +
+            '</div>' +
+            '<div class="cult-sched-opt-sub">忽略周计划，固定刷下方选定的常驻备用关卡：</div>' +
+            '<div style="margin-top:5px">' +
+              '<select id="cultFallback" onchange="cultivationSetSettings({fallback_mode:\'stage\', fallback_stage:this.value})"' +
+                disStageSelect + '>' + cultivationStageOptions(settings.fallback_stage) + '</select>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="cult-sched-flow" id="cultScheduleFlow">' + cultivationScheduleFlowHtml(settings) + '</div>' +
+  '</div>';
+}
+
 function cultivationSyncSettingsChrome() {
   if (typeof document === 'undefined' || typeof document.getElementById !== 'function') {
     return false;
   }
-  var chrome = cultivationSettingsChrome(cultivationState());
+  var state = cultivationState();
+  var draft = cultivationNormalizeSettingsDraft(state.settingsDraft || cultivationSettings());
+  var isActFirst = draft.priority_mode === 'activity_first';
+  var chrome = cultivationSettingsChrome(state);
   var button = document.getElementById('cultSettingsSave');
   var tag = document.getElementById('cultSettingsDirtyTag');
   var note = document.getElementById('cultSettingsNote');
   var balanceTag = document.getElementById('cultBalanceDirtyTag');
+  var scheduleMount = document.getElementById('cultScheduleMount');
   if (button) {
     button.textContent = chrome.buttonLabel;
     button.className = chrome.buttonClass;
@@ -266,7 +543,41 @@ function cultivationSyncSettingsChrome() {
     balanceTag.textContent = chrome.balanceTag;
     if (balanceTag.style) balanceTag.style.display = chrome.balanceTagAttr ? 'none' : '';
   }
-  return !!(button || tag || note || balanceTag);
+  var activeId = (document.activeElement && document.activeElement.id) ? String(document.activeElement.id) : '';
+  if (scheduleMount && activeId !== 'cultThreshold') {
+    scheduleMount.innerHTML = renderCultivationScheduleWaterfall(draft);
+  } else {
+    var flowEl = document.getElementById('cultScheduleFlow');
+    if (flowEl) flowEl.innerHTML = cultivationScheduleFlowHtml(draft);
+  }
+  var syncPairs = [
+    ['cultEnabled', draft.enabled, false],
+    ['cultAutoElite', draft.auto_elite, false],
+    ['cultPriorityCult', draft.priority_mode === 'cultivation_first', !draft.enabled],
+    ['cultPriorityAct', isActFirst, !draft.enabled],
+    ['cultMedExpire', draft.medicine_mode === 'expire_only', !draft.enabled],
+    ['cultMedAll', draft.medicine_mode === 'cultivation_all', !draft.enabled],
+    ['cultMedNone', draft.medicine_mode === 'strict_none', !draft.enabled],
+    ['cultFallbackWeekly', draft.fallback_mode === 'weekly', !draft.enabled],
+    ['cultFallbackStage', draft.fallback_mode === 'stage', !draft.enabled || isActFirst],
+  ];
+  syncPairs.forEach(function(row) {
+    var el = document.getElementById(row[0]);
+    if (!el) return;
+    el.checked = !!row[1];
+    el.disabled = !!row[2];
+  });
+  var threshEl = document.getElementById('cultThreshold');
+  if (threshEl) {
+    threshEl.disabled = !draft.enabled || !isActFirst;
+    if (activeId !== 'cultThreshold') threshEl.value = String(draft.activity_threshold);
+  }
+  var fbSelect = document.getElementById('cultFallback');
+  if (fbSelect) {
+    fbSelect.disabled = !draft.enabled || isActFirst || draft.fallback_mode !== 'stage';
+    fbSelect.value = String(draft.fallback_stage || '1-7');
+  }
+  return !!(button || tag || note || balanceTag || scheduleMount);
 }
 
 function cultivationPickOperator(operatorId) {
@@ -645,8 +956,13 @@ function cultivationCraftAmount(craft) {
 function cultivationCraftStation(craft) {
   var station = (craft || {}).station;
   if (!station) return '';
-  if (typeof station === 'string') return station;
-  return String(station.name || station.label || station.station || '');
+  var raw = typeof station === 'string'
+    ? station
+    : String(station.name || station.label || station.station || station.kind || '');
+  var lower = raw.toLowerCase();
+  if (lower === 'manufacture') return '制造站';
+  if (lower === 'workshop') return '加工站';
+  return raw;
 }
 
 function cultivationCraftInputs(craft) {
@@ -686,19 +1002,34 @@ function cultivationGoalCrafts(goalId) {
   var plan = cultivationData().plan || {};
   var entry = cultivationPlanGoalEntry(goalId);
   var crafts = entry ? (entry.crafts || []) : (plan.crafts || []);
+  var exchanges = entry ? (entry.exchanges || []) : (plan.exchanges || []);
   var ready = entry ? (entry.ready === true || entry.status === 'ready') : !!plan.ready;
   var blocked = entry ? (entry.blocked || []) : (plan.blocked || []);
+  var craftItems = crafts.map(function(craft) {
+    return {
+      name: cultivationCraftName(craft),
+      count: cultivationCraftAmount(craft),
+      station: cultivationCraftStation(craft),
+      batches: cultivationCraftBatches(craft),
+      inputs: cultivationCraftInputs(craft),
+    };
+  }).filter(function(item) { return item.count > 0; });
+  var exchangeItems = (Array.isArray(exchanges) ? exchanges : []).map(function(ex) {
+    ex = ex || {};
+    var count = Number(ex.quantity != null ? ex.quantity : ex.count) || 0;
+    var cost = Number(ex.cost != null ? ex.cost : (ex.currency_cost != null ? ex.currency_cost : ex.total_cost)) || 0;
+    var curName = cultivationItemName(ex.currency_id);
+    return {
+      name: ex.name || cultivationItemName(ex.item_id),
+      count: count,
+      station: '采购中心红票商店',
+      batches: 1,
+      inputs: cost > 0 ? [curName + ' ×' + cost] : [],
+    };
+  }).filter(function(item) { return item.count > 0; });
   return {
     ready: ready,
-    items: crafts.map(function(craft) {
-      return {
-        name: cultivationCraftName(craft),
-        count: cultivationCraftAmount(craft),
-        station: cultivationCraftStation(craft),
-        batches: cultivationCraftBatches(craft),
-        inputs: cultivationCraftInputs(craft),
-      };
-    }).filter(function(item) { return item.count > 0; }),
+    items: exchangeItems.concat(craftItems),
     blocked: blocked.map(function(item) {
       item = item || {};
       return {
@@ -716,16 +1047,29 @@ function cultivationAggregate() {
   var plan = cultivationData().plan || {};
   var missing = plan.missing || {};
   var crafts = plan.crafts || [];
+  var exchanges = Array.isArray(plan.exchanges) ? plan.exchanges : [];
+  var exchangeEntries = exchanges.map(function(ex) {
+    ex = ex || {};
+    var count = Number(ex.quantity != null ? ex.quantity : ex.count) || 0;
+    var cost = Number(ex.cost != null ? ex.cost : (ex.currency_cost != null ? ex.currency_cost : ex.total_cost)) || 0;
+    var curName = cultivationItemName(ex.currency_id);
+    return {
+      name: (ex.name || cultivationItemName(ex.item_id)) +
+        (cost > 0 ? '（红票兑换：' + curName + ' ×' + cost + '）' : ''),
+      count: count,
+    };
+  }).filter(function(item) { return item.count > 0; });
+  var craftEntries = crafts.map(function(craft) {
+    return {
+      name: cultivationCraftName(craft),
+      count: cultivationCraftAmount(craft),
+    };
+  }).filter(function(item) { return item.count > 0; });
   return {
     missing: Object.keys(missing).map(function(itemId) {
       return {name: cultivationItemName(itemId), count: Number(missing[itemId]) || 0};
     }).filter(function(entry) { return entry.count > 0; }),
-    crafts: crafts.map(function(craft) {
-      return {
-        name: cultivationCraftName(craft),
-        count: cultivationCraftAmount(craft),
-      };
-    }).filter(function(item) { return item.count > 0; }),
+    crafts: exchangeEntries.concat(craftEntries),
     blocked: (plan.blocked || []).map(function(item) {
       item = item || {};
       return {
@@ -740,20 +1084,49 @@ function cultivationAggregate() {
   };
 }
 
+function cultivationEffectiveAutoElite() {
+  var state = cultivationState();
+  var settings = state.settingsDraft || cultivationSettings();
+  return !!settings.auto_elite;
+}
+
 function cultivationGoalStatus(goal) {
   if (goal.completed) return '已完成';
   if (goal.enabled === false) return '已暂停';
   if (!cultivationInventoryVerified()) return '库存待确认';
   var planEntry = cultivationPlanGoalEntry(goal.id);
   if (!planEntry) return '待计算';
+  var autoElite = cultivationEffectiveAutoElite();
+  var curElite = Number(goal.current_elite) || 0;
+  var tgtElite = Number(goal.target_elite) || 0;
+  var promo = planEntry.promotion || null;
+  var verifiedReady = promo ? (Number(promo.verified_ready_elite) || 0) : 0;
   if (planEntry.status === 'blocked') {
     var manual = (planEntry.blocked || []).some(function(item) {
       return item && item.reason === 'manual_exchange';
     });
     return manual ? '人工兑换阻塞' : '无法自动获取';
   }
-  if (planEntry.status === 'missing') return '材料不足';
-  if (planEntry.status === 'ready') return '原料齐备，待手动合成/培养';
+  if (planEntry.status === 'missing') {
+    if (verifiedReady > curElite && verifiedReady < tgtElite) {
+      return '精英' + verifiedReady + '材料已齐 · 精英' + tgtElite + '材料不足';
+    }
+    if (curElite < tgtElite) {
+      return '材料不足（阻塞于精英' + (curElite + 1) + '）';
+    }
+    return '材料不足';
+  }
+  if (planEntry.status === 'ready') {
+    if (autoElite && tgtElite > curElite) {
+      return Number(goal.target_level) > 1
+        ? '精英材料齐备，待自动晋升（收尾等级需手动）'
+        : '原料齐备，待自动精英化';
+    }
+    if (autoElite && tgtElite === curElite) {
+      return '精英已达成 · 经验/龙门币齐备，待手动升级';
+    }
+    return '原料齐备，待手动合成/培养';
+  }
   return '状态待确认';
 }
 
@@ -819,6 +1192,7 @@ function applyCultivationPayload(payload, options) {
   if (!state.settingsDirty || !preserveDraft) {
     state.settingsDraft = cultivationSettings();
     state.settingsDirty = false;
+    state.thresholdRaw = undefined;
   }
   if (!state.balanceDirty || !preserveDraft) {
     var currency = cultivationCurrency();
@@ -914,10 +1288,12 @@ function cultivationFingerprint(data) {
     mastery: data.mastery,
     inventory: data.inventory,
     currency: data.currency,
+    red_ticket: data.red_ticket,
     runtime: data.runtime,
     plan: data.plan,
     snapshot_status: cultivationFingerprintSnapshotStatus(data.snapshot_status),
     operator_snapshot: data.operator_snapshot,
+    weekly_context: data.weekly_context,
     notifications: data.notifications,
   });
 }
@@ -1171,15 +1547,49 @@ async function setCultivationGoalState(goalId, patch) {
 async function saveCultivationSettings() {
   var state = cultivationState();
   if (state.settingsSaving) return false;
-  var draft = state.settingsDraft || cultivationSettings();
+  var threshInput = (typeof document !== 'undefined' && typeof document.getElementById === 'function')
+    ? document.getElementById('cultThreshold')
+    : null;
+  var rawThreshCandidate = state.thresholdRaw !== undefined
+    ? String(state.thresholdRaw).trim()
+    : (threshInput && threshInput.value !== undefined ? String(threshInput.value).trim() : null);
+  if (rawThreshCandidate !== null) {
+    if (!/^[0-9]+$/.test(rawThreshCandidate)) {
+      state.error = '活动保底上限必须是 0 至 9999 的整数';
+      cultivationRenderIfVisible();
+      return false;
+    }
+    var numThresh = parseInt(rawThreshCandidate, 10);
+    if (!Number.isInteger(numThresh) || numThresh < 0 || numThresh > 9999) {
+      state.error = '活动保底上限必须是 0 至 9999 的整数';
+      cultivationRenderIfVisible();
+      return false;
+    }
+  }
+  var draft = cultivationNormalizeSettingsDraft(state.settingsDraft || cultivationSettings());
+  state.settingsDraft = draft;
   var current = cultivationSettings();
-  // Only send what changed so an unrelated stale fallback value cannot fail the save.
+  // Only send what changed, while guaranteeing mutually-exclusive settings are NEVER emitted.
   var payload = {revision: (state.data || {}).revision};
   if (!!draft.enabled !== !!current.enabled) payload.enabled = !!draft.enabled;
-  if (String(draft.fallback_stage || '') !== String(current.fallback_stage || '')) {
+  if (!!draft.auto_elite !== !!current.auto_elite) payload.auto_elite = !!draft.auto_elite;
+  if (draft.priority_mode !== current.priority_mode) payload.priority_mode = draft.priority_mode;
+  if (draft.medicine_mode !== current.medicine_mode) payload.medicine_mode = draft.medicine_mode;
+  if (draft.fallback_mode !== current.fallback_mode) payload.fallback_mode = draft.fallback_mode;
+  if (draft.priority_mode !== 'activity_first' &&
+      String(draft.fallback_stage || '') !== String(current.fallback_stage || '')) {
     payload.fallback_stage = String(draft.fallback_stage || '');
   }
-  if (payload.enabled === undefined && payload.fallback_stage === undefined) {
+  if (Number(draft.activity_threshold) !== Number(current.activity_threshold)) {
+    payload.activity_threshold = Number(draft.activity_threshold);
+  }
+  if (draft.priority_mode === 'activity_first') {
+    if ('priority_mode' in payload || 'fallback_mode' in payload) {
+      payload.fallback_mode = 'weekly';
+    }
+    delete payload.fallback_stage;
+  }
+  if (Object.keys(payload).length <= 1) {
     payload.enabled = !!draft.enabled;
   }
   state.settingsSaving = true;
@@ -1202,15 +1612,51 @@ async function saveCultivationSettings() {
       return false;
     }
     var saved = readData.settings || {};
+    var savedWctx = readData.weekly_context || {};
     var mismatch = false;
     if ('enabled' in payload && !!saved.enabled !== !!payload.enabled) mismatch = true;
+    if ('auto_elite' in payload && !!saved.auto_elite !== !!payload.auto_elite) mismatch = true;
+    if ('priority_mode' in payload && saved.priority_mode !== undefined &&
+        String(saved.priority_mode) !== String(payload.priority_mode)) mismatch = true;
+    if ('medicine_mode' in payload && saved.medicine_mode !== undefined &&
+        String(saved.medicine_mode) !== String(payload.medicine_mode)) mismatch = true;
+    if ('fallback_mode' in payload && saved.fallback_mode !== undefined &&
+        String(saved.fallback_mode) !== String(payload.fallback_mode)) mismatch = true;
     if ('fallback_stage' in payload &&
         String(saved.fallback_stage || '') !== String(payload.fallback_stage)) mismatch = true;
+    if ('activity_threshold' in payload && savedWctx.activity_threshold !== undefined &&
+        Number(savedWctx.activity_threshold) !== Number(payload.activity_threshold)) mismatch = true;
     if (mismatch) {
       state.error = '设置保存后读回不一致，草稿已保留';
       return false;
     }
+    if (S.medicine && S.medicine.data) {
+      var syncedMedEnabled = draft.medicine_mode !== 'strict_none';
+      S.medicine.data.enabled = syncedMedEnabled;
+      S.medicine.data.threshold = Number(draft.activity_threshold);
+      S.medicine.data.cultivation_coordination = {
+        active: !!saved.enabled,
+        enabled: !!saved.enabled,
+        revision: Number.isInteger(readData.revision) ? readData.revision : null,
+        medicine_mode: saved.enabled ? String(saved.medicine_mode || draft.medicine_mode) : 'inactive',
+        priority_mode: saved.enabled ? String(saved.priority_mode || draft.priority_mode) : 'inactive',
+        fallback_mode: saved.enabled ? String(saved.fallback_mode || draft.fallback_mode) : 'inactive',
+      };
+      if (S.medicine.draft && !S.medicine.draftDirty) {
+        S.medicine.draft.enabled = syncedMedEnabled;
+        S.medicine.draft.threshold = Number(draft.activity_threshold);
+      }
+      if (S.medicine.loaded && typeof api === 'function' && typeof applyMedicinePayload === 'function') {
+        try {
+          var freshMed = await api('medicine-plan');
+          if (freshMed && freshMed.ok !== false && Array.isArray(freshMed.rules)) {
+            applyMedicinePayload(freshMed, {preserveDraft: true});
+          }
+        } catch (_) {}
+      }
+    }
     state.settingsDirty = false;
+    state.thresholdRaw = undefined;
     applyCultivationPayload(readData, {preserveDraft: true});
     state.notice = '设置已保存';
     return true;
@@ -1247,18 +1693,46 @@ async function startCultivationRun(mode) {
   }
 }
 
+async function startCultivationEliteRun() {
+  var state = cultivationState();
+  if (state.runPending) return false;
+  state.runPending = true;
+  state.error = '';
+  state.fetchSeq += 1;
+  cultivationRenderIfVisible();
+  try {
+    var response = await apiResponse('cultivation/elite-run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+    if (!response.ok || !response.data || response.data.ok === false) {
+      state.error = cultivationErrorText(response.data) || '干员精英化未能启动';
+      return false;
+    }
+    state.notice = '干员精英化已开始（含红票兑换助剂、制造站双芯片与加工站合成）';
+    await loadCultivation({preserveDraft: true});
+    return true;
+  } finally {
+    state.runPending = false;
+    cultivationRenderIfVisible();
+  }
+}
+
 function renderCultivation() {
   var state = cultivationState();
   if (!state.data) {
     return '<section class="card"><div class="section-title">干员培养目标</div>' +
       '<div class="cult-empty">' + esc(state.error || '正在读取培养数据…') + '</div></section>';
   }
-  var settings = state.settingsDraft || cultivationSettings();
+  var settings = cultivationNormalizeSettingsDraft(state.settingsDraft || cultivationSettings());
   var chrome = cultivationSettingsChrome(state);
   var runtime = cultivationRuntime();
   var inventory = cultivationData().inventory || {};
   var inventoryVerified = cultivationInventoryVerified();
   var currency = cultivationCurrency();
+  var redTicket = cultivationRedTicket();
+  var readyEliteCount = cultivationReadyEliteGoals().length;
   var operatorScan = cultivationOperatorScan();
   var inventoryScan = cultivationInventoryScan();
   var aggregate = cultivationAggregate();
@@ -1280,10 +1754,24 @@ function renderCultivation() {
       (currency.confirmed_at ? '（确认于 ' + currency.confirmed_at + '）' : '') +
       ' · 源石补货等可能花钱的操作及手动培养后，需重新确认'
     : '龙门币余额未知（余额来源：未知；请先识别仓库确认龙门币余额；手动填写仅作临时校正），暂不按缺口自动刷钱（仍会执行你指定的备用关卡）';
+  var redTicketLine = redTicket
+    ? (redTicket.available
+      ? ('<br>' + esc('采购凭证（红票）库存：' + redTicket.balance + ' 张（缺芯片助剂时每 90 红票自动换 1 份，红票不足时按 AP-5 自动刷取）'))
+      : ('<br>' + esc('采购凭证（红票）库存：待识别仓库确认')))
+    : '';
 
   var goalCards = goals.map(function(goal, index) {
     return renderCultivationGoal(goal, index, goals.length);
   }).join('');
+
+  var eliteRunTitle = readyEliteCount > 0
+    ? '立即对 ' + readyEliteCount + ' 名已复核齐料的干员执行自动晋升'
+    : '暂无已复核且齐料的精英化目标';
+  var medicinePolicyBanner = settings.medicine_mode === 'cultivation_all'
+    ? '当前理智药档位为“速刷培养”：开放缺口刷取可使用自然理智与库存理智药（转入兜底后停吃非临期药），全程不使用源石。'
+    : (settings.medicine_mode === 'strict_none'
+      ? '当前理智药档位为“严格禁药”：培养与兜底全程只消耗自然理智，不吃理智药、不使用源石。'
+      : '当前理智药档位为“仅临期清药”：平时只消耗自然理智，仅在理智药临期场次自动清药，全程不使用源石。');
 
   return '<section class="card"><div class="section-title">干员培养目标</div>' +
     '<div class="cult-toolbar">' +
@@ -1293,9 +1781,10 @@ function renderCultivation() {
         '<span>保存启用后，日常优先刷培养缺口；齐料或本未开放时刷下方备用关卡。关闭后按周计划执行。</span></div>' +
         '<span class="cult-tag" id="cultSettingsDirtyTag"' + chrome.settingsTagAttr + '>' +
           esc(chrome.settingsTag) + '</span></div>' +
-      '<div class="cult-field"><label>备用关卡</label>' +
-        '<select id="cultFallback" onchange="cultivationSetSettings({fallback_stage:this.value})">' +
-        cultivationStageOptions(settings.fallback_stage) + '</select></div>' +
+      '<div class="cult-field"><label>自动推进精英化</label>' +
+        '<div class="cult-switch"><input type="checkbox" id="cultAutoElite" ' + (settings.auto_elite ? 'checked' : '') +
+        ' onchange="cultivationSetSettings({auto_elite:this.checked})">' +
+        '<span>保存启用后，阶段材料齐备且库存/干员已复核时，随日常收尾自动升满前置等级并晋升至精英1/精英2（含红票买芯片助剂、制造站造双芯片并还原产线、加工站递归合成）。</span></div></div>' +
       '<div class="cult-field"><label>龙门币余额（临时校正）</label>' +
         '<div class="cult-actions" style="margin-top:0">' +
           '<input id="cultBalance" type="text" inputmode="numeric" style="min-width:150px" value="' +
@@ -1314,17 +1803,21 @@ function renderCultivation() {
         '>刷新状态</button>' +
       '</div>' +
       '<div class="cult-note" id="cultSettingsNote"' + chrome.settingsNoteAttr + '>' +
-        '开关/备用关卡改动尚未保存；保存目标不会一并保存设置。</div></div>' +
+        '开关（含自动推进精英化）或备用关卡改动尚未保存；保存目标不会一并保存设置。</div></div>' +
       '<div class="cult-field"><label>运行</label><div class="cult-actions">' +
         '<button class="btn" onclick="startCultivationRun(\'scan\')" ' + (state.runPending ? 'disabled' : '') +
         '>库存识别</button>' +
         '<button class="btn btn-p" onclick="startCultivationRun(\'run\')" ' + (state.runPending ? 'disabled' : '') +
         '>立即运行</button>' +
+        '<button class="btn" id="cultEliteRunBtn" title="' + esc(eliteRunTitle) + '" onclick="startCultivationEliteRun()" ' +
+        ((state.runPending || !readyEliteCount) ? 'disabled' : '') +
+        '>⚡ 立即精英化' + (readyEliteCount > 0 ? '（' + readyEliteCount + '）' : '') + '</button>' +
       '</div>' +
-      '<div class="cult-note">开始前复核实际练度和库存，按最新缺口刷取；任务结束刷新。</div></div>' +
+      '<div class="cult-note">开始前复核实际练度和库存，按最新缺口刷取；任务结束刷新。“⚡ 立即精英化”仅推进已齐料的精英阶段并在下一阶段缺料处自动停下。</div></div>' +
     '</div>' +
+    '<div id="cultScheduleMount">' + renderCultivationScheduleWaterfall(settings) + '</div>' +
     '<div class="cult-note" style="margin-top:12px">' + esc(runtimeLine) + '<br>' + esc(operatorLine) + '<br>' + esc(inventoryLine) +
-      ' · 备用关卡：目标关卡未开放或目标已齐备时，使用备用关卡。<br>' + esc(currencyLine) + '</div>' +
+      ' · 备用关卡：目标关卡未开放或目标已齐备时，使用备用关卡。<br>' + esc(currencyLine) + redTicketLine + '</div>' +
     (state.error ? '<div class="cult-error">' + esc(state.error) + '</div>' : '') +
     (state.notice ? '<div class="cult-result">' + esc(state.notice) + '</div>' : '') +
     (inventoryVerified ? '' :
@@ -1340,8 +1833,11 @@ function renderCultivation() {
         '确认之前不会按缺口自动刷钱——该限制只针对缺口规划，仍会执行你指定的备用关卡。' +
         '资源齐料判断与齐料通知需要可信的仓库余额；目标已实际达成的通知不受余额影响。' +
         '源石补货等可能花钱的操作及手动培养后，请重新识别仓库。</div>') +
-    '<div class="cult-warn">原料齐全不等同于已经升级。首版只消耗自然理智：不吃理智药、不使用源石。' +
-      '刷齐材料后由系统通知你，升级与合成需要你手动在游戏内完成。</div>' +
+    '<div class="cult-warn">原料齐全不等同于已经升级。' + medicinePolicyBanner +
+      (settings.auto_elite
+        ? '当前已开启“自动推进精英化”：已复核齐料的精英阶段会自动升满前置等级、完成红票换助剂/制造站双芯片/加工站合成并晋升（晋升后停在新阶段 1 级）；仅最终目标阶段高于 1 级的收尾等级（如精2 1级→60级）才需要你手动在游戏内完成。'
+        : '当前未开启“自动推进精英化”：刷齐下位原料后不会自动合成或晋升，合成与升级仍需要你手动在游戏内完成（也可勾选上方“自动推进精英化”保存启用）。') +
+    '</div>' +
     '<div class="cult-grid" style="margin-top:18px">' +
       '<div class="cult-card">' + renderCultivationDraft() + '</div>' +
       '<div class="cult-card">' + renderCultivationPlan(aggregate) + '</div>' +
@@ -1410,15 +1906,24 @@ function renderCultivationGoalDirectMaterials(planEntry) {
   var reqs = planEntry.requirements;
   var missingMap = planEntry.missing || {};
   var craftsList = Array.isArray(planEntry.crafts) ? planEntry.crafts : [];
+  var exchangesList = Array.isArray(planEntry.exchanges) ? planEntry.exchanges : [];
   var craftById = {};
   craftsList.forEach(function(c) {
     if (c && c.item_id) craftById[String(c.item_id)] = c;
+  });
+  var exchangeById = {};
+  exchangesList.forEach(function(ex) {
+    if (ex && ex.item_id) exchangeById[String(ex.item_id)] = ex;
   });
   function collectMissingInputs(itemId, seen) {
     seen = seen || {};
     if (seen[itemId]) return [];
     seen[itemId] = true;
     var found = [];
+    var ex = exchangeById[itemId];
+    if (ex && ex.currency_id && Number(missingMap[ex.currency_id]) > 0) {
+      found.push(cultivationItemName(ex.currency_id) + ' ×' + Number(missingMap[ex.currency_id]));
+    }
     var c = craftById[itemId];
     if (!c || !c.inputs) return found;
     Object.keys(c.inputs).forEach(function(inId) {
@@ -1431,6 +1936,17 @@ function renderCultivationGoalDirectMaterials(planEntry) {
     });
     return found;
   }
+  function usesExchange(itemId, seen) {
+    seen = seen || {};
+    if (seen[itemId]) return false;
+    seen[itemId] = true;
+    if (exchangeById[itemId]) return true;
+    var c = craftById[itemId];
+    if (!c || !c.inputs) return false;
+    return Object.keys(c.inputs).some(function(inId) {
+      return usesExchange(inId, seen);
+    });
+  }
   var pills = [];
   var order = {lack: 0, craft: 1, ok: 2};
   var items = [];
@@ -1441,6 +1957,7 @@ function renderCultivationGoalDirectMaterials(planEntry) {
     var name = cultivationItemName(itemId);
     var directMiss = Number(missingMap[itemId]) || 0;
     var craftEntry = craftById[itemId];
+    var exchangeEntry = exchangeById[itemId];
     if (directMiss > 0) {
       items.push({
         kind: 'lack',
@@ -1448,21 +1965,41 @@ function renderCultivationGoalDirectMaterials(planEntry) {
       });
       return;
     }
-    if (craftEntry) {
-      var craftQty = Number(craftEntry.quantity || craftEntry.produced) || 0;
-      var haveStock = Math.max(0, need - craftQty);
-      var missSubs = collectMissingInputs(itemId, {});
-      if (missSubs.length > 0) {
+    if (exchangeEntry && !craftEntry) {
+      var exQty = Number(exchangeEntry.quantity != null ? exchangeEntry.quantity : exchangeEntry.count) || 0;
+      var exStock = Math.max(0, need - exQty);
+      var exMiss = collectMissingInputs(itemId, {});
+      if (exMiss.length > 0) {
         items.push({
           kind: 'lack',
           html: '<span class="cult-lack-pill">❌ ' + esc(name) + ' ×' + need +
-            '（缺下位：' + esc(missSubs.join('、')) + '）</span>',
+            '（缺下位：' + esc(exMiss.join('、')) + '）</span>',
         });
       } else {
         items.push({
           kind: 'craft',
           html: '<span class="cult-craft-pill">🔧 ' + esc(name) + ' ×' + need +
-            '（现成 ' + haveStock + ' + 可合 ' + craftQty + ' · 合成后充足）</span>',
+            '（现成 ' + exStock + ' + 红票可换 ' + exQty + ' · 红票兑换后充足）</span>',
+        });
+      }
+      return;
+    }
+    if (craftEntry) {
+      var craftQty = Number(craftEntry.quantity || craftEntry.produced) || 0;
+      var haveStock = Math.max(0, need - craftQty);
+      var missSubs = collectMissingInputs(itemId, {});
+      var hasEx = usesExchange(itemId, {});
+      if (missSubs.length > 0) {
+        items.push({
+          kind: 'lack',
+          html: '<span class="cult-lack-pill">❌ ' + esc(name) + ' ×' + need +
+            '（缺下位：' + esc(missSubs.join('、')) + (hasEx ? '；芯片助剂已由红票覆盖' : '') + '）</span>',
+        });
+      } else {
+        items.push({
+          kind: 'craft',
+          html: '<span class="cult-craft-pill">🔧 ' + esc(name) + ' ×' + need +
+            '（现成 ' + haveStock + ' + 可合 ' + craftQty + (hasEx ? ' · 含红票换助剂' : '') + ' · 合成后充足）</span>',
         });
       }
       return;
@@ -1478,9 +2015,48 @@ function renderCultivationGoalDirectMaterials(planEntry) {
   return '<div class="cult-goal-meta">目标材料状态：' + pills.join('') + '</div>';
 }
 
+function renderCultivationGoalPhaseBar(goal, promo) {
+  if (!goal || goal.completed || !promo || !Array.isArray(promo.phases) || !promo.phases.length) return '';
+  if (!cultivationInventoryVerified()) return '';
+  var curElite = Number(goal.current_elite) || 0;
+  var tgtElite = Number(goal.target_elite) || 0;
+  var verifiedReady = Number(promo.verified_ready_elite) || 0;
+  var badges = [];
+  if (curElite >= 1 && tgtElite >= 2) {
+    badges.push('<span class="cult-ok-pill">✅ 精英1 已达成</span>');
+  }
+  promo.phases.forEach(function(ph) {
+    if (!ph || !ph.elite) return;
+    var el = Number(ph.elite);
+    if (ph.ready) {
+      var readyNote = verifiedReady >= el ? '已复核齐料，可自动晋升' : '库存齐料（待干员扫描确认）';
+      badges.push('<span class="cult-ok-pill">✅ 精英' + el + '：' + esc(readyNote) + '</span>');
+      return;
+    }
+    var missMap = ph.missing || {};
+    var missParts = Object.keys(missMap).map(function(mid) {
+      var cnt = Number(missMap[mid]) || 0;
+      return cnt > 0 ? (cultivationItemName(mid) + ' ×' + cnt) : '';
+    }).filter(Boolean);
+    var exParts = (Array.isArray(ph.exchanges) ? ph.exchanges : []).map(function(ex) {
+      var q = Number(ex.quantity != null ? ex.quantity : ex.count) || 0;
+      return q > 0 ? ((ex.name || cultivationItemName(ex.item_id)) + ' ×' + q + ' 已由红票覆盖') : '';
+    }).filter(Boolean);
+    var detail = missParts.length ? ('缺 ' + missParts.join('、')) : '材料/余额待确认';
+    if (exParts.length) detail += '；' + exParts.join('、');
+    badges.push('<span class="cult-lack-pill">❌ 精英' + el + '：' + esc(detail) + '</span>');
+  });
+  if (!badges.length) return '';
+  return '<div class="cult-goal-meta">分阶段进度：' + badges.join(' ') + '</div>';
+}
+
 function renderCultivationGoal(goal, index, totalCount) {
   var total = typeof totalCount === 'number' ? totalCount : ((cultivationData().goals || []).length || 1);
+  var autoElite = cultivationEffectiveAutoElite();
   var planEntry = cultivationPlanGoalEntry(goal.id);
+  var promo = planEntry && planEntry.promotion ? planEntry.promotion : null;
+  var verifiedReadyElite = promo ? (Number(promo.verified_ready_elite) || 0) : 0;
+  var canAutoPromote = !goal.completed && goal.enabled !== false && verifiedReadyElite > Number(goal.current_elite);
   var goalName = goal.operator_name || cultivationOperatorName(goal.operator_id, planEntry);
   var crafts = cultivationGoalCrafts(goal.id);
   var missing = cultivationGoalMissing(goal.id);
@@ -1493,7 +2069,22 @@ function renderCultivationGoal(goal, index, totalCount) {
   }
   var tags = '<span class="' + statusTagClass + '">' + statusText + '</span>' +
     (crafts.ready && !goal.completed && cultivationInventoryVerified()
-      ? '<span class="cult-tag is-ready">' + (crafts.items.length ? '材料已齐 · 合成后充足' : '材料已齐') + '</span>' : '');
+      ? '<span class="cult-tag is-ready">' + (crafts.items.length ? '材料已齐 · 合成后充足' : '材料已齐') + '</span>' : '') +
+    (canAutoPromote
+      ? '<span class="cult-tag is-craft">⚡ 可自动晋升至' + esc(cultivationEliteName(verifiedReadyElite)) + '</span>' : '');
+  var eliteStatusLine = (!goal.completed && goal.elite_status_label)
+    ? '<div class="cult-goal-meta">精英化进度：' + esc(goal.elite_status_label) +
+      (goal.last_elite_at ? '（' + esc(goal.last_elite_at) + '）' : '') + '</div>'
+    : '';
+  var phaseBarLine = renderCultivationGoalPhaseBar(goal, promo);
+  var curEliteNum = Number(goal.current_elite) || 0;
+  var tgtEliteNum = Number(goal.target_elite) || 0;
+  var readyMissingText = autoElite
+    ? (tgtEliteNum > curEliteNum
+      ? ('✅ 无材料缺口（原料齐备，兑换/合成后充足，待自动精英化' +
+         (Number(goal.target_level) > 1 ? '；晋升后收尾等级需手动升级' : '') + '）')
+      : '✅ 无材料缺口（精英已达成，经验/龙门币齐备，待手动升级）')
+    : '✅ 无材料缺口（原料齐备，合成后充足，待手动合成/培养）';
   var missingLine = goal.completed
     ? '无需处理'
     : !cultivationInventoryVerified()
@@ -1503,23 +2094,26 @@ function renderCultivationGoal(goal, index, totalCount) {
             return '<span class="cult-lack-pill">❌ 缺 ' + esc(entry.name) + ' ×' + entry.count + '</span>';
           }).join(' ')
         : (planEntry && planEntry.status === 'ready'
-          ? '<span class="cult-ok-pill">✅ 无材料缺口（原料齐备，合成后充足，待手动合成/培养）</span>'
+          ? '<span class="cult-ok-pill">' + readyMissingText + '</span>'
           : planEntry && planEntry.status === 'blocked'
             ? '<span class="cult-lack-pill">⚠️ 存在人工或其他获取阻塞</span>'
             : '暂未计算缺口');
   var directMaterialsLine = (!goal.completed && cultivationInventoryVerified())
     ? renderCultivationGoalDirectMaterials(planEntry)
     : '';
-  var craftLine = crafts.items.length
-    ? crafts.items.map(function(entry) {
-        var detail = [];
-        if (entry.station) detail.push(entry.station);
-        if (entry.batches > 1) detail.push('合成 ' + entry.batches + ' 次');
-        if (entry.inputs && entry.inputs.length) detail.push('需 ' + entry.inputs.join(' + '));
-        return esc(entry.name) + ' ×' + entry.count +
-          (detail.length ? '（' + detail.map(function(value) { return esc(value); }).join('，') + '）' : '');
-      }).join('、')
-    : '无';
+  var craftLine = goal.completed
+    ? '无需处理'
+    : (crafts.items.length
+      ? crafts.items.map(function(entry) {
+          var detail = [];
+          if (entry.station) detail.push(entry.station);
+          if (entry.batches > 1) detail.push('合成 ' + entry.batches + ' 次');
+          if (entry.inputs && entry.inputs.length) detail.push('需 ' + entry.inputs.join(' + '));
+          return esc(entry.name) + ' ×' + entry.count +
+            (detail.length ? '（' + detail.map(function(value) { return esc(value); }).join('，') + '）' : '');
+        }).join('、')
+      : '无');
+  var craftLabel = autoElite ? '自动兑换/合成清单：' : '手动合成清单：';
   var blockedLine = cultivationBlockedHtml(crafts.blocked, '无法自动获取：');
   var completedNote = goal.completed
     ? '<div class="cult-note">目标已达成，将通知并继续备用关卡；如需继续培养，可编辑更高目标。</div>'
@@ -1548,9 +2142,11 @@ function renderCultivationGoal(goal, index, totalCount) {
       '<div class="cult-goal-meta">当前 ' + esc(cultivationEliteName(goal.current_elite) + ' ' + goal.current_level + '级') +
         ' → 目标 ' + esc(cultivationEliteName(goal.target_elite) + ' ' + goal.target_level + '级') +
         ' · 优先级 ' + (index + 1) + '（支持置顶/上下调整顺序）</div>' +
+      eliteStatusLine +
+      phaseBarLine +
       directMaterialsLine +
       '<div class="cult-goal-meta">缺口：' + missingLine + '</div>' +
-      '<div class="cult-goal-meta">手动合成清单：' + craftLine + '</div>' +
+      '<div class="cult-goal-meta">' + craftLabel + craftLine + '</div>' +
       blockedLine +
       completedNote +
     '</div></div>' +
@@ -1559,6 +2155,10 @@ function renderCultivationGoal(goal, index, totalCount) {
 }
 
 function renderCultivationPlan(aggregate) {
+  var autoElite = cultivationEffectiveAutoElite();
+  var readyPillText = autoElite
+    ? '✅ 无材料缺口，下位原料齐备（兑换/合成后充足），将随日常收尾或点击“⚡ 立即精英化”自动完成阶段晋升（最终收尾等级需手动升级）。'
+    : '✅ 无材料缺口，下位原料齐备（合成后充足），等待手动合成并培养。';
   var missing = aggregate.missing.length
     ? '<ul class="cult-list">' + aggregate.missing.map(function(entry) {
         return '<li><span class="cult-lack-pill">❌ 缺 ' + esc(entry.name) + ' ×' + entry.count + '</span></li>';
@@ -1566,7 +2166,7 @@ function renderCultivationPlan(aggregate) {
     : !cultivationInventoryVerified()
       ? '<div class="cult-note">库存未确认，暂不能判定缺口。</div>'
       : aggregate.ready
-        ? '<div class="cult-note"><span class="cult-ok-pill">✅ 无材料缺口，下位原料齐备（合成后充足），等待手动合成并培养。</span></div>'
+        ? '<div class="cult-note"><span class="cult-ok-pill">' + readyPillText + '</span></div>'
         : aggregate.blocked.length
           ? '<div class="cult-note">当前没有可刷取缺口，但存在人工或其他获取阻塞。</div>'
           : '<div class="cult-note">无材料缺口。</div>';
@@ -1574,17 +2174,26 @@ function renderCultivationPlan(aggregate) {
     ? '<ul class="cult-list">' + aggregate.crafts.map(function(entry) {
         return '<li><span class="cult-craft-pill">🔧 ' + esc(entry.name) + ' ×' + entry.count + '</span></li>';
       }).join('') + '</ul>'
-    : '<div class="cult-note">暂不需要手动合成。</div>';
+    : '<div class="cult-note">' + (autoElite ? '无需额外兑换或合成。' : '暂不需要手动合成。') + '</div>';
   var blocked = cultivationBlockedHtml(aggregate.blocked, '无法自动获取，暂不能自动刷取：');
-  return '<div class="cult-section-title">缺口与手动合成清单</div>' +
+  var sectionTitle = autoElite ? '缺口与自动兑换/合成清单' : '缺口与手动合成清单';
+  var craftSubtitle = autoElite
+    ? '材料齐备后由 OperProgress 自动兑换/合成的部分（红票商店 / 制造站 / 加工站）：'
+    : '材料齐了之后需要你手动合成的部分：';
+  var footerText = !cultivationInventoryVerified()
+    ? '库存未确认，暂不能判定原料是否齐备；请先做一次库存识别。'
+    : (aggregate.ready
+      ? (autoElite
+        ? '当前目标原料已齐：可晋升精英阶段将自动执行（也可点击上方“⚡ 立即精英化”），仅最终收尾等级需手动升级。'
+        : '当前目标原料已齐，等待你在游戏内手动合成并培养。')
+      : (autoElite
+        ? '仍有材料缺口；已齐料的前置精英阶段可先行自动晋升，剩余缺口刷齐后会通过 Telegram 通知你。'
+        : '仍有缺口，刷取完成后会通过 Telegram 通知你。'));
+  return '<div class="cult-section-title">' + sectionTitle + '</div>' +
     '<div class="cult-note">按当前目标顺序汇总的原料缺口：</div>' + missing +
-    '<div class="cult-note" style="margin-top:12px">材料齐了之后需要你手动合成的部分：</div>' + crafts +
+    '<div class="cult-note" style="margin-top:12px">' + craftSubtitle + '</div>' + crafts +
     blocked +
-    '<div class="cult-note" style="margin-top:12px">' +
-      (!cultivationInventoryVerified()
-        ? '库存未确认，暂不能判定原料是否齐备；请先做一次库存识别。'
-        : (aggregate.ready ? '当前目标原料已齐，等待你在游戏内手动合成并培养。' : '仍有缺口，刷取完成后会通过 Telegram 通知你。')) +
-    '</div>';
+    '<div class="cult-note" style="margin-top:12px">' + footerText + '</div>';
 }
 
 function bindCultivationEvents() {

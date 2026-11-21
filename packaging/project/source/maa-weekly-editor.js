@@ -98,6 +98,19 @@ function medicinePolicyText(payload) {
   return '已知期限按最后匹配的 02:00 场次判断，其他作战保持禁药。';
 }
 
+async function syncCultivationAfterWeeklyChange() {
+  if (!S.cultivation || !S.cultivation.loaded || typeof cultivationFetch !== 'function') return;
+  try {
+    const res = await cultivationFetch();
+    if (res && res.data && typeof applyCultivationPayload === 'function') {
+      applyCultivationPayload(res.data, {preserveDraft:true, keepMessages:true});
+      if (typeof cultivationFingerprint === 'function') {
+        S.cultivation.pollFingerprint = cultivationFingerprint(res.data);
+      }
+    }
+  } catch (_) {}
+}
+
 function renderMedicinePlan() {
   const state = S.medicine || {loaded:false, data:null, error:'', draft:{enabled:false, threshold:80}, saving:false};
   if (!state.loaded || !state.data) {
@@ -120,8 +133,14 @@ function renderMedicinePlan() {
   const confirmed = Number.isInteger(last.confirmed_used) ? last.confirmed_used : '未知';
   const attemptStatus = medicineAttemptStatusLabel(last.status);
   const loadNotice = state.error ? `<div class="help" role="status">理智药 API 读取失败：${esc(state.error)}；周计划仍可正常编辑和保存。</div>` : '';
+  const coord = payload.cultivation_coordination || {};
+  const cultActive = coord.active === true || coord.enabled === true ||
+    !!(S.cultivation && S.cultivation.data && S.cultivation.data.settings && S.cultivation.data.settings.enabled);
+  const coordNotice = cultActive
+    ? '<div class="help" role="status">当前「培养目标」已开启接管：此处的开关及阈值与培养目标页理智药档位实时双向同步。</div>'
+    : '';
   return `<section class="card medicine-plan">
-    ${loadNotice}<div class="page-head"><div><div class="section-title">理智药策略</div><div class="help">每个匹配的限时关卡使用同一个全局材料阈值，默认 80。</div></div>
+    ${loadNotice}${coordNotice}<div class="page-head"><div><div class="section-title">理智药策略</div><div class="help">每个匹配的限时关卡使用同一个全局材料阈值，默认 80。</div></div>
       <label class="switch-label">使用理智药 <input id="medicine-enabled" type="checkbox" ${draft.enabled?'checked':''} onchange="setMedicineEnabled(this.checked)"></label></div>
     <div class="info-grid">
       <div class="info-box"><span>药证据时刻 / 数量</span><strong>${formatMedicineTimestamp(evidence.observed_at)} / ${evidence.remaining_count ?? '未知'}</strong><div>来源：${esc(evidence.source || '未知')}；${medicineEvidenceStatus(evidence)}</div></div>
@@ -163,6 +182,27 @@ async function saveMedicineSettings(enabled, threshold) {
       throw new Error('读取结果与本次设置不一致');
     }
     applyMedicinePayload(verified, {preserveDraft:false});
+    if (S.cultivation && S.cultivation.data && S.cultivation.data.settings) {
+      const prevMode = S.cultivation.data.settings.medicine_mode || 'expire_only';
+      const nextMode = enabled ? (prevMode === 'cultivation_all' ? 'cultivation_all' : 'expire_only') : 'strict_none';
+      S.cultivation.data.settings.medicine_mode = nextMode;
+      const coordRev = verified.cultivation_coordination && verified.cultivation_coordination.revision;
+      if (Number.isInteger(coordRev)) {
+        S.cultivation.data.revision = coordRev;
+      }
+      if (S.cultivation.data.weekly_context) {
+        S.cultivation.data.weekly_context.activity_threshold = threshold;
+        S.cultivation.data.weekly_context.medicine_plan_enabled = enabled;
+      }
+      if (S.cultivation.settingsDraft && !S.cultivation.settingsDirty) {
+        S.cultivation.settingsDraft.medicine_mode = nextMode;
+        S.cultivation.settingsDraft.activity_threshold = threshold;
+      }
+      if (typeof cultivationFingerprint === 'function') {
+        S.cultivation.pollFingerprint = cultivationFingerprint(S.cultivation.data);
+      }
+    }
+    await syncCultivationAfterWeeklyChange();
     result = true;
     message = ['ok', '理智药设置已保存并读取确认 ✓'];
   } catch (error) {
@@ -241,6 +281,7 @@ async function toggleWeeklyPlan(enabled) {
     const payload = await api('weekly-plan');
     applyWeeklyOperationPayload(payload);
     await reloadMedicinePlan();
+    await syncCultivationAfterWeeklyChange();
     message = ['ok', enabled ? '周计划已启用 ✓' : '周计划已关闭，恢复 daily.toml ✓'];
   } catch (error) {
     message = ['err', '周计划设置未确认: ' + error.message];
@@ -300,6 +341,7 @@ async function saveWeeklyDay() {
       S.weeklyDirty = false;
     }
     await reloadMedicinePlan();
+    await syncCultivationAfterWeeklyChange();
     render();
     showMsg('ok', `${planWeekdayName(weekday)}配置已保存并读取确认 ✓${S.weeklyDirty?'；仍有新的未保存修改':''}`);
     return !S.weeklyDirty;
@@ -336,6 +378,7 @@ async function copyWeeklyDay() {
     const payload = await api('weekly-plan');
     applyWeeklyOperationPayload(payload);
     await reloadMedicinePlan();
+    await syncCultivationAfterWeeklyChange();
     message = ['ok', `已复制到 ${names} ✓`];
   } catch (error) {
     message = ['err', '复制未确认: ' + error.message];

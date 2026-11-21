@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -10,11 +10,62 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import tomllib
 import uuid
 
 _THREAD_LOCK = threading.RLock()
 MAX_GOALS = 20
+PRIORITY_MODES = ('cultivation_first', 'activity_first')
+MEDICINE_MODES = ('expire_only', 'cultivation_all', 'strict_none')
+FALLBACK_MODES = ('weekly', 'stage')
+CN_TZ = timezone(timedelta(hours=8))
+WEEKDAY_KEYS = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
+WEEKDAY_LABELS = {
+    'mon': '周一',
+    'tue': '周二',
+    'wed': '周三',
+    'thu': '周四',
+    'fri': '周五',
+    'sat': '周六',
+    'sun': '周日',
+}
+def _resolve_cultivation_paths():
+    cache_dir = Path(
+        os.environ.get('MAA_CACHE_DIR')
+        or (Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'maa')
+    )
+    data_dir = Path(
+        os.environ.get('MAA_DATA_DIR')
+        or (Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'maa')
+    )
+    act_file = Path(os.environ.get('MAA_ACTIVITY_FILE') or (cache_dir / 'StageActivityV2.json'))
+    item_file = Path(os.environ.get('MAA_ITEM_FILE') or (data_dir / 'resource' / 'item_index.json'))
+    return act_file, item_file
+
+
+_DEFAULT_ACTIVITY_FILE, _DEFAULT_ITEM_FILE = _resolve_cultivation_paths()
+ACTIVITY_FILE = _DEFAULT_ACTIVITY_FILE
+ITEM_FILE = _DEFAULT_ITEM_FILE
+
+
+def _resolve_client_type(config_dir):
+    if config_dir is None:
+        return 'Official'
+    try:
+        from maa_schedule_control import resolve_active_client
+        resolved = resolve_active_client(config_dir)
+        if isinstance(resolved, tuple) and resolved and isinstance(resolved[0], str):
+            return resolved[0]
+    except Exception:
+        pass
+    return 'Official'
+
+
+class InvalidSettingsError(ValueError):
+    status = 400
+    code = 'invalid_settings'
 DEPOT_GOLD_ITEM_ID = '4001'
+DEPOT_RED_TICKET_ITEM_ID = '4006'
 PROFESSION_TO_OPER_ROLE = {
     'PIONEER': 'Pioneer',
     'WARRIOR': 'Warrior',
@@ -58,6 +109,18 @@ OPER_PROGRESS_DETAIL_LABELS = {
     'PrerequisiteTraining': '前置专精训练已启动',
     'Interrupt': '任务中断',
 }
+ELITE_PROGRESS_DETAIL_LABELS = {
+    'Completed': '已自动晋升精英阶段',
+    'AlreadySatisfied': '已达到目标精英阶段',
+    'ResourceInsufficient': '晋升材料、红票或龙门币不足',
+    'OperatorNotFound': '未在干员列表中找到该干员',
+    'PrerequisiteNotMet': '晋升前置条件未满足',
+    'ChipNotCraftable': '一阶芯片无法自动合成（需先刷取普通芯片）',
+    'FormulaLocked': '加工站或制造站配方未解锁',
+    'Unsupported': '不支持的晋升参数',
+    'RecognitionFailed': '干员或晋升界面识别未完成',
+    'Interrupt': '晋升任务中断',
+}
 
 
 def load_catalog(path):
@@ -79,9 +142,48 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _default_state():
+def _weekly_now():
+    return datetime.now(CN_TZ)
+
+
+def _read_optional_json(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _atomic_write_json(path, value):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f'.{target.name}-', suffix='.tmp', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, target)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def _default_medicine_mode(config_dir=None):
+    if config_dir is not None:
+        med_cfg = _read_optional_json(Path(config_dir) / 'medicine-plan.json')
+        if isinstance(med_cfg, dict) and med_cfg.get('enabled') is False:
+            return 'strict_none'
+    return 'expire_only'
+
+
+def _default_state(config_dir=None):
     return {'schema_version': 1, 'revision': 0,
-            'settings': {'enabled': False, 'fallback_stage': '1-7'},
+            'settings': {'enabled': False, 'priority_mode': 'cultivation_first',
+                         'medicine_mode': _default_medicine_mode(config_dir),
+                         'fallback_mode': 'weekly', 'fallback_stage': '1-7',
+                         'auto_elite': False},
             'goals': [], 'inventory': {'available': False, 'items': {}, 'scanned_at': ''},
             'currency': {'available': False, 'balance': 0, 'source': 'unknown',
                          'confirmed_at': '', 'updated_at': '', 'events': []},
@@ -94,7 +196,7 @@ def _default_state():
 def load_state(config_dir):
     path = Path(config_dir) / 'cultivation/state.json'
     if not path.exists():
-        return _default_state()
+        return _default_state(config_dir)
     try:
         state = json.loads(path.read_text(encoding='utf-8'))
     except (ValueError, OSError) as exc:
@@ -105,6 +207,22 @@ def load_state(config_dir):
             or any(not isinstance(state.get(key), dict)
                    for key in ('settings', 'inventory', 'runtime', 'notifications'))):
         raise ValueError('培养状态格式无效；未覆盖现有数据')
+    settings = state['settings']
+    settings.setdefault('auto_elite', False)
+    settings.setdefault('priority_mode', 'cultivation_first')
+    settings.setdefault('medicine_mode', _default_medicine_mode(config_dir))
+    settings.setdefault('fallback_mode', 'weekly')
+    settings.setdefault('fallback_stage', '1-7')
+    if (type(settings.get('enabled')) is not bool
+            or type(settings.get('auto_elite')) is not bool
+            or settings.get('priority_mode') not in PRIORITY_MODES
+            or settings.get('medicine_mode') not in MEDICINE_MODES
+            or settings.get('fallback_mode') not in FALLBACK_MODES
+            or not isinstance(settings.get('fallback_stage'), str)
+            or not settings['fallback_stage'].strip()):
+        raise ValueError('培养状态格式无效；未覆盖现有数据')
+    if settings['priority_mode'] == 'activity_first' and settings['fallback_mode'] != 'weekly':
+        settings['fallback_mode'] = 'weekly'
     state.setdefault('currency', _default_state()['currency'])
     currency = state['currency']
     if not isinstance(currency, dict):
@@ -205,12 +323,342 @@ def _inventory_snapshot_status(inventory):
 
 def _bool(body, key):
     if key in body and type(body[key]) is not bool:
-        raise ValueError(f'{key} 必须为布尔值')
+        raise InvalidSettingsError(f'{key} 必须为布尔值')
+
+
+def _parse_side_story_stages(activity_data, item_map, client_type='Official'):
+    if not isinstance(activity_data, dict):
+        return {}
+    region = client_type if client_type in activity_data and isinstance(activity_data.get(client_type), dict) else 'Official'
+    official = activity_data.get(region) or {}
+    side_story = official.get('sideStoryStage') or official.get('SideStoryStage') or {}
+    if not isinstance(side_story, dict):
+        return {}
+    stages = {}
+    for info in side_story.values():
+        if not isinstance(info, dict):
+            continue
+        window = info.get('Activity') or info.get('activity') or {}
+        start_raw = window.get('UtcStartTime') or window.get('utcStartTime')
+        end_raw = window.get('UtcExpireTime') or window.get('utcExpireTime')
+        if not start_raw or not end_raw:
+            continue
+        try:
+            offset = int(window.get('TimeZone', window.get('timeZone', 8)))
+        except (TypeError, ValueError):
+            offset = 8
+        tz = timezone(timedelta(hours=max(-12, min(14, offset))))
+        try:
+            start_dt = datetime.fromisoformat(str(start_raw).replace('/', '-').replace(' ', 'T'))
+            end_dt = datetime.fromisoformat(str(end_raw).replace('/', '-').replace(' ', 'T'))
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=tz)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=tz)
+            start_cn = start_dt.astimezone(CN_TZ)
+            end_cn = end_dt.astimezone(CN_TZ)
+        except ValueError:
+            continue
+        for entry in info.get('Stages') or info.get('stages') or []:
+            if not isinstance(entry, dict):
+                continue
+            code = str(entry.get('Value') or entry.get('value') or '').strip()
+            if not code:
+                continue
+            drop = str(entry.get('Drop') or entry.get('drop') or '').strip()
+            item_id = ''
+            item_name = ''
+            if drop:
+                if drop in item_map and isinstance(item_map[drop], dict):
+                    item_id = drop
+                    item_name = str(item_map[drop].get('name') or drop)
+                else:
+                    matches = [
+                        str(k) for k, v in item_map.items()
+                        if isinstance(v, dict) and v.get('name') == drop
+                    ]
+                    if len(matches) == 1:
+                        item_id = matches[0]
+                        item_name = str(item_map[item_id].get('name') or item_id)
+            stages[code] = {
+                'stage': code,
+                'item_id': item_id,
+                'item_name': item_name,
+                'start': start_cn,
+                'end': end_cn,
+            }
+    return stages
+
+
+def _condition_matches(condition, now_cn, side_story_map, variant_stage=''):
+    if not condition:
+        return True
+    if not isinstance(condition, dict):
+        return False
+    ctype = condition.get('type')
+    if ctype == 'Always':
+        return True
+    if ctype == 'DateTime':
+        try:
+            offset = int(condition.get('timezone', 8))
+        except (TypeError, ValueError):
+            offset = 8
+        tz = timezone(timedelta(hours=max(-12, min(14, offset))))
+        cur = now_cn.astimezone(tz)
+        for bound_key, is_end in (('start', False), ('end', True)):
+            raw = condition.get(bound_key)
+            if not raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace('/', '-').replace(' ', 'T').replace('Z', '+00:00'))
+            except ValueError:
+                return False
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=tz)
+            else:
+                parsed = parsed.astimezone(tz)
+            if not is_end and cur < parsed:
+                return False
+            if is_end and cur >= parsed:
+                return False
+        return True
+    if ctype == 'Time':
+        try:
+            offset = int(condition.get('timezone', 8))
+        except (TypeError, ValueError):
+            offset = 8
+        tz = timezone(timedelta(hours=max(-12, min(14, offset))))
+        value = now_cn.astimezone(tz).strftime('%H:%M:%S')
+        start = condition.get('start')
+        end = condition.get('end')
+        if start and end and str(start) > str(end):
+            return value >= str(start) or value <= str(end)
+        return (not start or value >= str(start)) and (not end or value <= str(end))
+    if ctype in ('OnSideStory', 'SideStory'):
+        if variant_stage:
+            meta = side_story_map.get(variant_stage)
+            return bool(meta and meta['start'] <= now_cn < meta['end'])
+        return any(meta['start'] <= now_cn < meta['end'] for meta in side_story_map.values())
+    if ctype == 'Weekday':
+        try:
+            offset = int(condition.get('timezone', 8))
+        except (TypeError, ValueError):
+            offset = 8
+        tz = timezone(timedelta(hours=max(-12, min(14, offset))))
+        local = now_cn.astimezone(tz)
+        weekdays = condition.get('weekdays') or []
+        names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        return names[local.weekday()] in weekdays
+    if ctype == 'And':
+        return all(_condition_matches(c, now_cn, side_story_map, variant_stage)
+                   for c in (condition.get('conditions') or []))
+    if ctype == 'Or':
+        return any(_condition_matches(c, now_cn, side_story_map, variant_stage)
+                   for c in (condition.get('conditions') or []))
+    if ctype == 'Not':
+        return not _condition_matches(condition.get('condition') or {}, now_cn, side_story_map, variant_stage)
+    return False
+
+
+def _is_annihilation_fight(task):
+    if not isinstance(task, dict) or task.get('type') != 'Fight':
+        return False
+    stage = str((task.get('params') or {}).get('stage') or '')
+    if stage == 'Annihilation' or stage.endswith('Annihilation'):
+        return True
+    for variant in task.get('variants') or []:
+        if not isinstance(variant, dict):
+            continue
+        v_stage = str((variant.get('params') or {}).get('stage') or '')
+        if v_stage == 'Annihilation' or v_stage.endswith('Annihilation'):
+            return True
+    return False
+
+
+def _weekly_context(config_dir, catalog, inventory_items, inventory_verified):
+    directory = Path(config_dir)
+    now_cn = _weekly_now()
+    if now_cn.tzinfo is None:
+        now_cn = now_cn.replace(tzinfo=CN_TZ)
+    else:
+        now_cn = now_cn.astimezone(CN_TZ)
+    game_dt = now_cn - timedelta(hours=4)
+    weekday_key = WEEKDAY_KEYS[game_dt.weekday()]
+    weekday_label = WEEKDAY_LABELS[weekday_key]
+
+    med_cfg = _read_optional_json(directory / 'medicine-plan.json') or {}
+    threshold = med_cfg.get('threshold', 80)
+    if type(threshold) is not int or not 0 <= threshold <= 9999:
+        threshold = 80
+    med_enabled = med_cfg.get('enabled') is not False
+
+    expiring_count = 0
+    total_medicine_count = 0
+    expiring_at = ''
+    evidence = _read_optional_json(directory / 'medicine-evidence.json') or {}
+    if evidence.get('accurate') is True and type(evidence.get('remaining_count')) is int and evidence['remaining_count'] > 0:
+        horizon = now_cn + timedelta(hours=30)
+        batches = evidence.get('batches')
+        if isinstance(batches, list) and batches:
+            min_unexpired = None
+            for batch in batches:
+                if not isinstance(batch, dict):
+                    continue
+                b_rem = batch.get('remaining', batch.get('count', 0))
+                b_raw = str(batch.get('expires_at') or '')
+                if type(b_rem) is not int or b_rem <= 0 or not b_raw:
+                    continue
+                try:
+                    b_dt = datetime.fromisoformat(b_raw.replace('Z', '+00:00'))
+                    if b_dt.tzinfo is None:
+                        b_dt = b_dt.replace(tzinfo=CN_TZ)
+                    if b_dt > now_cn:
+                        total_medicine_count += b_rem
+                        if b_dt < horizon:
+                            expiring_count += b_rem
+                        if min_unexpired is None or b_dt < min_unexpired:
+                            min_unexpired = b_dt
+                except ValueError:
+                    continue
+            if min_unexpired is not None:
+                expiring_at = min_unexpired.astimezone(CN_TZ).isoformat()
+        else:
+            raw_exp = str(evidence.get('expires_at') or '')
+            if raw_exp:
+                try:
+                    exp_dt = datetime.fromisoformat(raw_exp.replace('Z', '+00:00'))
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=CN_TZ)
+                    if exp_dt > now_cn:
+                        total_medicine_count = int(evidence['remaining_count'])
+                        expiring_at = exp_dt.astimezone(CN_TZ).isoformat()
+                        if exp_dt < horizon:
+                            expiring_count = total_medicine_count
+                except ValueError:
+                    pass
+
+    weekly_cfg = _read_optional_json(directory / 'weekly-plan.json') or {}
+    weekly_enabled = weekly_cfg.get('enabled') is True
+    source_name = f'daily-{weekday_key}.toml' if weekly_enabled else 'daily.toml'
+    task_path = directory / 'tasks' / source_name
+    if not task_path.is_file() and weekly_enabled:
+        fallback_daily = directory / 'tasks' / 'daily.toml'
+        if fallback_daily.is_file():
+            source_name = 'daily.toml'
+            task_path = fallback_daily
+
+    ctx = {
+        'weekly_enabled': weekly_enabled,
+        'weekday_key': weekday_key,
+        'weekday_label': weekday_label,
+        'source_file': source_name,
+        'available': False,
+        'effective_stage': '',
+        'base_stage': '',
+        'is_activity_stage': False,
+        'activity_item_id': '',
+        'activity_item_name': '',
+        'activity_inventory': None,
+        'activity_threshold': threshold,
+        'activity_end': '',
+        'medicine_plan_enabled': med_enabled,
+        'expiring_medicine_count': expiring_count,
+        'total_medicine_count': total_medicine_count,
+        'expiring_medicine_expires_at': expiring_at,
+    }
+    if not task_path.is_file():
+        return ctx
+    try:
+        doc = tomllib.loads(task_path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return ctx
+    candidate_fights = [
+        t for t in (doc.get('tasks') or [])
+        if isinstance(t, dict)
+        and t.get('type') == 'Fight'
+        and t.get('_enabled') is not False
+        and not _is_annihilation_fight(t)
+    ]
+    fight = next(
+        (t for t in candidate_fights if t.get('name') == '理智作战'),
+        candidate_fights[0] if candidate_fights else None,
+    )
+    if fight is None:
+        return ctx
+
+    item_map = dict((catalog or {}).get('items') or {})
+    ext_items = _read_optional_json(ITEM_FILE)
+    if isinstance(ext_items, dict):
+        for k, v in ext_items.items():
+            if k not in item_map and isinstance(v, dict):
+                item_map[k] = v
+    activity_data = _read_optional_json(ACTIVITY_FILE) or {}
+    if not activity_data and Path(ACTIVITY_FILE) == _DEFAULT_ACTIVITY_FILE:
+        try:
+            from maa_activity_cache import get_activity
+            try:
+                activity_data = get_activity(ACTIVITY_FILE, config_dir=config_dir)[0] or {}
+            except TypeError:
+                activity_data = get_activity(ACTIVITY_FILE)[0] or {}
+        except Exception:
+            activity_data = {}
+    side_story_map = _parse_side_story_stages(
+        activity_data, item_map, client_type=_resolve_client_type(config_dir)
+    )
+
+    base_params = dict(fight.get('params') or {})
+    base_stage = str(base_params.get('stage') or '').strip()
+    effective_params = dict(base_params)
+    variants = fight.get('variants') or []
+    if isinstance(variants, list) and variants:
+        matched = False
+        strategy = str(fight.get('strategy') or 'first')
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            v_params = variant.get('params') if isinstance(variant.get('params'), dict) else {}
+            v_stage = str(v_params.get('stage') or '').strip()
+            if _condition_matches(variant.get('condition'), now_cn, side_story_map, v_stage):
+                effective_params.update(v_params)
+                matched = True
+                if strategy != 'merge':
+                    break
+        if not matched and not base_stage:
+            effective_params = {}
+    eff_stage = str(effective_params.get('stage') or '').strip()
+    meta = side_story_map.get(eff_stage)
+    is_open_act = bool(meta and meta['start'] <= now_cn < meta['end'])
+    if meta and not is_open_act:
+        if base_stage and base_stage != eff_stage:
+            eff_stage = base_stage
+            meta = side_story_map.get(eff_stage)
+            is_open_act = bool(meta and meta['start'] <= now_cn < meta['end'])
+            if meta and not is_open_act:
+                eff_stage = ''
+                base_stage = ''
+        else:
+            eff_stage = ''
+            if base_stage in side_story_map:
+                base_stage = ''
+
+    ctx['available'] = bool(eff_stage or base_stage)
+    ctx['effective_stage'] = eff_stage or base_stage
+    ctx['base_stage'] = base_stage or eff_stage
+    if is_open_act and meta:
+        ctx['is_activity_stage'] = True
+        ctx['activity_item_id'] = meta['item_id']
+        ctx['activity_item_name'] = meta['item_name']
+        ctx['activity_end'] = meta['end'].isoformat()
+        if meta['item_id'] and inventory_verified and isinstance(inventory_items, dict):
+            ctx['activity_inventory'] = int(inventory_items.get(meta['item_id'], 0) or 0)
+    return ctx
 
 
 def _payload(config_dir, catalog, state):
     items = dict(state['inventory']['items'])
-    gold = (catalog.get('currency') or {}).get('gold_item_id', DEPOT_GOLD_ITEM_ID)
+    currency_meta = catalog.get('currency') or {}
+    gold = currency_meta.get('gold_item_id', DEPOT_GOLD_ITEM_ID)
+    red_ticket_id = currency_meta.get('red_ticket_item_id', DEPOT_RED_TICKET_ITEM_ID)
     items.pop(gold, None)
     if state['currency']['available']:
         items[gold] = state['currency']['balance']
@@ -225,6 +673,23 @@ def _payload(config_dir, catalog, state):
                     row['status'] = 'blocked'
                 row.setdefault('blocked', []).append({'item_id': gold, 'count': 0,
                     'reason': 'currency_unknown', 'detail': '请先识别仓库确认龙门币余额'})
+            promo = row.get('promotion')
+            if isinstance(promo, dict):
+                cur_e = int(promo.get('current_elite', 0) or 0)
+                clamped_e = cur_e
+                chain_ok = True
+                for ph in promo.get('phases', []):
+                    if not isinstance(ph, dict):
+                        continue
+                    if ph.get('lmd_total', 0) > 0:
+                        ph['ready'] = False
+                        ph['status'] = 'blocked'
+                        chain_ok = False
+                    elif chain_ok and ph.get('ready'):
+                        clamped_e = int(ph.get('elite', cur_e) or cur_e)
+                    else:
+                        chain_ok = False
+                promo['ready_elite'] = clamped_e
         if any(row.get('reason') == 'currency_unknown' for g in plan.get('goals', []) for row in g.get('blocked', [])):
             plan['ready'] = False
             if not any(x.get('reason') == 'currency_unknown' for x in plan.get('blocked', [])):
@@ -235,6 +700,12 @@ def _payload(config_dir, catalog, state):
                                       Path(config_dir) / 'operator-box-state.json')
     snapshot = operator_status.get('snapshot') or {}
     attempt = operator_status.get('last_attempt') or {}
+    owned_ids = {
+        str(op.get('id'))
+        for op in (snapshot.get('own_opers') or [])
+        if isinstance(op, dict) and op.get('id')
+    }
+    operator_verified = bool(operator_status['available'] and not operator_status['stale'])
     inventory = state['inventory']
     inventory_status = _inventory_snapshot_status(inventory)
     inventory_verified = inventory_status['available'] and not inventory_status['stale']
@@ -248,6 +719,24 @@ def _payload(config_dir, catalog, state):
             row.get('status') == 'completed'
             or (inventory_verified and row.get('status') == 'ready')
         )
+        promo = row.get('promotion')
+        if isinstance(promo, dict):
+            cur_e = int(promo.get('current_elite', 0) or 0)
+            raw_ready_e = int(promo.get('ready_elite', cur_e) or cur_e)
+            can_promote = (
+                inventory_verified
+                and operator_verified
+                and row.get('operator_id') in owned_ids
+                and raw_ready_e > cur_e
+            )
+            promo['verified_ready_elite'] = raw_ready_e if can_promote else cur_e
+    red_ticket = {
+        'item_id': red_ticket_id,
+        'available': bool(inventory_verified),
+        'balance': int(inventory.get('items', {}).get(red_ticket_id, 0) or 0) if inventory.get('available') else 0,
+        'source': 'depot' if inventory_verified else 'unknown',
+        'scanned_at': inventory.get('scanned_at', '') if inventory.get('available') else '',
+    }
     snapshot_status = {
         'inventory': inventory_status,
         'operators': {'available': operator_status['available'],
@@ -255,8 +744,15 @@ def _payload(config_dir, catalog, state):
                       'stale': operator_status['stale'],
                       'last_error': attempt.get('message', '') if attempt.get('status') == 'failed' else ''},
     }
-    return {**state, 'plan': plan, 'catalog': catalog, 'operator_snapshot': snapshot,
-            'snapshot_status': snapshot_status}
+    weekly_context = _weekly_context(
+        config_dir,
+        catalog,
+        inventory.get('items') if inventory.get('available') else {},
+        inventory_verified,
+    )
+    return {**state, 'red_ticket': red_ticket, 'plan': plan, 'catalog': catalog,
+            'operator_snapshot': snapshot, 'snapshot_status': snapshot_status,
+            'weekly_context': weekly_context}
 
 
 def get_payload(config_dir, catalog_path):
@@ -266,19 +762,62 @@ def get_payload(config_dir, catalog_path):
 def update_settings(config_dir, catalog_path, body):
     _object(body)
     _bool(body, 'enabled')
+    _bool(body, 'auto_elite')
+    if 'priority_mode' in body and body['priority_mode'] not in PRIORITY_MODES:
+        raise InvalidSettingsError('主线优先级模式无效')
+    if 'medicine_mode' in body and body['medicine_mode'] not in MEDICINE_MODES:
+        raise InvalidSettingsError('理智药使用策略无效')
+    if 'fallback_mode' in body and body['fallback_mode'] not in FALLBACK_MODES:
+        raise InvalidSettingsError('兜底去向模式无效')
+    if 'activity_threshold' in body:
+        thr = body['activity_threshold']
+        if type(thr) is not int or not 0 <= thr <= 9999:
+            raise InvalidSettingsError('限时活动保底上限必须为 0 至 9999 的整数')
     catalog = load_catalog(catalog_path)
     if 'fallback_stage' in body:
         known = {stage['stage'] for stage in catalog.get('stages', [])}
         if not isinstance(body['fallback_stage'], str) or body['fallback_stage'] not in known:
-            raise ValueError('备用关卡必须选择已支持的常驻关卡')
+            raise InvalidSettingsError('备用关卡必须选择已支持的常驻关卡')
     with _state_lock(config_dir):
         state = load_state(config_dir)
         _check_revision(state, body)
-        for key in ('enabled', 'fallback_stage'):
+        cur = state['settings']
+        next_priority = body.get('priority_mode', cur.get('priority_mode', 'cultivation_first'))
+        next_medicine = body.get('medicine_mode', cur.get('medicine_mode', 'expire_only'))
+        if 'fallback_mode' in body:
+            next_fallback = body['fallback_mode']
+        elif 'fallback_stage' in body:
+            if next_priority == 'activity_first':
+                raise InvalidSettingsError('限时活动优先模式下兜底去向已锁定为跟随周计划，禁止指定固定常驻关卡')
+            next_fallback = 'stage'
+        elif next_priority == 'activity_first':
+            next_fallback = 'weekly'
+        else:
+            next_fallback = cur.get('fallback_mode', 'weekly')
+
+        if next_priority == 'activity_first' and next_fallback != 'weekly':
+            raise InvalidSettingsError('限时活动优先模式下兜底去向必须跟随周计划，禁止与固定常驻关卡同时启用')
+
+        for key in ('enabled', 'fallback_stage', 'auto_elite'):
             if key in body:
-                state['settings'][key] = body[key]
+                cur[key] = body[key]
+        cur['priority_mode'] = next_priority
+        cur['medicine_mode'] = next_medicine
+        cur['fallback_mode'] = next_fallback
         state['revision'] += 1
         _write(config_dir, state)
+
+        med_path = Path(config_dir) / 'medicine-plan.json'
+        if 'medicine_mode' in body or 'activity_threshold' in body or med_path.exists():
+            existing_med = _read_optional_json(med_path) or {}
+            prev_thr = existing_med.get('threshold', 80)
+            if type(prev_thr) is not int or not 0 <= prev_thr <= 9999:
+                prev_thr = 80
+            next_thr = body['activity_threshold'] if 'activity_threshold' in body else prev_thr
+            _atomic_write_json(med_path, {
+                'enabled': next_medicine != 'strict_none',
+                'threshold': next_thr,
+            })
     return _payload(config_dir, catalog, state)
 
 
@@ -313,6 +852,9 @@ def save_goal(config_dir, catalog_path, body):
         candidate['updated_at'] = _now()
         candidate.pop('verified_at', None)
         candidate.pop('completion_source', None)
+        for stale_key in ('elite_status', 'elite_status_label', 'last_elite_result',
+                          'last_elite_detail', 'last_elite_target', 'last_elite_at'):
+            candidate.pop(stale_key, None)
         if candidate.get('completed') and not (existing or {}).get('completed'):
             state['inventory']['available'] = False
             _mark_currency_unknown(state, '目标完成后需要重新识别仓库')
@@ -546,17 +1088,19 @@ def _notification_key(goal):
 
 def pending_notifications(config_dir, catalog_path, *, include_goals=True, include_uncompleted_goals=True):
     payload = get_payload(config_dir, catalog_path)
+    elite_notes = _pending_elite_notifications(payload)
     if not include_goals:
-        return _pending_mastery_notifications(payload)
+        return elite_notes + _pending_mastery_notifications(payload)
     inventory_status = payload['snapshot_status']['inventory']
     if not inventory_status.get('available') or inventory_status.get('stale'):
-        return _pending_mastery_notifications(payload)
+        return elite_notes + _pending_mastery_notifications(payload)
     age = inventory_status.get('age_seconds')
     if age is None or age < 0 or age > 900:
-        return _pending_mastery_notifications(payload)
+        return elite_notes + _pending_mastery_notifications(payload)
     scanned = datetime.fromisoformat(inventory_status['scanned_at'].replace('Z', '+00:00'))
-    result = []
+    result = list(elite_notes)
     plan_rows = {g['id']: g for g in payload['plan']['goals']}
+    auto_elite = bool((payload.get('settings') or {}).get('auto_elite'))
     for goal in payload['goals']:
         if not goal['enabled']:
             continue
@@ -569,10 +1113,21 @@ def pending_notifications(config_dir, catalog_path, *, include_goals=True, inclu
             key = hashlib.sha256(('achieved:' + _notification_key(goal)).encode()).hexdigest()
             if key not in payload['notifications']:
                 name = payload['catalog']['operators'][goal['operator_id']]['name']
-                fallback = payload['settings']['fallback_stage']
+                settings_obj = payload.get('settings') or {}
+                if settings_obj.get('fallback_mode') == 'weekly':
+                    wctx = payload.get('weekly_context') or {}
+                    wstage = wctx.get('effective_stage') or ''
+                    fallback_desc = (
+                        f'周计划备用关卡 {wstage}（自动跟随周计划）'
+                        if wstage
+                        else '周计划备用关卡（自动跟随周计划）'
+                    )
+                else:
+                    fallback = settings_obj.get('fallback_stage', '1-7')
+                    fallback_desc = f'备用关卡 {fallback}（开放且可用时）'
                 text = (f'[MAA] {name} 培养目标已达成\n'
                         f'复核练度：精英 {goal["current_elite"]}，等级 {goal["current_level"]}\n'
-                        f'不再为该目标刷取；其余目标处理完成后继续备用关卡 {fallback}（开放且可用时）。')
+                        f'不再为该目标刷取；其余目标处理完成后继续{fallback_desc}。')
                 result.append({'key': key, 'text': text})
             continue
         if not include_uncompleted_goals:
@@ -615,7 +1170,21 @@ def pending_notifications(config_dir, catalog_path, *, include_goals=True, inclu
         if key in payload['notifications']:
             continue
         name = payload['catalog']['operators'][goal['operator_id']]['name']
-        text = f'[MAA] {name} 培养资源已齐备\n目标：精英 {goal["target_elite"]}，等级 {goal["target_level"]}\n请手动合成并培养，完成后在培养目标页标记完成。'
+        if goal['current_elite'] >= goal['target_elite']:
+            action_hint = (
+                f'当前已处于精英 {goal["current_elite"]}（{goal["current_level"]} 级），'
+                '作战记录与龙门币已齐备，请在游戏内升至目标等级（下次扫描将自动确认完成）。'
+            )
+        elif auto_elite:
+            action_hint = (
+                '已开启自动精英化，可由 OperProgress 自动完成红票买助剂、制造站双芯片、加工站合成并晋升；'
+                '晋升后如需继续升至目标等级，请在游戏内升级。'
+            )
+        else:
+            action_hint = '请手动合成并培养，完成后在培养目标页标记完成。'
+        text = (f'[MAA] {name} 培养资源已齐备\n'
+                f'目标：精英 {goal["target_elite"]}，等级 {goal["target_level"]}\n'
+                f'{action_hint}')
         crafts = row.get('crafts', [])
         if crafts:
             lines = []
@@ -623,7 +1192,15 @@ def pending_notifications(config_dir, catalog_path, *, include_goals=True, inclu
                 item_id = craft.get('item_id', craft.get('item', ''))
                 item_name = payload['catalog']['items'].get(item_id, {}).get('name', item_id)
                 lines.append(f'{item_name} × {craft.get("quantity", craft.get("produced", craft.get("count", "")))}')
-            text += '\n手动合成清单：\n' + '\n'.join(lines)
+            text += '\n合成清单：\n' + '\n'.join(lines) if auto_elite else '\n手动合成清单：\n' + '\n'.join(lines)
+        exchanges = row.get('exchanges', [])
+        if exchanges:
+            ex_lines = []
+            for ex in exchanges:
+                item_name = ex.get('name') or payload['catalog']['items'].get(ex.get('item_id', ''), {}).get('name', ex.get('item_id', ''))
+                curr_name = payload['catalog']['items'].get(ex.get('currency_id', ''), {}).get('name', ex.get('currency_id', '采购凭证'))
+                ex_lines.append(f'{item_name} × {ex.get("quantity", 0)}（耗 {ex.get("cost", 0)} {curr_name}）')
+            text += '\n红票兑换清单：\n' + '\n'.join(ex_lines)
         result.append({'key': key, 'text': text[:3900]})
     result.extend(_pending_mastery_notifications(payload))
     return result
@@ -826,11 +1403,18 @@ def set_mastery_runtime(config_dir, status, message):
         _write(config_dir, state)
 
 
-def record_mastery_results(config_dir, catalog_path, details_list, *, summary=None):
+def record_mastery_results(config_dir, catalog_path, details_list, *, summary=None, submitted_plans=None):
     if not isinstance(details_list, list):
         raise ValueError('专精回调结果格式无效')
     catalog = load_catalog(catalog_path)
+    operators_meta = catalog.get('operators') or {}
     now = _now()
+    pending_elite = []
+    if isinstance(submitted_plans, list):
+        for p in submitted_plans:
+            if (isinstance(p, dict) and type(p.get('elite')) is int and p['elite'] > 0
+                    and 'skill_mastery' not in p and 'skill_level' not in p):
+                pending_elite.append((str(p.get('role', '') or ''), str(p.get('name', '') or ''), p['elite']))
     with _state_lock(config_dir):
         state = load_state(config_dir)
         plans = state['mastery']['plans']
@@ -842,21 +1426,72 @@ def record_mastery_results(config_dir, catalog_path, details_list, *, summary=No
             p.get('operator_name', ''): p
             for p in plans if p.get('enabled', True)
         }
+        goal_by_role_name = {}
+        goal_by_name = {}
+        for g in state['goals']:
+            if not g.get('enabled', True) or g.get('completed', False):
+                continue
+            meta = operators_meta.get(g.get('operator_id', '')) or {}
+            op_name = meta.get('name') or g.get('operator_name', '')
+            op_role = PROFESSION_TO_OPER_ROLE.get(meta.get('profession', ''), '')
+            if op_name:
+                goal_by_name.setdefault(op_name, g)
+                if op_role:
+                    goal_by_role_name.setdefault((op_role, op_name), g)
         updated_plans = []
+        updated_elite_goals = []
         advanced_in_run = set()
         for item in details_list:
             if not isinstance(item, dict):
                 continue
             role = str(item.get('role', '') or '')
             name = str(item.get('name', '') or '')
-            plan = by_role_name.get((role, name)) or by_name.get(name)
-            if plan is None:
-                continue
             detail_code = _normalize_oper_progress_detail(item.get('result_detail'))
             result_code = _normalize_oper_progress_result(item.get('result'))
             details_obj = item.get('details') if isinstance(item.get('details'), dict) else item
             is_skill_mastery_cb = 'skill_mastery' in details_obj or 'skill_mastery' in item
             is_skill_level_cb = ('skill_level' in details_obj or 'skill_level' in item) and not is_skill_mastery_cb
+            has_elite_key = 'elite' in details_obj or 'elite' in item
+            pending_idx = next(
+                (idx for idx, (pr, pn, _pe) in enumerate(pending_elite)
+                 if pn == name and (not pr or not role or pr == role)),
+                None,
+            )
+            matched_goal = goal_by_role_name.get((role, name)) or goal_by_name.get(name)
+            plan = by_role_name.get((role, name)) or by_name.get(name)
+            is_elite_cb = has_elite_key or (
+                not is_skill_mastery_cb and not is_skill_level_cb and (
+                    pending_idx is not None or (matched_goal is not None and plan is None)
+                )
+            )
+            if is_elite_cb:
+                sub_elite = 0
+                if pending_idx is not None:
+                    _, _, sub_elite = pending_elite.pop(pending_idx)
+                raw_e = details_obj.get('elite', item.get('elite'))
+                target_e = raw_e if type(raw_e) is int and raw_e > 0 else (
+                    sub_elite or (matched_goal.get('target_elite', 0) if matched_goal else 0)
+                )
+                if matched_goal is not None:
+                    matched_goal['last_elite_at'] = now
+                    matched_goal['last_elite_detail'] = detail_code
+                    matched_goal['last_elite_result'] = result_code
+                    matched_goal['last_elite_target'] = int(target_e or 0)
+                    if detail_code == 'Completed':
+                        matched_goal['elite_status'] = 'promoted'
+                        matched_goal['elite_status_label'] = f'已自动晋升至精英 {target_e}'
+                    elif detail_code == 'AlreadySatisfied':
+                        matched_goal['elite_status'] = 'satisfied'
+                        matched_goal['elite_status_label'] = f'已处于精英 {target_e}'
+                    else:
+                        matched_goal['elite_status'] = 'blocked'
+                        matched_goal['elite_status_label'] = ELITE_PROGRESS_DETAIL_LABELS.get(
+                            detail_code, detail_code or result_code
+                        )
+                    updated_elite_goals.append(matched_goal['id'])
+                continue
+            if plan is None:
+                continue
             if is_skill_level_cb:
                 if detail_code in ('Completed', 'AlreadySatisfied'):
                     plan['skill_level_7_verified'] = True
@@ -949,13 +1584,18 @@ def record_mastery_results(config_dir, catalog_path, details_list, *, summary=No
         if updated_plans and not state['mastery'].get('manual_order'):
             plans.sort(key=_mastery_plan_auto_tier)
         summary_msg = ''
-        if isinstance(summary, dict):
+        if isinstance(summary, dict) and updated_plans:
             completed_cnt = summary.get('completed', summary.get('success', 0))
             skipped_cnt = summary.get('skipped', 0)
             failed_cnt = summary.get('failed', 0)
             summary_msg = f'本轮专精汇总：启动/完成 {completed_cnt} 项，跳过 {skipped_cnt} 项，受阻 {failed_cnt} 项。'
         elif updated_plans:
             summary_msg = f'已更新 {len(set(updated_plans))} 个干员专精状态。'
+        elif isinstance(summary, dict) and not updated_elite_goals:
+            completed_cnt = summary.get('completed', summary.get('success', 0))
+            skipped_cnt = summary.get('skipped', 0)
+            failed_cnt = summary.get('failed', 0)
+            summary_msg = f'本轮专精汇总：启动/完成 {completed_cnt} 项，跳过 {skipped_cnt} 项，受阻 {failed_cnt} 项。'
         if summary_msg:
             state['mastery']['runtime'] = {
                 'status': 'succeeded',
@@ -965,6 +1605,60 @@ def record_mastery_results(config_dir, catalog_path, details_list, *, summary=No
         state['revision'] += 1
         _write(config_dir, state)
     return _payload(config_dir, catalog, state)
+
+
+def _elite_notification_key(goal, event_tag):
+    values = {
+        'id': goal.get('id', ''),
+        'operator_id': goal.get('operator_id', ''),
+        'target_elite': goal.get('target_elite', 0),
+        'last_elite_target': goal.get('last_elite_target', 0),
+        'last_elite_detail': goal.get('last_elite_detail', ''),
+        'event': event_tag,
+    }
+    return hashlib.sha256(('elite:' + json.dumps(values, sort_keys=True, ensure_ascii=False)).encode()).hexdigest()
+
+
+def _pending_elite_notifications(payload):
+    result = []
+    now = datetime.now(timezone.utc)
+    operators = (payload.get('catalog') or {}).get('operators') or {}
+    for goal in payload.get('goals') or []:
+        if not goal.get('enabled', True):
+            continue
+        last_elite_at = goal.get('last_elite_at', '')
+        if not last_elite_at:
+            continue
+        try:
+            ran = datetime.fromisoformat(str(last_elite_at).replace('Z', '+00:00'))
+            if (now - ran).total_seconds() > 900:
+                continue
+        except (ValueError, TypeError):
+            continue
+        name = operators.get(goal.get('operator_id', ''), {}).get('name', goal.get('operator_id', '干员'))
+        elite_status = goal.get('elite_status', '')
+        elite_target = goal.get('last_elite_target') or goal.get('current_elite', 0)
+        if elite_status == 'promoted' and not goal.get('completed'):
+            key = _elite_notification_key(goal, 'promoted')
+            if key not in payload['notifications']:
+                result.append({
+                    'key': key,
+                    'text': (f'[MAA] {name} 已自动晋升至精英 {elite_target}\n'
+                             f'计划目标：精英 {goal["target_elite"]}，等级 {goal["target_level"]}'),
+                })
+        elif elite_status == 'blocked':
+            key = _elite_notification_key(goal, 'blocked')
+            if key not in payload['notifications']:
+                label = goal.get('elite_status_label') or ELITE_PROGRESS_DETAIL_LABELS.get(
+                    goal.get('last_elite_detail', ''), '自动精英化受阻'
+                )
+                result.append({
+                    'key': key,
+                    'text': (f'[MAA] {name} 自动精英化受阻\n'
+                             f'原因：{label}\n'
+                             f'计划目标：精英 {goal["target_elite"]}，等级 {goal["target_level"]}'),
+                })
+    return result
 
 
 def _mastery_notification_key(plan, event_tag):
